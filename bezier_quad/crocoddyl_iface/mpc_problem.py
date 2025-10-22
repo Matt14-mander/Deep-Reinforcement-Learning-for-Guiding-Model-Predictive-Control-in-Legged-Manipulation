@@ -2,58 +2,47 @@
 import crocoddyl
 import pinocchio as pin
 
-def add_base_tracking_to_running_model(running_model, base_frame_id, target_SE3, w_pos=1e2, w_rot=5e1):
+def add_base_tracking_to_running_model(running_model, base_frame_id, target_SE3, w_placement=1e2):
+    """
+    用 ResidualModelFramePlacement + CostModelResidual 同时跟踪平移+旋转
+    """
     dmodel = running_model.differential
-    state = dmodel.state
+    state  = dmodel.state
 
-    tr_act = crocoddyl.ActivationModelWeightedQuad(np.ones(3))
-    rot_act = crocoddyl.ActivationModelWeightedQuad(np.ones(3))
+    # 残差：基座frame相对于target_SE3的位姿误差 [pos(3), rot(3)]
+    res_place = crocoddyl.ResidualModelFramePlacement(state, base_frame_id, target_SE3)
 
-    cost_tr = crocoddyl.CostModelFrameTranslation(
-        state,
-        crocoddyl.FrameTranslation(base_frame_id, target_SE3.translation),
-        tr_act
-    )
+    # 激活：加权二次范数（6维）
+    act6 = crocoddyl.ActivationModelWeightedQuad(np.ones(6))
 
-    cost_rot = crocoddyl.CostModelFrameRotation(
-        state,
-        crocoddyl.FrameRotation(base_frame_id, target_SE3.rotation),
-        rot_act
-    )
+    # 成本：Residual + Activation 组合
+    cost_place = crocoddyl.CostModelResidual(state, act6, res_place)
 
-    dmodel.costs.addCost("base_tr",  cost_tr,  w_pos)
-    dmodel.costs.addCost("base_rot", cost_rot, w_rot)
+    # 加到 running model 的成本和里
+    dmodel.costs.addCost("base_place", cost_place, w_placement)
+
 
 def inject_bezier_refs(problem, base_frame_id, frames_SE3, w_pos=1e2, w_rot=5e1):
     """
-    把每个 knot 的目标位姿设置为 Bézier 采样得到的基座位姿。
+    注意：这里直接用 placement 统一跟踪，所以只用一个权重 w_place。
+    为了兼容你原来的调用，这里仍保留 w_pos/w_rot 形参，但内部当成同一个尺度用。
     """
-    assert len(frames_SE3) == problem.T+1 or len(frames_SE3) == problem.T, \
-        "参考长度需与 shooting nodes 对齐（可传T或T+1）"
+    w_place = float(w_pos)  # 你也可以写成 0.5*w_pos + 0.5*w_rot
 
+    # running 节点
     for k in range(problem.T):
         running = problem.runningModels[k]
-        add_base_tracking_to_running_model(running, base_frame_id, frames_SE3[min(k, len(frames_SE3)-1)], w_pos, w_rot)
+        target  = frames_SE3[min(k, len(frames_SE3)-1)]
+        add_base_tracking_to_running_model(running, base_frame_id, target, w_place)
 
-    # 终端 cost（可选）：让终点状态更贴近 Bézier 末端
-    term = problem.terminalModel
-    # 终端也加一点位置/姿态跟踪（权重更大）
-    dmodel = term.differential
-    state = dmodel.state if hasattr(term, "differential") else term.state  # 兼容不同版本
+    # terminal 节点
     target_last = frames_SE3[-1]
-    term.costs.addCost(
-        "term_base_tr",
-        crocoddyl.CostModelFrameTranslation(
-            state, crocoddyl.ActivationModelWeightedQuad(np.ones(3)),
-            pin.FrameTranslation(base_frame_id, target_last.translation)
-        ),
-        w_pos*5.0
-    )
-    term.costs.addCost(
-        "term_base_rot",
-        crocoddyl.CostModelFrameRotation(
-            state, crocoddyl.ActivationModelWeightedQuad(np.ones(3)),
-            pin.FrameRotation(base_frame_id, target_last.rotation)
-        ),
-        w_rot*5.0
-    )
+    term = problem.terminalModel
+    # 兼容不同 Crocoddyl 版本（有的终端就是 Differential，有的是 Integrated）
+    dmodel = term.differential if hasattr(term, "differential") else term
+    state  = dmodel.state
+
+    res_last = crocoddyl.ResidualModelFramePlacement(state, base_frame_id, target_last)
+    act6     = crocoddyl.ActivationModelWeightedQuad(np.ones(6))
+    cost_last= crocoddyl.CostModelResidual(state, act6, res_last)
+    dmodel.costs.addCost("term_base_place", cost_last, 5.0*w_place)
