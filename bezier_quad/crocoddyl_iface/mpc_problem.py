@@ -3,31 +3,26 @@ import crocoddyl
 import pinocchio as pin
 
 def add_base_tracking_to_running_model(running_model, base_frame_id, target_SE3, w_pos=1e2, w_rot=5e1):
-    """
-    向一个 running IntegratedActionModel 里添加/更新“基座位姿跟踪”的代价。
-    """
-    # 取 differential model
     dmodel = running_model.differential
     state = dmodel.state
-    # 平移+旋转分别加代价，防止权重耦合
-    activation_xyz = crocoddyl.ActivationModelWeightedQuad(np.array([1.,1.,1.])*1.0)
-    act_rot = crocoddyl.ActivationModelWeightedQuad(np.array([1.,1.,1.])*1.0)
 
-    # 平移
-    Mref = pin.SE3.Identity()
-    Mref.translation = target_SE3.translation
-    frame_tr_cost = crocoddyl.CostModelFrameTranslation(
-        state, crocoddyl.ActivationModelWeightedQuad(np.array([1.,1.,1.])*1.0),
-        pin.FrameTranslation(base_frame_id, Mref.translation)
-    )
-    # 旋转（用FrameRotation或完整FramePlacement）
-    frame_rot_cost = crocoddyl.CostModelFrameRotation(
-        state, act_rot,
-        pin.FrameRotation(base_frame_id, target_SE3.rotation)
+    tr_act = crocoddyl.ActivationModelWeightedQuad(np.ones(3))
+    rot_act = crocoddyl.ActivationModelWeightedQuad(np.ones(3))
+
+    cost_tr = crocoddyl.CostModelFrameTranslation(
+        state,
+        crocoddyl.FrameTranslation(base_frame_id, target_SE3.translation),
+        tr_act
     )
 
-    dmodel.costs.addCost("base_tr", frame_tr_cost, w_pos)
-    dmodel.costs.addCost("base_rot", frame_rot_cost, w_rot)
+    cost_rot = crocoddyl.CostModelFrameRotation(
+        state,
+        crocoddyl.FrameRotation(base_frame_id, target_SE3.rotation),
+        rot_act
+    )
+
+    dmodel.costs.addCost("base_tr",  cost_tr,  w_pos)
+    dmodel.costs.addCost("base_rot", cost_rot, w_rot)
 
 def inject_bezier_refs(problem, base_frame_id, frames_SE3, w_pos=1e2, w_rot=5e1):
     """
