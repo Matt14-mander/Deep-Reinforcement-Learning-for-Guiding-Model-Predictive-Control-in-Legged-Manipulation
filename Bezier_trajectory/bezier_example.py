@@ -122,17 +122,17 @@ x_ref, y_ref, yaw_ref = sample_xy_yaw_bezier(A, P1, P2, B, T+1, yaw_mode="tangen
 frames_SE3 = build_frames_from_xy_yaw(x_ref, y_ref, yaw_ref, base_height=0.42)
 
 # 注入 Bézier 参考成本
-inject_bezier_refs(problem, anymal.model, anymal.model.getFrameId("base"), frames_SE3, w_run=1e1, w_term=1e2)
+inject_bezier_refs(problem, anymal.model, anymal.model.getFrameId("base"), frames_SE3, w_run=1e2, w_term=1e3)
 
 # 创建求解器
 solver = crocoddyl.SolverFDDP(problem)
 solver.setCallbacks([crocoddyl.CallbackVerbose(), crocoddyl.CallbackLogger()])
 
-xs = [x0.copy() for _ in range(solver.problem.T + 1)]
-us = [u.copy() for u in solver.problem.quasiStatic(xs[:-1])]
+xs = [x0 for _ in range(solver.problem.T + 1)]
+us = [u for u in solver.problem.quasiStatic(xs[:-1])]
 
 # 求解
-solver.solve(xs, us, 100, False)
+solver.solve(xs, us, 500, False)
 
 # 显示动画
 if WITHDISPLAY:
