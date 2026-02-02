@@ -17,8 +17,12 @@ EXTENSION_TOML_DATA = toml.load(os.path.join(EXTENSION_PATH, "config", "extensio
 
 # Minimum dependencies required prior to installation
 INSTALL_REQUIRES = [
-    # NOTE: Add dependencies
     "psutil",
+    "numpy>=1.20.0",
+    "scipy>=1.7.0",
+    "matplotlib>=3.5.0",
+    # Crocoddyl for MPC (optional - may need separate installation)
+    # "crocoddyl>=2.0.0",
 ]
 
 # Installation operation

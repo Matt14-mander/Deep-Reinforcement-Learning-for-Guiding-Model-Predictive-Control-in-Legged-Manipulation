@@ -1,65 +1,168 @@
-# Template for Isaac Lab Projects
+# RL+MPC Bezier Trajectory Control System
 
-## Overview
+A research project integrating Reinforcement Learning (RL) with Model Predictive Control (MPC) for robot trajectory control. The system uses Bezier curves as the trajectory parameterization, where the RL policy outputs Bezier control points and Crocoddyl MPC tracks the resulting trajectory.
 
-This project/repository serves as a template for building projects or extensions based on Isaac Lab.
-It allows you to develop in an isolated environment, outside of the core Isaac Lab repository.
+## Architecture Overview
 
-**Key Features:**
+```
+┌─────────────────────────────────────────────────────────────────────┐
+│                         RL Policy (5-10 Hz)                         │
+│                   Outputs: Bezier control points                    │
+└─────────────────────────────┬───────────────────────────────────────┘
+                              │ 12D: 4 control points × 3D position
+                              ▼
+┌─────────────────────────────────────────────────────────────────────┐
+│                    Trajectory Generator                             │
+│              Bezier params → Dense waypoints (50 Hz)                │
+└─────────────────────────────┬───────────────────────────────────────┘
+                              │ Reference trajectory: T × 3D positions
+                              ▼
+┌─────────────────────────────────────────────────────────────────────┐
+│                     Crocoddyl MPC (50 Hz)                           │
+│         Input: current state + reference trajectory                 │
+│         Output: thrust + torques (4D)                               │
+└─────────────────────────────┬───────────────────────────────────────┘
+                              │ 4D: [thrust, τx, τy, τz]
+                              ▼
+┌─────────────────────────────────────────────────────────────────────┐
+│                   IsaacLab Physics (200 Hz)                         │
+│                    Quadrotor simulation                             │
+└─────────────────────────────────────────────────────────────────────┘
+```
 
-- `Isolation` Work outside the core Isaac Lab repository, ensuring that your development efforts remain self-contained.
-- `Flexibility` This template is set up to allow your code to be run as an extension in Omniverse.
+## Frequency Hierarchy
 
-**Keywords:** extension, template, isaaclab
+| Component | Frequency | Notes |
+|-----------|-----------|-------|
+| Physics simulation | 200 Hz | `sim.dt = 0.005s` |
+| MPC control rate | 50 Hz | `decimation = 4` |
+| RL policy rate | 5-10 Hz | Every 5-10 MPC cycles |
+| Bezier horizon | 1.5 s | 75 waypoints at 50 Hz |
+
+## Project Structure
+
+```
+RL_Bezier_MPC/
+├── scripts/
+│   ├── train_quadrotor_mpc.py      # RL training entry point
+│   ├── play_quadrotor_mpc.py       # Evaluation and visualization
+│   └── test_mpc_standalone.py      # Test MPC without IsaacLab
+│
+└── source/RL_Bezier_MPC/RL_Bezier_MPC/
+    ├── envs/                       # DirectRL environments
+    ├── controllers/                # MPC controllers
+    ├── trajectory/                 # Trajectory generators
+    ├── robots/                     # Robot configurations
+    └── utils/                      # Helper functions
+```
+
+**Keywords:** rl, mpc, bezier, trajectory, quadrotor, isaaclab
 
 ## Installation
 
-- Install Isaac Lab by following the [installation guide](https://isaac-sim.github.io/IsaacLab/main/source/setup/installation/index.html).
-  We recommend using the conda or uv installation as it simplifies calling Python scripts from the terminal.
+### Prerequisites
 
-- Clone or copy this project/repository separately from the Isaac Lab installation (i.e. outside the `IsaacLab` directory):
+- Python 3.10+
+- IsaacLab 2.1.0+
+- NVIDIA GPU with CUDA support
 
-- Using a python interpreter that has Isaac Lab installed, install the library in editable mode using:
+### Install Isaac Lab
 
-    ```bash
-    # use 'PATH_TO_isaaclab.sh|bat -p' instead of 'python' if Isaac Lab is not installed in Python venv or conda
-    python -m pip install -e source/RL_Bezier_MPC
+Install Isaac Lab by following the [installation guide](https://isaac-sim.github.io/IsaacLab/main/source/setup/installation/index.html).
+We recommend using the conda or uv installation as it simplifies calling Python scripts from the terminal.
 
-- Verify that the extension is correctly installed by:
+### Install This Extension
 
-    - Listing the available tasks:
+Using a python interpreter that has Isaac Lab installed, install the library in editable mode:
 
-        Note: It the task name changes, it may be necessary to update the search pattern `"Template-"`
-        (in the `scripts/list_envs.py` file) so that it can be listed.
+```bash
+# Navigate to the project directory
+cd RL_Bezier_MPC
 
-        ```bash
-        # use 'FULL_PATH_TO_isaaclab.sh|bat -p' instead of 'python' if Isaac Lab is not installed in Python venv or conda
-        python scripts/list_envs.py
-        ```
+# Install the extension
+python -m pip install -e source/RL_Bezier_MPC
 
-    - Running a task:
+# Install Crocoddyl for MPC (optional but recommended)
+pip install crocoddyl
 
-        ```bash
-        # use 'FULL_PATH_TO_isaaclab.sh|bat -p' instead of 'python' if Isaac Lab is not installed in Python venv or conda
-        python scripts/<RL_LIBRARY>/train.py --task=<TASK_NAME>
-        ```
+# Install RSL-RL for training
+pip install rsl-rl-lib>=3.0.1
+```
 
-    - Running a task with dummy agents:
+### Verify Installation
 
-        These include dummy agents that output zero or random agents. They are useful to ensure that the environments are configured correctly.
+List available tasks:
 
-        - Zero-action agent
+```bash
+python scripts/list_envs.py
+```
 
-            ```bash
-            # use 'FULL_PATH_TO_isaaclab.sh|bat -p' instead of 'python' if Isaac Lab is not installed in Python venv or conda
-            python scripts/zero_agent.py --task=<TASK_NAME>
-            ```
-        - Random-action agent
+You should see `Quadrotor-MPC-Bezier-v0` in the list.
 
-            ```bash
-            # use 'FULL_PATH_TO_isaaclab.sh|bat -p' instead of 'python' if Isaac Lab is not installed in Python venv or conda
-            python scripts/random_agent.py --task=<TASK_NAME>
-            ```
+## Quick Start
+
+### Phase 1: Standalone MPC Test (No Simulation)
+
+Test trajectory generation and MPC tracking:
+
+```bash
+python scripts/test_mpc_standalone.py
+```
+
+### Phase 2: Simulation Test
+
+Run the environment with a random policy:
+
+```bash
+python scripts/play_quadrotor_mpc.py --random --num_envs 4
+```
+
+### Phase 3: RL Training
+
+Train the RL policy:
+
+```bash
+# Default: 64 parallel environments
+python scripts/train_quadrotor_mpc.py
+
+# Custom settings
+python scripts/train_quadrotor_mpc.py --num_envs 32 --max_iterations 2000
+
+# With video recording
+python scripts/train_quadrotor_mpc.py --video
+```
+
+### Evaluate Trained Policy
+
+```bash
+python scripts/play_quadrotor_mpc.py --checkpoint logs/quadrotor_mpc/*/model_*.pt
+```
+
+## Key Components
+
+### BezierTrajectoryGenerator
+
+Converts 12D Bezier control point offsets to dense 3D position waypoints.
+
+### CrocoddylQuadrotorMPC
+
+Optimal control solver using FDDP for trajectory tracking.
+
+### QuadrotorMPCEnv
+
+IsaacLab DirectRL environment integrating RL, trajectory generation, and MPC.
+
+## Configuration
+
+Key parameters in `QuadrotorMPCEnvCfg`:
+
+| Parameter | Default | Description |
+|-----------|---------|-------------|
+| `sim.dt` | 0.005 | Physics timestep (200 Hz) |
+| `decimation` | 4 | Steps per control (50 Hz MPC) |
+| `mpc_horizon_steps` | 25 | MPC lookahead (0.5s) |
+| `bezier_horizon` | 1.5 | Trajectory duration (s) |
+| `rl_policy_period` | 5 | MPC steps per RL update (10 Hz) |
 
 ### Set up IDE (Optional)
 
