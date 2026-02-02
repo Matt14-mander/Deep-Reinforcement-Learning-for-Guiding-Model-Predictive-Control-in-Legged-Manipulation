@@ -107,7 +107,7 @@ class B1RobotConfig:
     GAIT_PARAMS = {
         "step_duration": 0.15,
         "support_duration": 0.05,
-        "step_height": 0.1,
+        "step_height": 0.15,
     }
 
     # Standing height (CoM height)
@@ -159,7 +159,7 @@ def create_com_trajectory(
     start_pos: np.ndarray,
     trajectory_type: str = "straight",
     distance: float = 0.5,
-    turn_angle: float = np.pi / 4,
+    turn_angle: float = np.pi / 3,
     duration: float = 2.0,
     dt: float = 0.02,
 ) -> Tuple[np.ndarray, np.ndarray]:
@@ -204,8 +204,8 @@ def create_com_trajectory(
         params[9:12] = [forward, lateral, 0.0]
 
     elif trajectory_type == "s_curve":
-        params[3:6] = [distance / 3, distance * 0.15, 0.0]
-        params[6:9] = [2 * distance / 3, -distance * 0.15, 0.0]
+        params[3:6] = [distance / 3, distance * 0.3, 0.0]
+        params[6:9] = [2 * distance / 3, -distance * 0.3, 0.0]
         params[9:12] = [distance, 0.0, 0.0]
 
     else:
@@ -284,7 +284,7 @@ def build_ocp_with_our_pipeline(
                     np.array([0.0, 0.0, 0.0]),
                     pinocchio.LOCAL_WORLD_ALIGNED,
                     nu,
-                    np.array([0.0, 0.0])
+                    np.array([0.0, 50.0])
                 )
                 contact_model.addContact(f"contact_{foot_id}", contact)
 
@@ -389,7 +389,7 @@ def build_ocp_with_our_pipeline(
 def test_b1_gait(
     gait_type: str = "trot",
     trajectory_type: str = "straight",
-    distance: float = 0.5,
+    distance: float = 2.0,
     with_display: bool = False,
     with_plot: bool = False,
 ):
@@ -423,7 +423,7 @@ def test_b1_gait(
 
     # Create CoM trajectory
     print("\nGenerating CoM trajectory...")
-    duration = 2.0
+    duration = 3.0
     dt = 0.02
     com_trajectory, bezier_params = create_com_trajectory(
         start_pos=com_start,
@@ -443,7 +443,7 @@ def test_b1_gait(
         gait_type=gait_type,
         step_duration=B1RobotConfig.GAIT_PARAMS["step_duration"],
         support_duration=B1RobotConfig.GAIT_PARAMS["support_duration"],
-        num_cycles=4,
+        num_cycles=12,
     )
 
     print(f"  Number of phases: {len(contact_sequence)}")
