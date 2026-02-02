@@ -182,80 +182,63 @@ class CrocoddylQuadrotorMPC(BaseMPC):
         control_dim = 4
 
         # Create state manifold (vector space for simplicity)
-        # In practice, could use StateMultibody with a floating base model
         self.state = crocoddyl.StateVector(state_dim)
 
-        # Create running cost model
-        running_cost_model = crocoddyl.CostModelSum(self.state)
+        # Store references that can be updated later
+        self._reference_states = []
 
-        # Position tracking cost (will be updated each solve with reference)
-        # Using a residual model for state tracking
-        self.position_ref = np.zeros(3)  # Will be updated in solve()
-        position_residual = crocoddyl.ResidualModelState(
-            self.state, np.zeros(state_dim), state_dim
-        )
-        position_activation = crocoddyl.ActivationModelWeightedQuad(
-            np.array([self.position_weight] * 3 + [0.0] * 10)  # Only penalize position
-        )
-        position_cost = crocoddyl.CostModelResidual(
-            self.state, position_activation, position_residual
-        )
-        running_cost_model.addCost("position", position_cost, 1.0)
-
-        # Velocity regularization
-        velocity_activation = crocoddyl.ActivationModelWeightedQuad(
-            np.array([0.0] * 7 + [self.velocity_weight] * 3 + [0.0] * 3)
-        )
-        velocity_residual = crocoddyl.ResidualModelState(
-            self.state, np.zeros(state_dim), state_dim
-        )
-        velocity_cost = crocoddyl.CostModelResidual(
-            self.state, velocity_activation, velocity_residual
-        )
-        running_cost_model.addCost("velocity", velocity_cost, 1.0)
-
-        # Control regularization
-        control_residual = crocoddyl.ResidualModelControl(self.state, control_dim)
-        control_activation = crocoddyl.ActivationModelWeightedQuad(
-            np.array([self.control_weight] * control_dim)
-        )
-        control_cost = crocoddyl.CostModelResidual(
-            self.state, control_activation, control_residual
-        )
-        running_cost_model.addCost("control", control_cost, 1.0)
-
-        # Terminal cost model (higher weights)
-        terminal_cost_model = crocoddyl.CostModelSum(self.state)
-
-        terminal_position_activation = crocoddyl.ActivationModelWeightedQuad(
-            np.array(
-                [self.position_weight * self.terminal_weight_factor] * 3 + [0.0] * 10
-            )
-        )
-        terminal_position_cost = crocoddyl.CostModelResidual(
-            self.state, terminal_position_activation, position_residual
-        )
-        terminal_cost_model.addCost("terminal_position", terminal_position_cost, 1.0)
-
-        terminal_velocity_activation = crocoddyl.ActivationModelWeightedQuad(
-            np.array(
-                [0.0] * 7
-                + [self.velocity_weight * self.terminal_weight_factor] * 3
-                + [0.0] * 3
-            )
-        )
-        terminal_velocity_cost = crocoddyl.CostModelResidual(
-            self.state, terminal_velocity_activation, velocity_residual
-        )
-        terminal_cost_model.addCost("terminal_velocity", terminal_velocity_cost, 1.0)
-
-        # Create action models with quadrotor dynamics
+        # Create running action models (each has its own cost model for reference tracking)
         self.running_models = []
-        for _ in range(self.horizon_steps):
+        for i in range(self.horizon_steps):
+            # Create cost model for this timestep
+            running_cost_model = crocoddyl.CostModelSum(self.state, control_dim)
+
+            # Create reference state for this timestep
+            ref_state = np.zeros(state_dim)
+            ref_state[3] = 1.0  # Identity quaternion
+            self._reference_states.append(ref_state)
+
+            # Position tracking cost using ResidualModelState
+            # ResidualModelState(state, xref, nu) - nu must match control dimension
+            position_residual = crocoddyl.ResidualModelState(
+                self.state, ref_state, control_dim
+            )
+            position_activation = crocoddyl.ActivationModelWeightedQuad(
+                np.array([self.position_weight] * 3 + [0.0] * 10)
+            )
+            position_cost = crocoddyl.CostModelResidual(
+                self.state, position_activation, position_residual
+            )
+            running_cost_model.addCost("position", position_cost, 1.0)
+
+            # Velocity regularization
+            velocity_residual = crocoddyl.ResidualModelState(
+                self.state, np.zeros(state_dim), control_dim
+            )
+            velocity_activation = crocoddyl.ActivationModelWeightedQuad(
+                np.array([0.0] * 7 + [self.velocity_weight] * 3 + [0.0] * 3)
+            )
+            velocity_cost = crocoddyl.CostModelResidual(
+                self.state, velocity_activation, velocity_residual
+            )
+            running_cost_model.addCost("velocity", velocity_cost, 1.0)
+
+            # Control regularization
+            u_ref = np.array([self.hover_thrust, 0.0, 0.0, 0.0])
+            control_residual = crocoddyl.ResidualModelControl(self.state, u_ref)
+            control_activation = crocoddyl.ActivationModelWeightedQuad(
+                np.array([self.control_weight] * control_dim)
+            )
+            control_cost = crocoddyl.CostModelResidual(
+                self.state, control_activation, control_residual
+            )
+            running_cost_model.addCost("control", control_cost, 1.0)
+
             # Create differential model with quadrotor dynamics
             diff_model = _QuadrotorDifferentialActionModel(
                 self.state,
                 running_cost_model,
+                control_dim,
                 mass=self.mass,
                 inertia=self.inertia,
                 gravity=self.gravity,
@@ -274,10 +257,49 @@ class CrocoddylQuadrotorMPC(BaseMPC):
 
             self.running_models.append(model)
 
-        # Terminal model (no control, just cost)
+        # Terminal cost model (nu=0 for terminal state, no control)
+        terminal_cost_model = crocoddyl.CostModelSum(self.state, 0)
+
+        # Terminal reference state
+        terminal_ref_state = np.zeros(state_dim)
+        terminal_ref_state[3] = 1.0
+        self._terminal_reference_state = terminal_ref_state
+
+        # Terminal position cost (nu=0)
+        terminal_position_residual = crocoddyl.ResidualModelState(
+            self.state, terminal_ref_state, 0
+        )
+        terminal_position_activation = crocoddyl.ActivationModelWeightedQuad(
+            np.array(
+                [self.position_weight * self.terminal_weight_factor] * 3 + [0.0] * 10
+            )
+        )
+        terminal_position_cost = crocoddyl.CostModelResidual(
+            self.state, terminal_position_activation, terminal_position_residual
+        )
+        terminal_cost_model.addCost("terminal_position", terminal_position_cost, 1.0)
+
+        # Terminal velocity cost (nu=0)
+        terminal_velocity_residual = crocoddyl.ResidualModelState(
+            self.state, np.zeros(state_dim), 0
+        )
+        terminal_velocity_activation = crocoddyl.ActivationModelWeightedQuad(
+            np.array(
+                [0.0] * 7
+                + [self.velocity_weight * self.terminal_weight_factor] * 3
+                + [0.0] * 3
+            )
+        )
+        terminal_velocity_cost = crocoddyl.CostModelResidual(
+            self.state, terminal_velocity_activation, terminal_velocity_residual
+        )
+        terminal_cost_model.addCost("terminal_velocity", terminal_velocity_cost, 1.0)
+
+        # Terminal model (no dynamics integration, dt=0)
         terminal_diff_model = _QuadrotorDifferentialActionModel(
             self.state,
             terminal_cost_model,
+            0,  # nu=0 for terminal
             mass=self.mass,
             inertia=self.inertia,
             gravity=self.gravity,
@@ -413,33 +435,44 @@ class CrocoddylQuadrotorMPC(BaseMPC):
         return np.array([w, x, y, z])
 
     def _update_reference(self, reference_trajectory: np.ndarray):
-        """Update reference positions in cost functions."""
+        """Update reference positions in cost functions.
+
+        Args:
+            reference_trajectory: Reference positions (T x 3) for the MPC horizon.
+        """
         ref = np.atleast_2d(reference_trajectory)
         num_refs = len(ref)
 
+        # Update running model references
         for i, model in enumerate(self.running_models):
             ref_idx = min(i, num_refs - 1)
             ref_pos = ref[ref_idx]
-            ref_state = np.zeros(13)
-            ref_state[:3] = ref_pos
-            ref_state[3] = 1.0
 
+            # Update stored reference state
+            self._reference_states[i][:3] = ref_pos
+            self._reference_states[i][3] = 1.0  # Identity quaternion
+
+            # Update the cost model's reference
             diff_model = model.differential
-            if hasattr(diff_model, "costs"):
-                for name, cost_item in diff_model.costs.costs.items():
-                    if "position" in name:
-                        cost_item.cost.residual.reference = ref_state
+            if hasattr(diff_model, "costs") and diff_model.costs is not None:
+                costs_dict = diff_model.costs.costs
+                if "position" in costs_dict:
+                    cost_item = costs_dict["position"]
+                    if hasattr(cost_item.cost, "residual"):
+                        cost_item.cost.residual.reference = self._reference_states[i]
 
+        # Update terminal reference
         final_ref_pos = ref[-1]
-        terminal_ref_state = np.zeros(13)
-        terminal_ref_state[:3] = final_ref_pos
-        terminal_ref_state[3] = 1.0
+        self._terminal_reference_state[:3] = final_ref_pos
+        self._terminal_reference_state[3] = 1.0
 
         terminal_diff = self.terminal_model.differential
-        if hasattr(terminal_diff, "costs"):
-            for name, cost_item in terminal_diff.costs.costs.items():
-                if "position" in name:
-                    cost_item.cost.residual.reference = terminal_ref_state
+        if hasattr(terminal_diff, "costs") and terminal_diff.costs is not None:
+            costs_dict = terminal_diff.costs.costs
+            if "terminal_position" in costs_dict:
+                cost_item = costs_dict["terminal_position"]
+                if hasattr(cost_item.cost, "residual"):
+                    cost_item.cost.residual.reference = self._terminal_reference_state
 
     def _shift_trajectory(self, prev_xs: list, current_state: np.ndarray) -> list:
         """Shift previous state trajectory for warm-starting."""
@@ -507,24 +540,35 @@ if CROCODDYL_AVAILABLE:
             q̇ = 0.5 * Ω(ω) @ q
         """
 
-        def __init__(self, state, cost_model, mass: float, inertia: np.ndarray, gravity: np.ndarray):
-            nu = 4
+        def __init__(self, state, cost_model, nu: int, mass: float, inertia: np.ndarray, gravity: np.ndarray):
+            """Initialize quadrotor differential action model.
+
+            Args:
+                state: Crocoddyl state model
+                cost_model: Cost model (CostModelSum)
+                nu: Control dimension (4 for running models, 0 for terminal)
+                mass: Quadrotor mass in kg
+                inertia: 3x3 inertia matrix
+                gravity: 3D gravity vector
+            """
             crocoddyl.DifferentialActionModelAbstract.__init__(self, state, nu, cost_model.nr)
             self.costs = cost_model
+            self._nu = nu
             self.mass = mass
             self.inertia = inertia
             self.inertia_inv = np.linalg.inv(inertia)
             self.gravity = gravity
 
         def calc(self, data, x, u=None):
-            if u is None:
+            # Handle terminal model case (nu=0)
+            if self._nu == 0 or u is None:
                 u = np.zeros(4)
 
             quat = x[3:7]
             vel = x[7:10]
             omega = x[10:13]
-            thrust = u[0]
-            torque = u[1:4]
+            thrust = u[0] if len(u) > 0 else 0.0
+            torque = u[1:4] if len(u) > 3 else np.zeros(3)
 
             R = self._quat_to_rot(quat)
             thrust_body = np.array([0.0, 0.0, thrust])
@@ -538,19 +582,26 @@ if CROCODDYL_AVAILABLE:
             quat_dot = 0.5 * self._quat_mult(omega_quat, quat)
 
             data.xout = np.concatenate([vel, quat_dot, acc, angular_acc])
-            self.costs.calc(data.costs, x, u)
+
+            # Call cost calculation
+            if self._nu == 0:
+                self.costs.calc(data.costs, x)
+            else:
+                self.costs.calc(data.costs, x, u)
             data.cost = data.costs.cost
 
         def calcDiff(self, data, x, u=None):
-            if u is None:
+            # Handle terminal model case (nu=0)
+            if self._nu == 0 or u is None:
                 u = np.zeros(4)
-
-            self.costs.calcDiff(data.costs, x, u)
+                self.costs.calcDiff(data.costs, x)
+            else:
+                self.costs.calcDiff(data.costs, x, u)
 
             eps = 1e-6
             nx = self.state.nx
-            nu = self.nu
 
+            # Compute Fx (state Jacobian)
             data.Fx = np.zeros((nx, nx))
             for i in range(nx):
                 x_plus, x_minus = x.copy(), x.copy()
@@ -561,21 +612,25 @@ if CROCODDYL_AVAILABLE:
                 self.calc(data_minus, x_minus, u)
                 data.Fx[:, i] = (data_plus.xout - data_minus.xout) / (2 * eps)
 
-            data.Fu = np.zeros((nx, nu))
-            for i in range(nu):
-                u_plus, u_minus = u.copy(), u.copy()
-                u_plus[i] += eps
-                u_minus[i] -= eps
-                data_plus, data_minus = self.createData(), self.createData()
-                self.calc(data_plus, x, u_plus)
-                self.calc(data_minus, x, u_minus)
-                data.Fu[:, i] = (data_plus.xout - data_minus.xout) / (2 * eps)
+            # Compute Fu (control Jacobian) only for non-terminal models
+            if self._nu > 0:
+                data.Fu = np.zeros((nx, self._nu))
+                for i in range(self._nu):
+                    u_plus, u_minus = u.copy(), u.copy()
+                    u_plus[i] += eps
+                    u_minus[i] -= eps
+                    data_plus, data_minus = self.createData(), self.createData()
+                    self.calc(data_plus, x, u_plus)
+                    self.calc(data_minus, x, u_minus)
+                    data.Fu[:, i] = (data_plus.xout - data_minus.xout) / (2 * eps)
 
             data.Lx = data.costs.Lx
-            data.Lu = data.costs.Lu
             data.Lxx = data.costs.Lxx
-            data.Luu = data.costs.Luu
-            data.Lxu = data.costs.Lxu
+
+            if self._nu > 0:
+                data.Lu = data.costs.Lu
+                data.Luu = data.costs.Luu
+                data.Lxu = data.costs.Lxu
 
         def createData(self):
             data = crocoddyl.DifferentialActionDataAbstract(self)
