@@ -1,7 +1,12 @@
 {
   "permissions": {
     "allow": [
-      "Bash(tree:*)"
+      "Bash(tree:*)",
+      "Bash(python:*)",
+      "Bash(E:/msys64/ucrt64/bin/python.exe:*)",
+      "Bash(where:*)",
+      "Bash(E:/anaconda3/Scripts/conda.exe info:*)",
+      "Bash(E:/anaconda3/envs/croco_env/python.exe:*)"
     ]
   }
 }
