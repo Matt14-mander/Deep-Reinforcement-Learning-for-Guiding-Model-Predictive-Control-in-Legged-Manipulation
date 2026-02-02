@@ -1,0 +1,14 @@
+# Copyright (c) 2022-2026, The Isaac Lab Project Developers.
+# All rights reserved.
+#
+# SPDX-License-Identifier: BSD-3-Clause
+
+"""Trajectory generation module for quadruped MPC."""
+
+from .bezier_trajectory import BezierTrajectoryGenerator
+from .bezier_foot_trajectory import BezierFootTrajectory
+
+__all__ = [
+    "BezierTrajectoryGenerator",
+    "BezierFootTrajectory",
+]
