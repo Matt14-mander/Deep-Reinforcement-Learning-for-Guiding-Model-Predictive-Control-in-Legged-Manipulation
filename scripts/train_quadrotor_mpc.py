@@ -226,7 +226,8 @@ def train_with_rsl_rl(env_cfg: QuadrotorMPCEnvCfg, log_dir: str):
     env = QuadrotorMPCEnv(cfg=env_cfg, render_mode="rgb_array" if args_cli.video else None)
 
     # Wrap environment for RSL-RL
-    env = RslRlVecEnvWrapper(env, clip_actions=True)
+    # clip_actions=1.0 means actions are clipped to [-1, 1]
+    env = RslRlVecEnvWrapper(env, clip_actions=1.0)
 
     # Create PPO configuration
     ppo_cfg = create_ppo_config(env_cfg)
