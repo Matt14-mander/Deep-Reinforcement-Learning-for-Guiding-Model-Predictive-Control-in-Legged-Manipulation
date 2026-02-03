@@ -6,17 +6,9 @@
 
 """Simplified evaluation script for trained Quadrotor MPC agent.
 
-This script directly loads a trained RSL-RL model checkpoint and evaluates
-the policy in the quadrotor MPC environment.
-
 Usage:
-    # Evaluate with specific checkpoint
     python scripts/evaluate_quadrotor.py --checkpoint logs/quadrotor_mpc/2026-02-03_20-11-03/model_499.pt
-
-    # Evaluate with random policy (for testing)
     python scripts/evaluate_quadrotor.py --random
-
-    # Evaluate with more environments
     python scripts/evaluate_quadrotor.py --checkpoint path/to/model.pt --num_envs 8
 """
 
@@ -80,7 +72,7 @@ def create_runner_config():
         "seed": 42,
         "device": "cuda" if torch.cuda.is_available() else "cpu",
         "num_steps_per_env": 24,
-        "max_iterations": 1,  # Not training, just need structure
+        "max_iterations": 1,
         "empirical_normalization": True,  # Must match training!
         "obs_groups": {},
         "policy": {
@@ -112,6 +104,47 @@ def create_runner_config():
     }
 
 
+def load_policy_direct(checkpoint_path: str, obs_dim: int, action_dim: int, device):
+    """Load policy directly from checkpoint without using OnPolicyRunner."""
+    print(f"Loading checkpoint directly: {checkpoint_path}")
+
+    checkpoint = torch.load(checkpoint_path, map_location=device)
+    print(f"Checkpoint keys: {checkpoint.keys()}")
+
+    # Create ActorCritic model
+    from rsl_rl.modules import ActorCritic
+
+    policy = ActorCritic(
+        num_actor_obs=obs_dim,
+        num_critic_obs=obs_dim,
+        num_actions=action_dim,
+        actor_hidden_dims=[256, 256, 128],
+        critic_hidden_dims=[256, 256, 128],
+        activation="elu",
+        init_noise_std=1.0,
+    ).to(device)
+
+    # Load model state
+    if "model_state_dict" in checkpoint:
+        policy.load_state_dict(checkpoint["model_state_dict"])
+        print("Loaded model_state_dict")
+    elif "actor_critic" in checkpoint:
+        policy.load_state_dict(checkpoint["actor_critic"])
+        print("Loaded actor_critic")
+    else:
+        print(f"Warning: Could not find model weights in checkpoint")
+        print(f"Available keys: {checkpoint.keys()}")
+
+    policy.eval()
+
+    # Create inference function
+    def inference_fn(obs):
+        with torch.inference_mode():
+            return policy.act_inference(obs)
+
+    return inference_fn, policy
+
+
 def main():
     """Main evaluation function."""
     print("=" * 60)
@@ -129,81 +162,67 @@ def main():
     print(f"Episode length: {env_cfg.episode_length_s}s")
 
     # Create environment
+    print("Creating environment...")
     env = QuadrotorMPCEnv(
         cfg=env_cfg,
         render_mode="rgb_array" if args_cli.video else None,
     )
 
-    print(f"Observation space: {env.observation_space}")
-    print(f"Action space: {env.action_space}")
+    obs_dim = env.observation_space.shape[-1]  # 17
+    action_dim = env.action_space.shape[-1]  # 12
 
-    # Wrap environment for RSL-RL
-    env_wrapped = RslRlVecEnvWrapper(env, clip_actions=1.0)
+    print(f"Observation dim: {obs_dim}")
+    print(f"Action dim: {action_dim}")
 
     # Create policy
+    policy_nn = None
+
     if args_cli.random:
         print("\nUsing random policy")
-        policy = lambda obs: torch.rand(
-            (args_cli.num_envs, env.action_space.shape[0]),
-            device=device
-        ) * 2 - 1
-    elif args_cli.checkpoint:
-        print(f"\nLoading checkpoint: {args_cli.checkpoint}")
 
+        def policy(obs):
+            batch_size = obs.shape[0]
+            return torch.rand((batch_size, action_dim), device=device) * 2 - 1
+
+    elif args_cli.checkpoint:
         if not os.path.exists(args_cli.checkpoint):
             print(f"ERROR: Checkpoint file not found: {args_cli.checkpoint}")
             env.close()
             return
 
-        # Create runner with matching config
-        runner_cfg = create_runner_config()
-        runner = OnPolicyRunner(
-            env_wrapped,
-            runner_cfg,
-            log_dir=None,
-            device=device
+        # Load policy directly (avoid OnPolicyRunner initialization issues)
+        policy, policy_nn = load_policy_direct(
+            args_cli.checkpoint, obs_dim, action_dim, device
         )
+        print("Policy loaded successfully!")
 
-        # Load checkpoint
-        runner.load(args_cli.checkpoint)
-        print("Checkpoint loaded successfully!")
-
-        # Get inference policy
-        policy = runner.get_inference_policy(device=device)
-        print("Policy ready for inference")
     else:
         print("\nUsing straight-line policy (no checkpoint specified)")
-        # Simple policy that moves towards target
-        def straight_line_policy(obs):
+
+        def policy(obs):
             batch_size = obs.shape[0]
             actions = torch.zeros((batch_size, 12), device=device)
-
-            # Extract position and target from observation
             current_pos = obs[:, 0:3]
             target_pos = obs[:, 13:16]
-
-            # Direction to target
             direction = target_pos - current_pos
             distance = torch.norm(direction, dim=1, keepdim=True)
             direction_normalized = direction / (distance + 1e-6)
             scale = torch.clamp(distance / 2.0, 0, 1)
-
-            # Set control points along straight line
-            actions[:, 0:3] = 0.0  # P0 offset
-            actions[:, 3:6] = direction_normalized * scale / 3  # P1
-            actions[:, 6:9] = direction_normalized * scale * 2 / 3  # P2
-            actions[:, 9:12] = direction_normalized * scale  # P3
-
+            actions[:, 0:3] = 0.0
+            actions[:, 3:6] = direction_normalized * scale / 3
+            actions[:, 6:9] = direction_normalized * scale * 2 / 3
+            actions[:, 9:12] = direction_normalized * scale
             return actions
-
-        policy = straight_line_policy
 
     # Run evaluation
     print(f"\nRunning evaluation for {args_cli.num_steps} steps...")
     print("-" * 40)
 
-    # Get initial observations using the wrapper's method
-    obs = env_wrapped.get_observations()
+    # Reset environment and get initial observations
+    print("Resetting environment...")
+    obs_dict, info = env.reset()
+    obs = obs_dict["policy"]  # Get observation tensor
+    print(f"Initial obs shape: {obs.shape}")
 
     total_rewards = np.zeros(args_cli.num_envs)
     episode_rewards = []
@@ -218,7 +237,9 @@ def main():
             actions = policy(obs)
 
         # Step environment
-        obs, rewards, dones, infos = env_wrapped.step(actions)
+        obs_dict, rewards, terminated, truncated, infos = env.step(actions)
+        obs = obs_dict["policy"]
+        dones = terminated | truncated
 
         # Accumulate rewards
         if isinstance(rewards, torch.Tensor):
@@ -246,9 +267,11 @@ def main():
         if (step + 1) % 100 == 0:
             elapsed = time.time() - start_time
             fps = (step + 1) * args_cli.num_envs / elapsed
-            print(f"Step {step + 1}/{args_cli.num_steps}, "
-                  f"Episodes: {len(episode_rewards)}, "
-                  f"FPS: {fps:.1f}")
+            print(
+                f"Step {step + 1}/{args_cli.num_steps}, "
+                f"Episodes: {len(episode_rewards)}, "
+                f"FPS: {fps:.1f}"
+            )
 
     # Print final statistics
     print("-" * 40)
@@ -256,7 +279,9 @@ def main():
 
     if episode_rewards:
         print(f"  Completed episodes: {len(episode_rewards)}")
-        print(f"  Mean reward: {np.mean(episode_rewards):.2f} +/- {np.std(episode_rewards):.2f}")
+        print(
+            f"  Mean reward: {np.mean(episode_rewards):.2f} +/- {np.std(episode_rewards):.2f}"
+        )
         print(f"  Min reward: {np.min(episode_rewards):.2f}")
         print(f"  Max reward: {np.max(episode_rewards):.2f}")
         print(f"  Mean episode length: {np.mean(episode_lengths):.1f}")
