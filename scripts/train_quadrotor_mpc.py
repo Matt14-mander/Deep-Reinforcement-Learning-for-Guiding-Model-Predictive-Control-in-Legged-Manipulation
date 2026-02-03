@@ -101,6 +101,8 @@ def create_ppo_config(env_cfg: QuadrotorMPCEnvCfg):
         "num_steps_per_env": 24,  # Rollout length
         "max_iterations": args_cli.max_iterations,
         "empirical_normalization": True,
+        # Observation groups (required by new RSL-RL)
+        "obs_groups": {},
         # PPO algorithm parameters
         "policy": {
             "class_name": "ActorCritic",
