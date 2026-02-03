@@ -108,7 +108,7 @@ def load_policy_direct(checkpoint_path: str, obs_dim: int, action_dim: int, devi
     """Load policy directly from checkpoint without using OnPolicyRunner."""
     print(f"Loading checkpoint directly: {checkpoint_path}")
 
-    checkpoint = torch.load(checkpoint_path, map_location=device)
+    checkpoint = torch.load(checkpoint_path, map_location=device, weights_only=False)
     print(f"Checkpoint keys: {checkpoint.keys()}")
 
     # Create ActorCritic model
