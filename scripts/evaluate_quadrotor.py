@@ -34,6 +34,7 @@ parser.add_argument(
 )
 parser.add_argument("--random", action="store_true", help="Use random policy")
 parser.add_argument("--video", action="store_true", help="Record video")
+parser.add_argument("--video_length", type=int, default=300, help="Video length in steps")
 
 # AppLauncher arguments
 AppLauncher.add_app_launcher_args(parser)
@@ -230,6 +231,16 @@ def main():
             actions[:, 9:12] = direction_normalized * scale
             return actions
 
+    # Video recording setup
+    video_writer = None
+    video_dir = None
+    if args_cli.video:
+        video_dir = os.path.join("logs", "quadrotor_mpc", "videos")
+        os.makedirs(video_dir, exist_ok=True)
+        timestamp = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
+        video_path = os.path.join(video_dir, f"eval_{timestamp}.mp4")
+        print(f"\nVideo will be saved to: {video_path}")
+
     # Run evaluation
     print(f"\nRunning evaluation for {args_cli.num_steps} steps...")
     print("-" * 40)
@@ -245,9 +256,22 @@ def main():
     episode_lengths = []
     current_episode_length = np.zeros(args_cli.num_envs)
 
+    # Collect video frames
+    video_frames = []
+
     start_time = time.time()
 
     for step in range(args_cli.num_steps):
+        # Capture video frame
+        if args_cli.video and step < args_cli.video_length:
+            frame = env.render()
+            if frame is not None:
+                if isinstance(frame, torch.Tensor):
+                    frame = frame.cpu().numpy()
+                if frame.ndim == 4:
+                    frame = frame[0]  # Take first env
+                video_frames.append(frame)
+
         # Get actions from policy
         with torch.inference_mode():
             actions = policy(obs)
@@ -288,6 +312,35 @@ def main():
                 f"Episodes: {len(episode_rewards)}, "
                 f"FPS: {fps:.1f}"
             )
+
+    # Save video
+    if args_cli.video and video_frames:
+        print(f"\nSaving video with {len(video_frames)} frames...")
+        try:
+            import cv2
+
+            h, w = video_frames[0].shape[:2]
+            fourcc = cv2.VideoWriter_fourcc(*"mp4v")
+            video_writer = cv2.VideoWriter(video_path, fourcc, 30.0, (w, h))
+            for frame in video_frames:
+                # Convert RGB to BGR for OpenCV
+                bgr_frame = cv2.cvtColor(frame, cv2.COLOR_RGB2BGR)
+                video_writer.write(bgr_frame)
+            video_writer.release()
+            print(f"Video saved: {video_path} ({len(video_frames)} frames, {w}x{h})")
+        except ImportError:
+            print("OpenCV not installed, saving frames as images instead...")
+            frames_dir = os.path.join(video_dir, f"frames_{timestamp}")
+            os.makedirs(frames_dir, exist_ok=True)
+            from PIL import Image
+
+            for i, frame in enumerate(video_frames):
+                img = Image.fromarray(frame)
+                img.save(os.path.join(frames_dir, f"frame_{i:04d}.png"))
+            print(f"Frames saved to: {frames_dir}")
+    elif args_cli.video:
+        print("\nNo frames captured. render() may not be supported in headless mode.")
+        print("Try adding --enable_cameras flag or use Isaac Sim's built-in recorder.")
 
     # Print final statistics
     print("-" * 40)
