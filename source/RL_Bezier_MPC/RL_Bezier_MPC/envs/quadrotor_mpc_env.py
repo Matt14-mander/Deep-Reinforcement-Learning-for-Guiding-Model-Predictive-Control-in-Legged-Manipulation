@@ -288,6 +288,17 @@ class QuadrotorMPCEnv(DirectRLEnv):
             env_ids=slice(None),   # All environments
         )
 
+    def _apply_action(self) -> None:
+        """Apply the computed controls to the simulation.
+
+        This method is called at each physics step. The controls were already
+        computed and stored in _pre_physics_step, so we just need to ensure
+        they are written to the simulation.
+        """
+        # The permanent wrench composer automatically applies forces each step
+        # We just need to call write_data_to_sim on the asset
+        pass  # Forces are applied via permanent_wrench_composer set in _pre_physics_step
+
     def _get_observations(self) -> Dict[str, torch.Tensor]:
         """Compute observations for RL policy.
 
