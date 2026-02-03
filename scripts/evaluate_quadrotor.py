@@ -111,9 +111,11 @@ def load_policy_direct(checkpoint_path: str, obs_dim: int, action_dim: int, devi
     checkpoint = torch.load(checkpoint_path, map_location=device, weights_only=False)
     print(f"Checkpoint keys: {checkpoint.keys()}")
 
-    # Create ActorCritic model
+    # Create ActorCritic model with normalizer enabled (matching training config)
     from rsl_rl.modules import ActorCritic
+    from rsl_rl.utils.benchmarkable import Benchmarkable
 
+    print("Creating ActorCritic model...")
     policy = ActorCritic(
         num_actor_obs=obs_dim,
         num_critic_obs=obs_dim,
@@ -122,20 +124,25 @@ def load_policy_direct(checkpoint_path: str, obs_dim: int, action_dim: int, devi
         critic_hidden_dims=[256, 256, 128],
         activation="elu",
         init_noise_std=1.0,
+        obs_normalizer_class_name="EmpiricalNormalization",  # Match training
+        obs_normalizer_cfg={},
     ).to(device)
+    print("ActorCritic model created")
 
     # Load model state
+    print("Loading state dict...")
     if "model_state_dict" in checkpoint:
         policy.load_state_dict(checkpoint["model_state_dict"])
-        print("Loaded model_state_dict")
+        print("Loaded model_state_dict successfully")
     elif "actor_critic" in checkpoint:
         policy.load_state_dict(checkpoint["actor_critic"])
-        print("Loaded actor_critic")
+        print("Loaded actor_critic successfully")
     else:
         print(f"Warning: Could not find model weights in checkpoint")
         print(f"Available keys: {checkpoint.keys()}")
 
     policy.eval()
+    print("Policy set to eval mode")
 
     # Create inference function
     def inference_fn(obs):
