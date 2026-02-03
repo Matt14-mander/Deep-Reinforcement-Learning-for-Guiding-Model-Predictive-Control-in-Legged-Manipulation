@@ -101,13 +101,16 @@ class QuadrupedMPCEnvCfg(DirectRLEnvCfg):
     #   - Target position (3D): goal position
     #   - Gait phase (1D): normalized progress [0, 1]
     # Total: 45D
-    num_observations: int = 45
+    observation_space: int = 45
 
     # Action space:
     #   - CoM Bezier control point offsets (12D): 4 points × 3D
     #   - Gait modulation (3D): step_length, step_height, step_frequency modifiers
     # Total: 15D
-    num_actions: int = 15
+    action_space: int = 15
+
+    # State space (for asymmetric actor-critic, 0 means same as observation)
+    state_space: int = 0
 
     # Action sub-dimensions for parsing
     num_bezier_actions: int = 12
@@ -293,7 +296,7 @@ class QuadrupedMPCEnvCfg(DirectRLEnvCfg):
         assert self.decimation > 0, "Decimation must be positive"
         assert self.mpc_horizon_steps > 0, "MPC horizon must be positive"
         assert self.rl_policy_period > 0, "RL policy period must be positive"
-        assert self.num_actions == self.num_bezier_actions + self.num_gait_mod_actions, (
+        assert self.action_space == self.num_bezier_actions + self.num_gait_mod_actions, (
             "Action dimensions must sum correctly"
         )
         assert self.num_bezier_waypoints > self.mpc_horizon_steps, (

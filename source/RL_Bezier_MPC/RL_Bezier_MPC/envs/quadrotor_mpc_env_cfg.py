@@ -79,11 +79,14 @@ class QuadrotorMPCEnvCfg(DirectRLEnvCfg):
     #   - Target position (3D): next goal position from trajectory
     #   - Trajectory phase (1D): normalized progress [0, 1]
     # Total: 17D
-    num_observations: int = 17
+    observation_space: int = 17
 
     # Action space:
     #   - Bezier control point offsets (12D): 4 points × 3D
-    num_actions: int = 12
+    action_space: int = 12
+
+    # State space (for asymmetric actor-critic, 0 means same as observation)
+    state_space: int = 0
 
     # ==========================================================================
     # MPC Configuration
