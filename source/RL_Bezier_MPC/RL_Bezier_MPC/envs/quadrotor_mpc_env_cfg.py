@@ -128,6 +128,38 @@ class QuadrotorMPCEnvCfg(DirectRLEnvCfg):
     torque_max: float = 0.01  # N.m
 
     # ==========================================================================
+    # Robot Configuration
+    # ==========================================================================
+
+    robot_cfg: RigidObjectCfg = RigidObjectCfg(
+        prim_path="/World/envs/env_.*/Quadrotor",
+        spawn=sim_utils.CuboidCfg(
+            size=(0.1, 0.1, 0.03),  # Approximate quadrotor dimensions
+            rigid_props=sim_utils.RigidBodyPropertiesCfg(
+                rigid_body_enabled=True,
+                disable_gravity=False,
+                linear_damping=0.0,
+                angular_damping=0.0,
+                max_linear_velocity=10.0,
+                max_angular_velocity=20.0,
+            ),
+            mass_props=sim_utils.MassPropertiesCfg(
+                mass=0.027,  # quadrotor_mass
+            ),
+            collision_props=sim_utils.CollisionPropertiesCfg(
+                collision_enabled=True,
+            ),
+            visual_material=sim_utils.PreviewSurfaceCfg(
+                diffuse_color=(0.2, 0.2, 0.8),
+            ),
+        ),
+        init_state=RigidObjectCfg.InitialStateCfg(
+            pos=(0.0, 0.0, 1.0),
+            rot=(1.0, 0.0, 0.0, 0.0),
+        ),
+    )
+
+    # ==========================================================================
     # Task Configuration
     # ==========================================================================
 

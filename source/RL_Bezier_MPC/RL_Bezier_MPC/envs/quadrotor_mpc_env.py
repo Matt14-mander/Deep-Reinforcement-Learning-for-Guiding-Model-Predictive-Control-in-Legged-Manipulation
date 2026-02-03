@@ -127,57 +127,29 @@ class QuadrotorMPCEnv(DirectRLEnv):
 
     def _setup_scene(self):
         """Set up the simulation scene with quadrotor and ground plane."""
+        # Create the quadrotor rigid object from config
+        self.quadrotor = RigidObject(self.cfg.robot_cfg)
+
         # Spawn ground plane
-        ground_cfg = sim_utils.GroundPlaneCfg(
-            size=(100.0, 100.0),
-        )
-        ground_cfg.func("/World/ground", ground_cfg)
+        from isaaclab.sim.spawners.from_files import GroundPlaneCfg, spawn_ground_plane
+        spawn_ground_plane(prim_path="/World/ground", cfg=GroundPlaneCfg())
 
-        # Spawn quadrotors as rigid bodies
-        # Using a simple cuboid as placeholder for quadrotor mesh
-        quadrotor_cfg = RigidObjectCfg(
-            prim_path="{ENV_REGEX_NS}/Quadrotor",
-            spawn=sim_utils.CuboidCfg(
-                size=(0.1, 0.1, 0.03),  # Approximate quadrotor dimensions
-                rigid_props=sim_utils.RigidBodyPropertiesCfg(
-                    rigid_body_enabled=True,
-                    disable_gravity=False,
-                    linear_damping=0.0,
-                    angular_damping=0.0,
-                    max_linear_velocity=10.0,
-                    max_angular_velocity=20.0,
-                ),
-                mass_props=sim_utils.MassPropertiesCfg(
-                    mass=self.cfg.quadrotor_mass,
-                ),
-                collision_props=sim_utils.CollisionPropertiesCfg(
-                    collision_enabled=True,
-                ),
-                visual_material=sim_utils.PreviewSurfaceCfg(
-                    diffuse_color=(0.2, 0.2, 0.8),
-                ),
-            ),
-            init_state=RigidObjectCfg.InitialStateCfg(
-                pos=(0.0, 0.0, 1.0),
-                rot=(1.0, 0.0, 0.0, 0.0),
-            ),
-        )
-
-        # Create the rigid object asset
-        self.quadrotor = RigidObject(quadrotor_cfg)
-
-        # Add to scene
-        self.scene.rigid_objects["quadrotor"] = self.quadrotor
-
-        # Clone environments
+        # Clone and replicate environments
         self.scene.clone_environments(copy_from_source=False)
+
+        # Filter collisions for CPU simulation
+        if self.device == "cpu":
+            self.scene.filter_collisions(global_prim_paths=[])
+
+        # Add rigid object to scene
+        self.scene.rigid_objects["quadrotor"] = self.quadrotor
 
         # Add lights
         light_cfg = sim_utils.DomeLightCfg(
-            intensity=1000.0,
-            color=(1.0, 1.0, 1.0),
+            intensity=2000.0,
+            color=(0.75, 0.75, 0.75),
         )
-        light_cfg.func("/World/light", light_cfg)
+        light_cfg.func("/World/Light", light_cfg)
 
     def _pre_physics_step(self, actions: torch.Tensor):
         """Process RL actions before physics stepping.
