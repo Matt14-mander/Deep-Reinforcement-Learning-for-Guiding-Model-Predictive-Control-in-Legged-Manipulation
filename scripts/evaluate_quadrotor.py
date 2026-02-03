@@ -231,16 +231,6 @@ def main():
             actions[:, 9:12] = direction_normalized * scale
             return actions
 
-    # Video recording setup
-    video_writer = None
-    video_dir = None
-    if args_cli.video:
-        video_dir = os.path.join("logs", "quadrotor_mpc", "videos")
-        os.makedirs(video_dir, exist_ok=True)
-        timestamp = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
-        video_path = os.path.join(video_dir, f"eval_{timestamp}.mp4")
-        print(f"\nVideo will be saved to: {video_path}")
-
     # Run evaluation
     print(f"\nRunning evaluation for {args_cli.num_steps} steps...")
     print("-" * 40)
@@ -256,21 +246,18 @@ def main():
     episode_lengths = []
     current_episode_length = np.zeros(args_cli.num_envs)
 
-    # Collect video frames
-    video_frames = []
+    # Trajectory logging for visualization
+    trajectory_data = []
 
     start_time = time.time()
 
     for step in range(args_cli.num_steps):
-        # Capture video frame
-        if args_cli.video and step < args_cli.video_length:
-            frame = env.render()
-            if frame is not None:
-                if isinstance(frame, torch.Tensor):
-                    frame = frame.cpu().numpy()
-                if frame.ndim == 4:
-                    frame = frame[0]  # Take first env
-                video_frames.append(frame)
+        # Log trajectory data for later visualization
+        if args_cli.video:
+            trajectory_data.append({
+                "step": step,
+                "obs": obs.cpu().numpy().copy(),
+            })
 
         # Get actions from policy
         with torch.inference_mode():
@@ -313,34 +300,104 @@ def main():
                 f"FPS: {fps:.1f}"
             )
 
-    # Save video
-    if args_cli.video and video_frames:
-        print(f"\nSaving video with {len(video_frames)} frames...")
+    # Save trajectory plot as video
+    if args_cli.video and trajectory_data:
+        print(f"\nGenerating trajectory visualization with {len(trajectory_data)} frames...")
+        video_dir = os.path.join("logs", "quadrotor_mpc", "videos")
+        os.makedirs(video_dir, exist_ok=True)
+        timestamp = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
+
         try:
-            import cv2
+            import matplotlib
+            matplotlib.use("Agg")
+            import matplotlib.pyplot as plt
+            from matplotlib.animation import FuncAnimation, FFMpegWriter, PillowWriter
 
-            h, w = video_frames[0].shape[:2]
-            fourcc = cv2.VideoWriter_fourcc(*"mp4v")
-            video_writer = cv2.VideoWriter(video_path, fourcc, 30.0, (w, h))
-            for frame in video_frames:
-                # Convert RGB to BGR for OpenCV
-                bgr_frame = cv2.cvtColor(frame, cv2.COLOR_RGB2BGR)
-                video_writer.write(bgr_frame)
-            video_writer.release()
-            print(f"Video saved: {video_path} ({len(video_frames)} frames, {w}x{h})")
-        except ImportError:
-            print("OpenCV not installed, saving frames as images instead...")
-            frames_dir = os.path.join(video_dir, f"frames_{timestamp}")
-            os.makedirs(frames_dir, exist_ok=True)
-            from PIL import Image
+            # Extract positions and targets for env 0
+            positions = np.array([d["obs"][0, 0:3] for d in trajectory_data])  # x,y,z
+            targets = np.array([d["obs"][0, 13:16] for d in trajectory_data])  # target x,y,z
 
-            for i, frame in enumerate(video_frames):
-                img = Image.fromarray(frame)
-                img.save(os.path.join(frames_dir, f"frame_{i:04d}.png"))
-            print(f"Frames saved to: {frames_dir}")
-    elif args_cli.video:
-        print("\nNo frames captured. render() may not be supported in headless mode.")
-        print("Try adding --enable_cameras flag or use Isaac Sim's built-in recorder.")
+            # Create 2D trajectory plot animation
+            fig, axes = plt.subplots(1, 3, figsize=(18, 5))
+            fig.suptitle("Quadrotor MPC - Trajectory Evaluation", fontsize=14)
+
+            labels = [("X", "Y", "XY Plane"), ("X", "Z", "XZ Plane"), ("Y", "Z", "YZ Plane")]
+            idx_pairs = [(0, 1), (0, 2), (1, 2)]
+
+            lines = []
+            target_dots = []
+            current_dots = []
+
+            for ax, (xlabel, ylabel, title), (ix, iy) in zip(axes, labels, idx_pairs):
+                ax.set_xlabel(xlabel)
+                ax.set_ylabel(ylabel)
+                ax.set_title(title)
+                ax.set_aspect("equal")
+                ax.grid(True, alpha=0.3)
+
+                # Set axis limits
+                all_vals = np.concatenate([positions[:, [ix, iy]], targets[:, [ix, iy]]])
+                margin = 0.5
+                ax.set_xlim(all_vals[:, 0].min() - margin, all_vals[:, 0].max() + margin)
+                ax.set_ylim(all_vals[:, 1].min() - margin, all_vals[:, 1].max() + margin)
+
+                line, = ax.plot([], [], "b-", linewidth=1, alpha=0.7, label="Trajectory")
+                target_dot, = ax.plot([], [], "r*", markersize=15, label="Target")
+                current_dot, = ax.plot([], [], "go", markersize=8, label="Current")
+
+                lines.append(line)
+                target_dots.append(target_dot)
+                current_dots.append(current_dot)
+
+            axes[0].legend(loc="upper left", fontsize=8)
+
+            step_text = fig.text(0.5, 0.02, "", ha="center", fontsize=12)
+
+            def update(frame):
+                for i, (ix, iy) in enumerate(idx_pairs):
+                    lines[i].set_data(positions[:frame+1, ix], positions[:frame+1, iy])
+                    target_dots[i].set_data([targets[frame, ix]], [targets[frame, iy]])
+                    current_dots[i].set_data([positions[frame, ix]], [positions[frame, iy]])
+                dist = np.linalg.norm(positions[frame] - targets[frame])
+                step_text.set_text(f"Step: {frame}/{len(trajectory_data)} | Distance to target: {dist:.3f}m")
+                return lines + target_dots + current_dots + [step_text]
+
+            anim = FuncAnimation(fig, update, frames=len(trajectory_data), interval=33, blit=True)
+
+            # Try saving as mp4, fallback to gif
+            video_path = os.path.join(video_dir, f"trajectory_{timestamp}.gif")
+            anim.save(video_path, writer=PillowWriter(fps=30))
+            print(f"Trajectory animation saved: {video_path}")
+
+            # Also save static plot
+            static_path = os.path.join(video_dir, f"trajectory_{timestamp}.png")
+            fig_static, axes_s = plt.subplots(1, 3, figsize=(18, 5))
+            fig_static.suptitle("Quadrotor MPC - Full Trajectory", fontsize=14)
+
+            for ax, (xlabel, ylabel, title), (ix, iy) in zip(axes_s, labels, idx_pairs):
+                ax.set_xlabel(xlabel)
+                ax.set_ylabel(ylabel)
+                ax.set_title(title)
+                ax.set_aspect("equal")
+                ax.grid(True, alpha=0.3)
+                ax.plot(positions[:, ix], positions[:, iy], "b-", linewidth=1, alpha=0.7, label="Trajectory")
+                ax.plot(positions[0, ix], positions[0, iy], "gs", markersize=10, label="Start")
+                ax.plot(positions[-1, ix], positions[-1, iy], "go", markersize=10, label="End")
+                ax.plot(targets[-1, ix], targets[-1, iy], "r*", markersize=15, label="Target")
+            axes_s[0].legend(fontsize=8)
+            fig_static.savefig(static_path, dpi=150, bbox_inches="tight")
+            print(f"Static trajectory plot saved: {static_path}")
+
+            plt.close("all")
+
+        except Exception as e:
+            print(f"Visualization error: {e}")
+            # Fallback: save raw data
+            data_path = os.path.join(video_dir, f"trajectory_{timestamp}.npz")
+            np.savez(data_path,
+                     positions=np.array([d["obs"][:, 0:3] for d in trajectory_data]),
+                     targets=np.array([d["obs"][:, 13:16] for d in trajectory_data]))
+            print(f"Raw trajectory data saved: {data_path}")
 
     # Print final statistics
     print("-" * 40)
