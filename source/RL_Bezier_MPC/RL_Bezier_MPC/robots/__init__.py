@@ -5,7 +5,17 @@
 
 """Robot configurations for RL+MPC Bezier control system."""
 
-from .quadrotor_cfg import QUADROTOR_CFG, QuadrotorCfg
+# Quadrotor configurations (always available - core config doesn't need IsaacLab)
+from .quadrotor_cfg import QuadrotorCfg, CRAZYFLIE_CFG, ISAACLAB_AVAILABLE
+
+# Conditionally import IsaacLab-specific quadrotor configs
+if ISAACLAB_AVAILABLE:
+    from .quadrotor_cfg import QUADROTOR_CFG, QuadrotorSpawnCfg
+else:
+    QUADROTOR_CFG = None
+    QuadrotorSpawnCfg = None
+
+# Quadruped configurations (always available - core configs don't need IsaacLab)
 from .quadruped_cfg import (
     QuadrupedCfg,
     QuadrupedPhysicsCfg,
@@ -20,9 +30,13 @@ from .quadruped_cfg import (
 )
 
 __all__ = [
+    # Availability flag
+    "ISAACLAB_AVAILABLE",
     # Quadrotor
-    "QUADROTOR_CFG",
     "QuadrotorCfg",
+    "CRAZYFLIE_CFG",
+    "QUADROTOR_CFG",
+    "QuadrotorSpawnCfg",
     # Quadruped
     "QuadrupedCfg",
     "QuadrupedPhysicsCfg",

@@ -22,9 +22,21 @@ from typing import Tuple
 
 import numpy as np
 
-import isaaclab.sim as sim_utils
-from isaaclab.assets import RigidObjectCfg
-from isaaclab.utils import configclass
+# Try to import IsaacLab components (optional for standalone testing)
+try:
+    import isaaclab.sim as sim_utils
+    from isaaclab.assets import RigidObjectCfg
+    from isaaclab.utils import configclass
+
+    ISAACLAB_AVAILABLE = True
+except ImportError:
+    ISAACLAB_AVAILABLE = False
+    sim_utils = None
+    RigidObjectCfg = None
+
+    # Dummy decorator for when IsaacLab is not available
+    def configclass(cls):
+        return dataclass(cls)
 
 
 @configclass
@@ -90,70 +102,79 @@ class QuadrotorCfg:
 CRAZYFLIE_CFG = QuadrotorCfg()
 
 
-# IsaacLab RigidObjectCfg for spawning quadrotor in simulation
-# This uses a simple box as placeholder - replace with actual USD model
-QUADROTOR_CFG = RigidObjectCfg(
-    prim_path="{ENV_REGEX_NS}/Quadrotor",
-    spawn=sim_utils.UsdFileCfg(
-        # Use a simple cube as placeholder
-        # Replace with actual Crazyflie USD path when available
-        usd_path=None,  # Will need actual USD path
-        rigid_props=sim_utils.RigidBodyPropertiesCfg(
-            rigid_body_enabled=True,
-            disable_gravity=False,
-            linear_damping=0.0,
-            angular_damping=0.0,
-            max_linear_velocity=10.0,
-            max_angular_velocity=20.0,
-            max_depenetration_velocity=1.0,
-        ),
-        mass_props=sim_utils.MassPropertiesCfg(
-            mass=0.027,  # Crazyflie mass
-        ),
-    ),
-    init_state=RigidObjectCfg.InitialStateCfg(
-        pos=(0.0, 0.0, 1.0),  # Start 1m above ground
-        rot=(1.0, 0.0, 0.0, 0.0),  # Identity quaternion (w, x, y, z)
-        lin_vel=(0.0, 0.0, 0.0),
-        ang_vel=(0.0, 0.0, 0.0),
-    ),
-)
+# =============================================================================
+# IsaacLab-specific configurations (only when IsaacLab is available)
+# =============================================================================
 
-
-@configclass
-class QuadrotorSpawnCfg:
-    """Configuration for spawning a quadrotor as a simple rigid body.
-
-    Uses a programmatically created box mesh since we may not have
-    access to a Crazyflie USD model.
-    """
-
-    # Spawn as simple cube (visual placeholder)
-    spawn: sim_utils.SpawnerCfg = sim_utils.CuboidCfg(
-        size=(0.1, 0.1, 0.03),  # Approximate quadrotor size
-        rigid_props=sim_utils.RigidBodyPropertiesCfg(
-            rigid_body_enabled=True,
-            disable_gravity=False,
-            linear_damping=0.0,
-            angular_damping=0.0,
+if ISAACLAB_AVAILABLE:
+    # IsaacLab RigidObjectCfg for spawning quadrotor in simulation
+    # This uses a simple box as placeholder - replace with actual USD model
+    QUADROTOR_CFG = RigidObjectCfg(
+        prim_path="{ENV_REGEX_NS}/Quadrotor",
+        spawn=sim_utils.UsdFileCfg(
+            # Use a simple cube as placeholder
+            # Replace with actual Crazyflie USD path when available
+            usd_path=None,  # Will need actual USD path
+            rigid_props=sim_utils.RigidBodyPropertiesCfg(
+                rigid_body_enabled=True,
+                disable_gravity=False,
+                linear_damping=0.0,
+                angular_damping=0.0,
+                max_linear_velocity=10.0,
+                max_angular_velocity=20.0,
+                max_depenetration_velocity=1.0,
+            ),
+            mass_props=sim_utils.MassPropertiesCfg(
+                mass=0.027,  # Crazyflie mass
+            ),
         ),
-        mass_props=sim_utils.MassPropertiesCfg(
-            mass=0.027,
-        ),
-        collision_props=sim_utils.CollisionPropertiesCfg(
-            collision_enabled=True,
-        ),
-        visual_material=sim_utils.PreviewSurfaceCfg(
-            diffuse_color=(0.2, 0.2, 0.8),  # Blue color
-        ),
-    )
-
-    # Initial state
-    init_state: RigidObjectCfg.InitialStateCfg = field(
-        default_factory=lambda: RigidObjectCfg.InitialStateCfg(
-            pos=(0.0, 0.0, 1.0),
-            rot=(1.0, 0.0, 0.0, 0.0),
+        init_state=RigidObjectCfg.InitialStateCfg(
+            pos=(0.0, 0.0, 1.0),  # Start 1m above ground
+            rot=(1.0, 0.0, 0.0, 0.0),  # Identity quaternion (w, x, y, z)
             lin_vel=(0.0, 0.0, 0.0),
             ang_vel=(0.0, 0.0, 0.0),
-        )
+        ),
     )
+
+    @configclass
+    class QuadrotorSpawnCfg:
+        """Configuration for spawning a quadrotor as a simple rigid body.
+
+        Uses a programmatically created box mesh since we may not have
+        access to a Crazyflie USD model.
+        """
+
+        # Spawn as simple cube (visual placeholder)
+        spawn: sim_utils.SpawnerCfg = sim_utils.CuboidCfg(
+            size=(0.1, 0.1, 0.03),  # Approximate quadrotor size
+            rigid_props=sim_utils.RigidBodyPropertiesCfg(
+                rigid_body_enabled=True,
+                disable_gravity=False,
+                linear_damping=0.0,
+                angular_damping=0.0,
+            ),
+            mass_props=sim_utils.MassPropertiesCfg(
+                mass=0.027,
+            ),
+            collision_props=sim_utils.CollisionPropertiesCfg(
+                collision_enabled=True,
+            ),
+            visual_material=sim_utils.PreviewSurfaceCfg(
+                diffuse_color=(0.2, 0.2, 0.8),  # Blue color
+            ),
+        )
+
+        # Initial state
+        init_state: RigidObjectCfg.InitialStateCfg = field(
+            default_factory=lambda: RigidObjectCfg.InitialStateCfg(
+                pos=(0.0, 0.0, 1.0),
+                rot=(1.0, 0.0, 0.0, 0.0),
+                lin_vel=(0.0, 0.0, 0.0),
+                ang_vel=(0.0, 0.0, 0.0),
+            )
+        )
+
+else:
+    # Placeholders when IsaacLab is not available
+    QUADROTOR_CFG = None
+    QuadrotorSpawnCfg = None
