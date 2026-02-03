@@ -111,45 +111,54 @@ def load_policy_direct(checkpoint_path: str, obs_dim: int, action_dim: int, devi
     checkpoint = torch.load(checkpoint_path, map_location=device, weights_only=False)
     print(f"Checkpoint keys: {checkpoint.keys()}")
 
-    # Create ActorCritic model with normalizer enabled (matching training config)
-    from rsl_rl.modules import ActorCritic
-    from rsl_rl.utils.benchmarkable import Benchmarkable
+    state_dict = checkpoint["model_state_dict"]
 
-    print("Creating ActorCritic model...")
-    policy = ActorCritic(
-        num_actor_obs=obs_dim,
-        num_critic_obs=obs_dim,
-        num_actions=action_dim,
-        actor_hidden_dims=[256, 256, 128],
-        critic_hidden_dims=[256, 256, 128],
-        activation="elu",
-        init_noise_std=1.0,
-        obs_normalizer_class_name="EmpiricalNormalization",  # Match training
-        obs_normalizer_cfg={},
+    # Build actor network manually (simpler, avoids RSL-RL initialization issues)
+    print("Building actor network manually...")
+    import torch.nn as nn
+
+    actor = nn.Sequential(
+        nn.Linear(obs_dim, 256),
+        nn.ELU(),
+        nn.Linear(256, 256),
+        nn.ELU(),
+        nn.Linear(256, 128),
+        nn.ELU(),
+        nn.Linear(128, action_dim),
     ).to(device)
-    print("ActorCritic model created")
 
-    # Load model state
-    print("Loading state dict...")
-    if "model_state_dict" in checkpoint:
-        policy.load_state_dict(checkpoint["model_state_dict"])
-        print("Loaded model_state_dict successfully")
-    elif "actor_critic" in checkpoint:
-        policy.load_state_dict(checkpoint["actor_critic"])
-        print("Loaded actor_critic successfully")
-    else:
-        print(f"Warning: Could not find model weights in checkpoint")
-        print(f"Available keys: {checkpoint.keys()}")
+    # Load actor weights
+    actor_state = {
+        "0.weight": state_dict["actor.0.weight"],
+        "0.bias": state_dict["actor.0.bias"],
+        "2.weight": state_dict["actor.2.weight"],
+        "2.bias": state_dict["actor.2.bias"],
+        "4.weight": state_dict["actor.4.weight"],
+        "4.bias": state_dict["actor.4.bias"],
+        "6.weight": state_dict["actor.6.weight"],
+        "6.bias": state_dict["actor.6.bias"],
+    }
+    actor.load_state_dict(actor_state)
+    print("Actor weights loaded")
 
-    policy.eval()
-    print("Policy set to eval mode")
+    # Load normalizer stats
+    obs_mean = state_dict["actor_obs_normalizer._mean"].to(device)
+    obs_std = state_dict["actor_obs_normalizer._std"].to(device)
+    print(f"Normalizer loaded: mean shape {obs_mean.shape}, std shape {obs_std.shape}")
 
-    # Create inference function
+    actor.eval()
+    print("Policy ready for inference")
+
+    # Create inference function with normalization
     def inference_fn(obs):
         with torch.inference_mode():
-            return policy.act_inference(obs)
+            # Normalize observations
+            obs_normalized = (obs - obs_mean) / (obs_std + 1e-8)
+            # Get actions
+            actions = actor(obs_normalized)
+            return actions
 
-    return inference_fn, policy
+    return inference_fn, actor
 
 
 def main():
