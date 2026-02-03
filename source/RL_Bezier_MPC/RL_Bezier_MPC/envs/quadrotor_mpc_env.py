@@ -125,6 +125,10 @@ class QuadrotorMPCEnv(DirectRLEnv):
         self.action_low = torch.tensor(low, device=self.device, dtype=torch.float32)
         self.action_high = torch.tensor(high, device=self.device, dtype=torch.float32)
 
+        # Pending control buffers for batch application
+        self._pending_forces = np.zeros((self.num_envs, 3))
+        self._pending_torques = np.zeros((self.num_envs, 3))
+
     def _setup_scene(self):
         """Set up the simulation scene with quadrotor and ground plane."""
         # Create the quadrotor rigid object from config
@@ -228,16 +232,19 @@ class QuadrotorMPCEnv(DirectRLEnv):
 
             self.last_mpc_solutions[env_idx] = solution
 
-            # Apply control to robot
+            # Store control for batch application
             control = solution.control
-            self._apply_control(env_idx, control)
+            self._apply_control_single(env_idx, control)
 
             # Increment counters
             self.trajectory_phases[env_idx] += 1
             self.mpc_step_counter[env_idx] += 1
 
-    def _apply_control(self, env_idx: int, control: np.ndarray):
-        """Apply thrust and torque control to quadrotor.
+        # Apply all controls in batch after loop
+        self._apply_all_controls()
+
+    def _apply_control_single(self, env_idx: int, control: np.ndarray):
+        """Store control for a single environment (called during MPC loop).
 
         Args:
             env_idx: Environment index.
@@ -258,21 +265,27 @@ class QuadrotorMPCEnv(DirectRLEnv):
         thrust_body = np.array([0.0, 0.0, thrust])
         thrust_world = R @ thrust_body
 
-        # Create force and torque tensors
-        force = torch.tensor(
-            thrust_world, device=self.device, dtype=torch.float32
-        ).unsqueeze(0)
+        # Store in buffers (will be applied in batch later)
+        self._pending_forces[env_idx] = thrust_world
+        self._pending_torques[env_idx] = torque
 
-        torque_tensor = torch.tensor(
-            torque, device=self.device, dtype=torch.float32
-        ).unsqueeze(0)
+    def _apply_all_controls(self):
+        """Apply all pending controls to the simulation in batch."""
+        # Convert to tensors with proper shape: (num_envs, 1, 3) for single body
+        forces = torch.tensor(
+            self._pending_forces, device=self.device, dtype=torch.float32
+        ).unsqueeze(1)  # (num_envs, 1, 3)
 
-        # Apply external forces and torques
-        # Note: IsaacLab applies forces/torques at center of mass
-        self.quadrotor.set_external_force_and_torque(
-            forces=force,
-            torques=torque_tensor,
-            env_ids=torch.tensor([env_idx], device=self.device),
+        torques = torch.tensor(
+            self._pending_torques, device=self.device, dtype=torch.float32
+        ).unsqueeze(1)  # (num_envs, 1, 3)
+
+        # Apply using permanent wrench composer (new API)
+        self.quadrotor.permanent_wrench_composer.set_forces_and_torques(
+            forces=forces,
+            torques=torques,
+            body_ids=slice(None),  # All bodies (just 1 for quadrotor)
+            env_ids=slice(None),   # All environments
         )
 
     def _get_observations(self) -> Dict[str, torch.Tensor]:
