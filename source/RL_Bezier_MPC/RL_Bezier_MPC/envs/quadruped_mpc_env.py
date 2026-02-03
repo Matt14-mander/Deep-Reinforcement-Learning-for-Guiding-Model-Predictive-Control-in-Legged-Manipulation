@@ -185,6 +185,15 @@ class QuadrupedMPCEnv(DirectRLEnv):
             (self.num_envs, 4), dtype=torch.bool, device=self.device
         )
 
+        # Pending force/torque buffers for batch application
+        # Shape: (num_envs, 1, 3) - 1 body per env
+        self._pending_forces = torch.zeros(
+            (self.num_envs, 1, 3), device=self.device, dtype=torch.float32
+        )
+        self._pending_torques = torch.zeros(
+            (self.num_envs, 1, 3), device=self.device, dtype=torch.float32
+        )
+
     def _setup_scene(self):
         """Set up the simulation scene with quadruped and ground plane."""
         # Spawn ground plane
@@ -196,14 +205,7 @@ class QuadrupedMPCEnv(DirectRLEnv):
         # Spawn quadrupeds as articulated robots
         # Using a placeholder box until proper URDF is available
         quadruped_spawn = sim_utils.CuboidCfg(
-            size=(
-                self.cfg.quadruped_cfg.physics.body_length if hasattr(self.cfg, 'quadruped_cfg')
-                else 0.4,
-                self.cfg.quadruped_cfg.physics.body_width if hasattr(self.cfg, 'quadruped_cfg')
-                else 0.2,
-                self.cfg.quadruped_cfg.physics.body_height if hasattr(self.cfg, 'quadruped_cfg')
-                else 0.1,
-            ),
+            size=(0.4, 0.2, 0.1),
             rigid_props=sim_utils.RigidBodyPropertiesCfg(
                 rigid_body_enabled=True,
                 disable_gravity=False,
@@ -228,7 +230,7 @@ class QuadrupedMPCEnv(DirectRLEnv):
         from isaaclab.assets import RigidObject, RigidObjectCfg
 
         robot_cfg = RigidObjectCfg(
-            prim_path="{ENV_REGEX_NS}/Robot",
+            prim_path="/World/envs/env_.*/Robot",
             spawn=quadruped_spawn,
             init_state=RigidObjectCfg.InitialStateCfg(
                 pos=(0.0, 0.0, self.cfg.standing_height),
@@ -236,14 +238,9 @@ class QuadrupedMPCEnv(DirectRLEnv):
             ),
         )
 
-        # Create the robot asset
+        # Create the robot asset and add to scene
         self.robot = RigidObject(robot_cfg)
-
-        # Add to scene
         self.scene.rigid_objects["robot"] = self.robot
-
-        # Clone environments
-        self.scene.clone_environments(copy_from_source=False)
 
         # Add lights
         light_cfg = sim_utils.DomeLightCfg(
@@ -357,6 +354,14 @@ class QuadrupedMPCEnv(DirectRLEnv):
             self.trajectory_phases[env_idx] += 1
             self.mpc_step_counter[env_idx] += 1
 
+    def _apply_action(self):
+        """Apply accumulated forces/torques to the robot bodies."""
+        self.robot.permanent_wrench_composer.set_forces_and_torques(
+            forces=self._pending_forces,
+            torques=self._pending_torques,
+            body_ids=slice(None),
+        )
+
     def _apply_control(self, env_idx: int, joint_torques: np.ndarray):
         """Apply joint torque control to quadruped.
 
@@ -374,28 +379,17 @@ class QuadrupedMPCEnv(DirectRLEnv):
         vertical_force = np.sum(np.abs(joint_torques)) * 0.1  # Scale factor
         vertical_force = min(vertical_force, self.cfg.robot_mass * 9.81 * 2)
 
-        force = torch.tensor(
-            [0.0, 0.0, vertical_force],
-            device=self.device,
-            dtype=torch.float32
-        ).unsqueeze(0)
-
         # Simple torque from joint imbalance
         torque_x = (joint_torques[0] + joint_torques[3] - joint_torques[6] - joint_torques[9]) * 0.01
         torque_y = (joint_torques[1] + joint_torques[4] - joint_torques[7] - joint_torques[10]) * 0.01
         torque_z = 0.0
 
-        torque = torch.tensor(
-            [torque_x, torque_y, torque_z],
-            device=self.device,
-            dtype=torch.float32
-        ).unsqueeze(0)
-
-        # Apply forces
-        self.robot.set_external_force_and_torque(
-            forces=force,
-            torques=torque,
-            env_ids=torch.tensor([env_idx], device=self.device),
+        # Store pending forces/torques for batch application
+        self._pending_forces[env_idx, 0, :] = torch.tensor(
+            [0.0, 0.0, vertical_force], device=self.device, dtype=torch.float32
+        )
+        self._pending_torques[env_idx, 0, :] = torch.tensor(
+            [torque_x, torque_y, torque_z], device=self.device, dtype=torch.float32
         )
 
     def _get_observations(self) -> Dict[str, torch.Tensor]:

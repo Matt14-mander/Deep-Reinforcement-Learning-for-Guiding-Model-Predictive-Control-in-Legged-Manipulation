@@ -252,12 +252,22 @@ def main():
     start_time = time.time()
 
     for step in range(args_cli.num_steps):
-        # Log trajectory data for later visualization
-        if args_cli.video:
-            trajectory_data.append({
-                "step": step,
-                "obs": obs.cpu().numpy().copy(),
-            })
+        # Log trajectory data
+        trajectory_data.append({
+            "step": step,
+            "obs": obs.cpu().numpy().copy(),
+        })
+
+        # Print detailed state info at key steps
+        if step == 0 or step == args_cli.num_steps - 1 or (step + 1) % 100 == 0:
+            o = obs[0].cpu().numpy()  # env 0
+            pos = o[0:3]
+            target = o[13:16]
+            dist = np.linalg.norm(pos - target)
+            vel = np.linalg.norm(o[7:10])
+            print(f"  [Step {step:4d}] pos=({pos[0]:.3f}, {pos[1]:.3f}, {pos[2]:.3f}) "
+                  f"target=({target[0]:.3f}, {target[1]:.3f}, {target[2]:.3f}) "
+                  f"dist={dist:.3f} vel={vel:.3f}")
 
         # Get actions from policy
         with torch.inference_mode():
