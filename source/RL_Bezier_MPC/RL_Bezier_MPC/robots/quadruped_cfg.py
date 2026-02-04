@@ -432,7 +432,8 @@ def load_pinocchio_model(urdf_path: Optional[str] = None, robot_name: str = "sol
 
         # Try generic loading first (works for all robots including b1)
         robot = example_robot_data.load(robot_name)
-        return robot.model, robot.urdf_path
+        urdf = getattr(robot, "urdf_path", getattr(robot, "urdf", None))
+        return robot.model, urdf
 
     except ImportError:
         raise ImportError(
