@@ -92,6 +92,7 @@ class QuadrupedMPCEnv(DirectRLEnv):
 
         # Load Pinocchio model for MPC (if Crocoddyl available)
         self._pinocchio_model = None
+        self._pinocchio_data = None
         self._foot_frame_ids = None
 
         if CROCODDYL_AVAILABLE:
@@ -99,6 +100,7 @@ class QuadrupedMPCEnv(DirectRLEnv):
                 self._pinocchio_model, _ = load_pinocchio_model(
                     robot_name=cfg.robot_name
                 )
+                self._pinocchio_data = self._pinocchio_model.createData()
                 self._foot_frame_ids = get_foot_frame_ids(
                     self._pinocchio_model,
                     cfg.foot_frame_names,
@@ -333,15 +335,21 @@ class QuadrupedMPCEnv(DirectRLEnv):
 
             # Solve MPC
             if self.mpc_controllers[env_idx] is not None:
-                solution = self.mpc_controllers[env_idx].solve(
-                    current_state=robot_states[env_idx],
-                    com_reference=com_reference,
-                    current_foot_positions=foot_positions,
-                    gait_params=gait_params,
-                    warm_start=True,
-                )
-                self.last_mpc_solutions[env_idx] = solution
-                joint_torques = solution.control
+                try:
+                    solution = self.mpc_controllers[env_idx].solve(
+                        current_state=robot_states[env_idx],
+                        com_reference=com_reference,
+                        current_foot_positions=foot_positions,
+                        gait_params=gait_params,
+                        warm_start=True,
+                    )
+                    self.last_mpc_solutions[env_idx] = solution
+                    joint_torques = solution.control
+                except Exception as e:
+                    if env_idx == 0:
+                        print(f"Warning: MPC solve failed for env {env_idx}: {e}")
+                    joint_torques = np.zeros(self.cfg.num_joints)
+                    self.last_mpc_solutions[env_idx] = None
             else:
                 # Dummy mode: zero control
                 joint_torques = np.zeros(self.cfg.num_joints)
@@ -370,7 +378,7 @@ class QuadrupedMPCEnv(DirectRLEnv):
 
         Args:
             env_idx: Environment index.
-            joint_torques: Joint torque vector (12D for quadruped).
+            joint_torques: Joint torque vector (nu-dimensional from MPC).
         """
         # For rigid body placeholder, compute equivalent body force/torque
         # This is a simplification - real implementation would use articulation
@@ -379,9 +387,14 @@ class QuadrupedMPCEnv(DirectRLEnv):
         vertical_force = np.sum(np.abs(joint_torques)) * 0.1  # Scale factor
         vertical_force = min(vertical_force, self.cfg.robot_mass * 9.81 * 2)
 
-        # Simple torque from joint imbalance
-        torque_x = (joint_torques[0] + joint_torques[3] - joint_torques[6] - joint_torques[9]) * 0.01
-        torque_y = (joint_torques[1] + joint_torques[4] - joint_torques[7] - joint_torques[10]) * 0.01
+        # Simple torque from joint imbalance (safely handle varying nu)
+        nu = len(joint_torques)
+        if nu >= 12:
+            torque_x = (joint_torques[0] + joint_torques[3] - joint_torques[6] - joint_torques[9]) * 0.01
+            torque_y = (joint_torques[1] + joint_torques[4] - joint_torques[7] - joint_torques[10]) * 0.01
+        else:
+            torque_x = 0.0
+            torque_y = 0.0
         torque_z = 0.0
 
         # Store pending forces/torques for batch application
@@ -681,23 +694,69 @@ class QuadrupedMPCEnv(DirectRLEnv):
     def _get_robot_states_numpy(self) -> np.ndarray:
         """Get robot states as numpy array for MPC.
 
-        For full quadruped, state is (nq + nv) dimensional.
-        For placeholder, we return simplified state.
+        Constructs a full Pinocchio-compatible state vector (nq + nv) from
+        the rigid body placeholder. Joint positions are set to standing
+        defaults and joint velocities to zero.
+
+        Pinocchio state convention:
+            q = [x, y, z, qx, qy, qz, qw, joint1...jointN]  (nq)
+            v = [vx, vy, vz, wx, wy, wz, dq1...dqN]          (nv)
+            state = [q; v]
+
+        Note: Pinocchio uses quaternion (x, y, z, w) while IsaacLab uses (w, x, y, z).
 
         Returns:
-            Array of shape (num_envs, state_dim).
+            Array of shape (num_envs, nq + nv).
         """
         robot_data = self.robot.data
 
-        # Simplified state for rigid body placeholder
-        # Full articulation would include joint positions/velocities
-        state_dim = 13  # Simplified: pos(3) + quat(4) + lin_vel(3) + ang_vel(3)
+        # Get Pinocchio model dimensions
+        if self._pinocchio_model is not None:
+            nq = self._pinocchio_model.nq
+            nv = self._pinocchio_model.nv
+            # Get standing reference configuration for joint defaults
+            if hasattr(self._pinocchio_model, 'referenceConfigurations') and \
+               "standing" in self._pinocchio_model.referenceConfigurations:
+                q_ref = self._pinocchio_model.referenceConfigurations["standing"]
+            else:
+                import pinocchio
+                q_ref = pinocchio.neutral(self._pinocchio_model)
+        else:
+            # Fallback for dummy mode
+            nq = 7 + self.cfg.num_joints
+            nv = 6 + self.cfg.num_joints
+            q_ref = np.zeros(nq)
+            q_ref[6] = 1.0  # quaternion w=1
 
+        state_dim = nq + nv
         states = np.zeros((self.num_envs, state_dim))
-        states[:, 0:3] = robot_data.root_pos_w.cpu().numpy()
-        states[:, 3:7] = robot_data.root_quat_w.cpu().numpy()
-        states[:, 7:10] = robot_data.root_lin_vel_w.cpu().numpy()
-        states[:, 10:13] = robot_data.root_ang_vel_w.cpu().numpy()
+
+        # Root position (x, y, z)
+        root_pos = robot_data.root_pos_w.cpu().numpy()
+        states[:, 0:3] = root_pos
+
+        # Root quaternion: IsaacLab (w,x,y,z) -> Pinocchio (x,y,z,w)
+        root_quat_wxyz = robot_data.root_quat_w.cpu().numpy()
+        states[:, 3] = root_quat_wxyz[:, 1]  # qx
+        states[:, 4] = root_quat_wxyz[:, 2]  # qy
+        states[:, 5] = root_quat_wxyz[:, 3]  # qz
+        states[:, 6] = root_quat_wxyz[:, 0]  # qw
+
+        # Joint positions: use standing reference (placeholder has no joints)
+        if nq > 7:
+            for i in range(self.num_envs):
+                states[i, 7:nq] = q_ref[7:nq]
+
+        # Root linear velocity
+        root_lin_vel = robot_data.root_lin_vel_w.cpu().numpy()
+        states[:, nq:nq + 3] = root_lin_vel
+
+        # Root angular velocity
+        root_ang_vel = robot_data.root_ang_vel_w.cpu().numpy()
+        states[:, nq + 3:nq + 6] = root_ang_vel
+
+        # Joint velocities: zero (placeholder has no joints)
+        # states[:, nq + 6:nq + nv] already zeros
 
         return states
 
@@ -706,25 +765,43 @@ class QuadrupedMPCEnv(DirectRLEnv):
     ) -> Dict[str, np.ndarray]:
         """Get current foot positions for an environment.
 
-        For placeholder, compute nominal positions from body state.
+        If Pinocchio model is available, uses forward kinematics.
+        Otherwise computes nominal positions from body state.
 
         Args:
             env_idx: Environment index.
-            state: Robot state.
+            state: Robot state in Pinocchio convention (nq + nv).
 
         Returns:
             Dict mapping foot name to position (3,).
         """
-        # For rigid body placeholder, compute nominal foot positions
-        # based on body position and orientation
+        # Try FK with Pinocchio if available
+        if self._pinocchio_model is not None and self._foot_frame_ids is not None:
+            try:
+                import pinocchio
+                nq = self._pinocchio_model.nq
+                q = state[:nq]
+                pinocchio.framesForwardKinematics(
+                    self._pinocchio_model, self._pinocchio_data, q
+                )
+                positions = {}
+                for foot_name, frame_id in self._foot_frame_ids.items():
+                    oMf = self._pinocchio_data.oMf[frame_id]
+                    positions[foot_name] = oMf.translation.copy()
+                return positions
+            except Exception:
+                pass  # Fall through to nominal computation
 
+        # Fallback: compute nominal foot positions from body pose
         from ..utils.math_utils import rotation_matrix_z, quat_to_euler
 
         pos = state[:3]
-        quat = state[3:7]  # (w, x, y, z)
+        # State uses Pinocchio quaternion convention: (qx, qy, qz, qw)
+        quat_xyzw = state[3:7]
+        quat_wxyz = np.array([quat_xyzw[3], quat_xyzw[0], quat_xyzw[1], quat_xyzw[2]])
 
         # Get yaw from quaternion
-        euler = quat_to_euler(quat)
+        euler = quat_to_euler(quat_wxyz)
         yaw = euler[2]
 
         R = rotation_matrix_z(yaw)
