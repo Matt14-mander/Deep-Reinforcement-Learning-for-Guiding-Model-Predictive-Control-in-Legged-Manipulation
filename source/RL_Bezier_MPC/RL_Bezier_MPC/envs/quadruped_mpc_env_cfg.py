@@ -153,7 +153,7 @@ class QuadrupedMPCEnvCfg(DirectRLEnvCfg):
     # Gait timing defaults
     default_step_duration: float = 0.15  # seconds per swing phase
     default_support_duration: float = 0.05  # double support duration
-    default_step_height: float = 0.05  # meters
+    default_step_height: float = 0.15  # meters
 
     # Gait modulation bounds (multipliers around 1.0)
     step_length_mod_range: Tuple[float, float] = (0.5, 2.0)
@@ -165,15 +165,15 @@ class QuadrupedMPCEnvCfg(DirectRLEnvCfg):
     # ==========================================================================
 
     # Robot type identifier
-    robot_name: str = "go1"
+    robot_name: str = "b1"
 
     # Physical parameters (will be overridden by robot config)
-    robot_mass: float = 12.0  # kg
-    standing_height: float = 0.35  # meters
+    robot_mass: float = 50.0  # kg
+    standing_height: float = 0.45  # meters
 
     # Joint configuration
     num_joints: int = 12
-    max_joint_torque: float = 23.0  # N.m
+    max_joint_torque: float = 55.0  # N.m
 
     # Friction coefficient for MPC
     friction_coefficient: float = 0.7
@@ -181,18 +181,18 @@ class QuadrupedMPCEnvCfg(DirectRLEnvCfg):
     # Hip offsets (meters, in body frame)
     # +x = forward, +y = left, +z = up
     hip_offsets: Dict[str, np.ndarray] = field(default_factory=lambda: {
-        "LF": np.array([+0.183, +0.047, 0.0]),
-        "RF": np.array([+0.183, -0.047, 0.0]),
-        "LH": np.array([-0.183, +0.047, 0.0]),
-        "RH": np.array([-0.183, -0.047, 0.0]),
+        "LF": np.array([+0.3, +0.1, 0.0]),
+        "RF": np.array([+0.3, -0.1, 0.0]),
+        "LH": np.array([-0.3, +0.1, 0.0]),
+        "RH": np.array([-0.3, -0.1, 0.0]),
     })
 
     # Foot frame names (as in URDF)
     foot_frame_names: Dict[str, str] = field(default_factory=lambda: {
-        "LF": "LF_FOOT",
-        "RF": "RF_FOOT",
-        "LH": "LH_FOOT",
-        "RH": "RH_FOOT",
+        "LF": "FL_foot",
+        "RF": "FR_foot",
+        "LH": "RL_foot",
+        "RH": "RR_foot",
     })
 
     # ==========================================================================
@@ -203,7 +203,7 @@ class QuadrupedMPCEnvCfg(DirectRLEnvCfg):
     initial_pos_range: Tuple[float, float, float, float, float, float] = (
         -0.2, 0.2,  # x_min, x_max
         -0.2, 0.2,  # y_min, y_max
-        0.30, 0.40,  # z_min, z_max (near standing height)
+        0.40, 0.50,  # z_min, z_max (near standing height)
     )
 
     # Initial orientation randomization (yaw only)
@@ -260,7 +260,7 @@ class QuadrupedMPCEnvCfg(DirectRLEnvCfg):
     # ==========================================================================
 
     viewer_eye: Tuple[float, float, float] = (5.0, 5.0, 3.0)
-    viewer_lookat: Tuple[float, float, float] = (0.0, 0.0, 0.3)
+    viewer_lookat: Tuple[float, float, float] = (0.0, 0.0, 0.45)
 
     # ==========================================================================
     # Debug/Visualization

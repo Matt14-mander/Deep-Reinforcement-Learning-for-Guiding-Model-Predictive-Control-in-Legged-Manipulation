@@ -254,6 +254,37 @@ GO1_CFG = QuadrupedCfg(
     },
 )
 
+# Unitree B1 configuration
+B1_CFG = QuadrupedCfg(
+    name="b1",
+    physics=QuadrupedPhysicsCfg(
+        mass=50.0,
+        body_length=0.6,
+        body_width=0.2,
+        standing_height=0.45,
+        thigh_length=0.35,
+        calf_length=0.35,
+    ),
+    joints=QuadrupedJointsCfg(
+        max_torque=55.0,
+        kp=100.0,
+        kd=3.0,
+    ),
+    frames=QuadrupedFramesCfg(
+        lf_foot="FL_foot",
+        rf_foot="FR_foot",
+        lh_foot="RL_foot",
+        rh_foot="RR_foot",
+    ),
+    hip_offsets={
+        "LF": np.array([+0.3, +0.1, 0.0]),
+        "RF": np.array([+0.3, -0.1, 0.0]),
+        "LH": np.array([-0.3, +0.1, 0.0]),
+        "RH": np.array([-0.3, -0.1, 0.0]),
+    },
+    default_step_height=0.15,
+)
+
 # Solo 12 configuration (Open Dynamic Robot Initiative)
 SOLO12_CFG = QuadrupedCfg(
     name="solo12",
@@ -279,7 +310,7 @@ SOLO12_CFG = QuadrupedCfg(
 )
 
 # Default configuration
-DEFAULT_QUADRUPED_CFG = GO1_CFG
+DEFAULT_QUADRUPED_CFG = B1_CFG
 
 
 # =============================================================================
@@ -297,7 +328,7 @@ if ISAACLAB_AVAILABLE:
         """
 
         # Quadruped physics config
-        quadruped_cfg: QuadrupedCfg = field(default_factory=lambda: GO1_CFG)
+        quadruped_cfg: QuadrupedCfg = field(default_factory=lambda: B1_CFG)
 
         # USD/URDF path for spawning
         # Set to None to use procedural generation (placeholder)
@@ -399,21 +430,9 @@ def load_pinocchio_model(urdf_path: Optional[str] = None, robot_name: str = "sol
     try:
         import example_robot_data
 
-        # Map robot names to example-robot-data loaders
-        robot_loaders = {
-            "solo12": example_robot_data.load_solo12,
-            "solo": example_robot_data.load_solo,
-            "anymal": example_robot_data.load_anymal,
-            "hyq": example_robot_data.load_hyq,
-        }
-
-        if robot_name.lower() in robot_loaders:
-            robot = robot_loaders[robot_name.lower()]()
-            return robot.model, robot.urdf_path
-        else:
-            # Try generic loading
-            robot = example_robot_data.load(robot_name)
-            return robot.model, robot.urdf_path
+        # Try generic loading first (works for all robots including b1)
+        robot = example_robot_data.load(robot_name)
+        return robot.model, robot.urdf_path
 
     except ImportError:
         raise ImportError(
