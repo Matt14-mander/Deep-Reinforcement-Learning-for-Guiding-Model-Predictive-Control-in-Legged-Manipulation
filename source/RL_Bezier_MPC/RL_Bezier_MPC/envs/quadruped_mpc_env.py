@@ -240,9 +240,8 @@ class QuadrupedMPCEnv(DirectRLEnv):
             ),
         )
 
-        # Create the robot asset and add to scene
+        # Create the robot asset
         self.robot = RigidObject(robot_cfg)
-        self.scene.rigid_objects["robot"] = self.robot
 
         # Add lights
         light_cfg = sim_utils.DomeLightCfg(
@@ -250,6 +249,12 @@ class QuadrupedMPCEnv(DirectRLEnv):
             color=(1.0, 1.0, 1.0),
         )
         light_cfg.func("/World/light", light_cfg)
+
+        # Clone environments and replicate physics (required for multi-env)
+        self.scene.clone_environments(copy_from_source=False)
+
+        # Register objects to scene AFTER cloning
+        self.scene.rigid_objects["robot"] = self.robot
 
     def _pre_physics_step(self, actions: torch.Tensor):
         """Process RL actions before physics stepping.
@@ -580,6 +585,9 @@ class QuadrupedMPCEnv(DirectRLEnv):
         if num_resets == 0:
             return
 
+        # Reset scene and episode buffers FIRST (parent resets assets to defaults)
+        super()._reset_idx(env_ids)
+
         env_ids_np = env_ids.cpu().numpy()
 
         # Reset robot poses with randomization
@@ -611,7 +619,7 @@ class QuadrupedMPCEnv(DirectRLEnv):
         # Zero velocities
         zero_vel = torch.zeros((num_resets, 3), device=self.device)
 
-        # Reset robot state
+        # Write custom poses AFTER parent reset
         self.robot.write_root_pose_to_sim(
             torch.cat([random_pos, random_quat], dim=-1), env_ids
         )
@@ -656,9 +664,6 @@ class QuadrupedMPCEnv(DirectRLEnv):
             # Reset stored params
             self.prev_bezier_params[env_idx] = initial_params
             self.prev_gait_mods[env_idx] = np.ones(self.cfg.num_gait_mod_actions)
-
-        # Reset episode buffers (handled by parent)
-        super()._reset_idx(env_ids)
 
     def _generate_initial_bezier_params(
         self,
