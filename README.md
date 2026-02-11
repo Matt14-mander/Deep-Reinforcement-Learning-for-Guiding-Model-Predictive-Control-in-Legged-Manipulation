@@ -1,4 +1,4 @@
-<<<<<<< HEAD
+
 # RL+MPC Bezier Trajectory Control System
 
 A research project integrating Reinforcement Learning (RL) with Model Predictive Control (MPC) for robot trajectory control. The system uses Bezier curves as the trajectory parameterization, where the RL policy outputs Bezier control points and Crocoddyl MPC tracks the resulting trajectory.
