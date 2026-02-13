@@ -27,11 +27,6 @@ Observation Space:
     Total: 45D
 """
 
-from dataclasses import field
-from typing import Dict, Tuple
-
-import numpy as np
-
 import isaaclab.sim as sim_utils
 from isaaclab.assets import ArticulationCfg
 from isaaclab.envs import DirectRLEnvCfg
@@ -156,61 +151,57 @@ class QuadrupedMPCEnvCfg(DirectRLEnvCfg):
     default_step_height: float = 0.15  # meters
 
     # Gait modulation bounds (multipliers around 1.0)
-    step_length_mod_range: Tuple[float, float] = (0.5, 2.0)
-    step_height_mod_range: Tuple[float, float] = (0.5, 2.0)
-    step_frequency_mod_range: Tuple[float, float] = (0.5, 2.0)
+    step_length_mod_range: tuple = (0.5, 2.0)
+    step_height_mod_range: tuple = (0.5, 2.0)
+    step_frequency_mod_range: tuple = (0.5, 2.0)
 
     # ==========================================================================
     # Robot Configuration
     # ==========================================================================
 
     # Robot type identifier
-    robot_name: str = "b1"
+    robot_name: str = "go2"
 
-    # Physical parameters (will be overridden by robot config)
-    robot_mass: float = 50.0  # kg
-    standing_height: float = 0.45  # meters
+    # Physical parameters for Unitree Go2
+    robot_mass: float = 15.0  # kg (Go2 is ~15kg)
+    standing_height: float = 0.4  # meters
 
     # Joint configuration
     num_joints: int = 12
-    max_joint_torque: float = 55.0  # N.m
+    max_joint_torque: float = 23.5  # N.m (Go2 HV motor peak torque)
 
     # Friction coefficient for MPC
     friction_coefficient: float = 0.7
 
-    # Hip offsets (meters, in body frame)
+    # Hip offsets for Go2 (meters, in body frame)
     # +x = forward, +y = left, +z = up
-    hip_offsets: Dict[str, np.ndarray] = field(default_factory=lambda: {
-        "LF": np.array([+0.3, +0.1, 0.0]),
-        "RF": np.array([+0.3, -0.1, 0.0]),
-        "LH": np.array([-0.3, +0.1, 0.0]),
-        "RH": np.array([-0.3, -0.1, 0.0]),
-    })
+    hip_offset_lf: tuple = (0.1934, 0.0465, 0.0)
+    hip_offset_rf: tuple = (0.1934, -0.0465, 0.0)
+    hip_offset_lh: tuple = (-0.1934, 0.0465, 0.0)
+    hip_offset_rh: tuple = (-0.1934, -0.0465, 0.0)
 
     # Foot frame names (as in URDF)
-    foot_frame_names: Dict[str, str] = field(default_factory=lambda: {
-        "LF": "FL_foot",
-        "RF": "FR_foot",
-        "LH": "RL_foot",
-        "RH": "RR_foot",
-    })
+    foot_frame_lf: str = "FL_foot"
+    foot_frame_rf: str = "FR_foot"
+    foot_frame_lh: str = "RL_foot"
+    foot_frame_rh: str = "RR_foot"
 
     # ==========================================================================
     # Task Configuration
     # ==========================================================================
 
     # Initial position randomization
-    initial_pos_range: Tuple[float, float, float, float, float, float] = (
+    initial_pos_range: tuple = (
         -0.2, 0.2,  # x_min, x_max
         -0.2, 0.2,  # y_min, y_max
         0.40, 0.50,  # z_min, z_max (near standing height)
     )
 
     # Initial orientation randomization (yaw only)
-    initial_yaw_range: Tuple[float, float] = (-0.3, 0.3)  # radians
+    initial_yaw_range: tuple = (-0.3, 0.3)  # radians
 
     # Target generation (goal positions)
-    target_pos_range: Tuple[float, float, float, float, float, float] = (
+    target_pos_range: tuple = (
         2.0, 5.0,   # x_min, x_max (forward)
         -2.0, 2.0,  # y_min, y_max
         0.0, 0.0,   # z_min, z_max (ground level)
@@ -259,8 +250,8 @@ class QuadrupedMPCEnvCfg(DirectRLEnvCfg):
     # Viewer Settings
     # ==========================================================================
 
-    viewer_eye: Tuple[float, float, float] = (5.0, 5.0, 3.0)
-    viewer_lookat: Tuple[float, float, float] = (0.0, 0.0, 0.45)
+    viewer_eye: tuple = (5.0, 5.0, 3.0)
+    viewer_lookat: tuple = (0.0, 0.0, 0.45)
 
     # ==========================================================================
     # Debug/Visualization
@@ -274,6 +265,25 @@ class QuadrupedMPCEnvCfg(DirectRLEnvCfg):
 
     def __post_init__(self):
         """Post-initialization configuration."""
+        import math
+        import numpy as np
+
+        # Build hip_offsets dict from individual tuple fields (for env usage)
+        self.hip_offsets = {
+            "LF": np.array(self.hip_offset_lf),
+            "RF": np.array(self.hip_offset_rf),
+            "LH": np.array(self.hip_offset_lh),
+            "RH": np.array(self.hip_offset_rh),
+        }
+
+        # Build foot_frame_names dict from individual str fields
+        self.foot_frame_names = {
+            "LF": self.foot_frame_lf,
+            "RF": self.foot_frame_rf,
+            "LH": self.foot_frame_lh,
+            "RH": self.foot_frame_rh,
+        }
+
         # Compute derived values
         self.mpc_steps_per_episode = int(
             self.episode_length_s / self.mpc_dt
@@ -289,8 +299,8 @@ class QuadrupedMPCEnvCfg(DirectRLEnvCfg):
         self.max_body_height = self.standing_height * self.max_body_height_ratio
 
         # Convert orientation limits to radians
-        self.max_pitch_rad = np.deg2rad(self.max_pitch_deg)
-        self.max_roll_rad = np.deg2rad(self.max_roll_deg)
+        self.max_pitch_rad = math.radians(self.max_pitch_deg)
+        self.max_roll_rad = math.radians(self.max_roll_deg)
 
         # Validate configuration
         assert self.decimation > 0, "Decimation must be positive"

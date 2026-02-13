@@ -187,61 +187,27 @@ class QuadrupedMPCEnv(DirectRLEnv):
             (self.num_envs, 4), dtype=torch.bool, device=self.device
         )
 
-        # Pending force/torque buffers for batch application
-        # Shape: (num_envs, 1, 3) - 1 body per env
-        self._pending_forces = torch.zeros(
-            (self.num_envs, 1, 3), device=self.device, dtype=torch.float32
-        )
-        self._pending_torques = torch.zeros(
-            (self.num_envs, 1, 3), device=self.device, dtype=torch.float32
+        # Pending joint effort buffer for batch application
+        # Shape: (num_envs, num_joints)
+        self._pending_joint_efforts = torch.zeros(
+            (self.num_envs, cfg.num_joints), device=self.device, dtype=torch.float32
         )
 
     def _setup_scene(self):
-        """Set up the simulation scene with quadruped and ground plane."""
+        """Set up the simulation scene with Go2 quadruped and ground plane."""
+        from isaaclab_assets.robots.unitree import UNITREE_GO2_CFG
+
         # Spawn ground plane
         ground_cfg = sim_utils.GroundPlaneCfg(
             size=(100.0, 100.0),
         )
         ground_cfg.func("/World/ground", ground_cfg)
 
-        # Spawn quadrupeds as articulated robots
-        # Using a placeholder box until proper URDF is available
-        quadruped_spawn = sim_utils.CuboidCfg(
-            size=(0.4, 0.2, 0.1),
-            rigid_props=sim_utils.RigidBodyPropertiesCfg(
-                rigid_body_enabled=True,
-                disable_gravity=False,
-                linear_damping=0.0,
-                angular_damping=0.0,
-                max_linear_velocity=5.0,
-                max_angular_velocity=10.0,
-            ),
-            mass_props=sim_utils.MassPropertiesCfg(
-                mass=self.cfg.robot_mass,
-            ),
-            collision_props=sim_utils.CollisionPropertiesCfg(
-                collision_enabled=True,
-            ),
-            visual_material=sim_utils.PreviewSurfaceCfg(
-                diffuse_color=(0.6, 0.4, 0.2),  # Brown color
-            ),
-        )
-
-        # For now, use RigidObject as placeholder
-        # In production, use ArticulationCfg with proper URDF
-        from isaaclab.assets import RigidObject, RigidObjectCfg
-
-        robot_cfg = RigidObjectCfg(
+        # Spawn Go2 quadruped as articulated robot
+        robot_cfg = UNITREE_GO2_CFG.replace(
             prim_path="/World/envs/env_.*/Robot",
-            spawn=quadruped_spawn,
-            init_state=RigidObjectCfg.InitialStateCfg(
-                pos=(0.0, 0.0, self.cfg.standing_height),
-                rot=(1.0, 0.0, 0.0, 0.0),
-            ),
         )
-
-        # Create the robot asset
-        self.robot = RigidObject(robot_cfg)
+        self.robot = Articulation(robot_cfg)
 
         # Add lights
         light_cfg = sim_utils.DomeLightCfg(
@@ -253,8 +219,8 @@ class QuadrupedMPCEnv(DirectRLEnv):
         # Clone environments and replicate physics (required for multi-env)
         self.scene.clone_environments(copy_from_source=False)
 
-        # Register objects to scene AFTER cloning
-        self.scene.rigid_objects["robot"] = self.robot
+        # Register articulation to scene AFTER cloning
+        self.scene.articulations["robot"] = self.robot
 
     def _pre_physics_step(self, actions: torch.Tensor):
         """Process RL actions before physics stepping.
@@ -368,46 +334,40 @@ class QuadrupedMPCEnv(DirectRLEnv):
             self.mpc_step_counter[env_idx] += 1
 
     def _apply_action(self):
-        """Apply accumulated forces/torques to the robot bodies."""
-        self.robot.permanent_wrench_composer.set_forces_and_torques(
-            forces=self._pending_forces,
-            torques=self._pending_torques,
-            body_ids=slice(None),
-        )
+        """Apply accumulated joint effort targets to the robot."""
+        self.robot.set_joint_effort_target(self._pending_joint_efforts)
 
     def _apply_control(self, env_idx: int, joint_torques: np.ndarray):
-        """Apply joint torque control to quadruped.
+        """Apply joint torque control to Go2 quadruped.
 
-        For the placeholder rigid body, we apply equivalent body forces.
-        In production with actual articulation, this would set joint efforts.
+        Maps MPC output (joint torques) to Isaac Lab articulation joint effort targets.
 
         Args:
             env_idx: Environment index.
-            joint_torques: Joint torque vector (nu-dimensional from MPC).
+            joint_torques: Joint torque vector (12D from MPC or dummy).
         """
-        # For rigid body placeholder, compute equivalent body force/torque
-        # This is a simplification - real implementation would use articulation
+        # Ensure correct dimension (12 joints for Go2)
+        num_joints = self.cfg.num_joints
+        if len(joint_torques) > num_joints:
+            # MPC may output more DOFs (including floating base)
+            # Take only the actuated joints
+            joint_torques = joint_torques[:num_joints]
+        elif len(joint_torques) < num_joints:
+            # Pad with zeros if MPC outputs fewer
+            padded = np.zeros(num_joints)
+            padded[:len(joint_torques)] = joint_torques
+            joint_torques = padded
 
-        # Sum of vertical forces from all legs (simplified)
-        vertical_force = np.sum(np.abs(joint_torques)) * 0.1  # Scale factor
-        vertical_force = min(vertical_force, self.cfg.robot_mass * 9.81 * 2)
-
-        # Simple torque from joint imbalance (safely handle varying nu)
-        nu = len(joint_torques)
-        if nu >= 12:
-            torque_x = (joint_torques[0] + joint_torques[3] - joint_torques[6] - joint_torques[9]) * 0.01
-            torque_y = (joint_torques[1] + joint_torques[4] - joint_torques[7] - joint_torques[10]) * 0.01
-        else:
-            torque_x = 0.0
-            torque_y = 0.0
-        torque_z = 0.0
-
-        # Store pending forces/torques for batch application
-        self._pending_forces[env_idx, 0, :] = torch.tensor(
-            [0.0, 0.0, vertical_force], device=self.device, dtype=torch.float32
+        # Clamp torques to max
+        joint_torques = np.clip(
+            joint_torques,
+            -self.cfg.max_joint_torque,
+            self.cfg.max_joint_torque,
         )
-        self._pending_torques[env_idx, 0, :] = torch.tensor(
-            [torque_x, torque_y, torque_z], device=self.device, dtype=torch.float32
+
+        # Store pending joint efforts for batch application
+        self._pending_joint_efforts[env_idx, :] = torch.tensor(
+            joint_torques, device=self.device, dtype=torch.float32
         )
 
     def _get_observations(self) -> Dict[str, torch.Tensor]:
@@ -432,11 +392,12 @@ class QuadrupedMPCEnv(DirectRLEnv):
         linear_vel = robot_data.root_lin_vel_w  # (num_envs, 3)
         angular_vel = robot_data.root_ang_vel_w  # (num_envs, 3)
 
-        # Joint state (dummy zeros for rigid body placeholder)
-        joint_pos = torch.zeros((self.num_envs, 12), device=self.device)
-        joint_vel = torch.zeros((self.num_envs, 12), device=self.device)
+        # Joint state from articulation
+        joint_pos = robot_data.joint_pos[:, :12]  # (num_envs, 12)
+        joint_vel = robot_data.joint_vel[:, :12]  # (num_envs, 12)
 
-        # Foot contacts (estimate from height for placeholder)
+        # Foot contacts: estimate from foot height
+        # TODO: Add ContactSensorCfg for accurate contact detection
         foot_contacts = (position[:, 2:3] < self.cfg.standing_height * 0.5).float()
         foot_contacts = foot_contacts.expand(-1, 4)
 
@@ -627,6 +588,19 @@ class QuadrupedMPCEnv(DirectRLEnv):
             torch.cat([zero_vel, zero_vel], dim=-1), env_ids
         )
 
+        # Reset joint positions to default standing pose and zero velocities
+        num_joints = self.robot.data.joint_pos.shape[1]
+        default_joint_pos = self.robot.data.default_joint_pos[env_ids]
+        default_joint_vel = torch.zeros(
+            (num_resets, num_joints), device=self.device
+        )
+        self.robot.write_joint_state_to_sim(
+            default_joint_pos, default_joint_vel, env_ids=env_ids
+        )
+
+        # Reset pending joint efforts
+        self._pending_joint_efforts[env_ids] = 0.0
+
         # Generate new target positions
         target_range = self.cfg.target_pos_range
         for idx, env_idx in enumerate(env_ids_np):
@@ -747,10 +721,11 @@ class QuadrupedMPCEnv(DirectRLEnv):
         states[:, 5] = root_quat_wxyz[:, 3]  # qz
         states[:, 6] = root_quat_wxyz[:, 0]  # qw
 
-        # Joint positions: use standing reference (placeholder has no joints)
+        # Joint positions from articulation
         if nq > 7:
-            for i in range(self.num_envs):
-                states[i, 7:nq] = q_ref[7:nq]
+            joint_pos = robot_data.joint_pos.cpu().numpy()
+            num_robot_joints = min(joint_pos.shape[1], nq - 7)
+            states[:, 7:7 + num_robot_joints] = joint_pos[:, :num_robot_joints]
 
         # Root linear velocity
         root_lin_vel = robot_data.root_lin_vel_w.cpu().numpy()
@@ -760,8 +735,11 @@ class QuadrupedMPCEnv(DirectRLEnv):
         root_ang_vel = robot_data.root_ang_vel_w.cpu().numpy()
         states[:, nq + 3:nq + 6] = root_ang_vel
 
-        # Joint velocities: zero (placeholder has no joints)
-        # states[:, nq + 6:nq + nv] already zeros
+        # Joint velocities from articulation
+        if nv > 6:
+            joint_vel = robot_data.joint_vel.cpu().numpy()
+            num_robot_joints = min(joint_vel.shape[1], nv - 6)
+            states[:, nq + 6:nq + 6 + num_robot_joints] = joint_vel[:, :num_robot_joints]
 
         return states
 

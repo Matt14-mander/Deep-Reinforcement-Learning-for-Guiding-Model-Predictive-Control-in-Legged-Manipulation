@@ -309,8 +309,49 @@ SOLO12_CFG = QuadrupedCfg(
     },
 )
 
-# Default configuration
-DEFAULT_QUADRUPED_CFG = B1_CFG
+# Unitree Go2 configuration
+GO2_CFG = QuadrupedCfg(
+    name="go2",
+    physics=QuadrupedPhysicsCfg(
+        mass=15.0,
+        body_length=0.3868,
+        body_width=0.093,
+        standing_height=0.4,
+        hip_length=0.0465,
+        thigh_length=0.213,
+        calf_length=0.213,
+    ),
+    joints=QuadrupedJointsCfg(
+        max_torque=23.5,
+        kp=25.0,
+        kd=0.5,
+        joint_names=[
+            "FR_hip_joint", "FR_thigh_joint", "FR_calf_joint",
+            "FL_hip_joint", "FL_thigh_joint", "FL_calf_joint",
+            "RR_hip_joint", "RR_thigh_joint", "RR_calf_joint",
+            "RL_hip_joint", "RL_thigh_joint", "RL_calf_joint",
+        ],
+        default_haa=0.0,
+        default_hfe=0.9,
+        default_kfe=-1.5,
+    ),
+    frames=QuadrupedFramesCfg(
+        lf_foot="FL_foot",
+        rf_foot="FR_foot",
+        lh_foot="RL_foot",
+        rh_foot="RR_foot",
+    ),
+    hip_offsets={
+        "LF": np.array([+0.1934, +0.0465, 0.0]),
+        "RF": np.array([+0.1934, -0.0465, 0.0]),
+        "LH": np.array([-0.1934, +0.0465, 0.0]),
+        "RH": np.array([-0.1934, -0.0465, 0.0]),
+    },
+    default_step_height=0.08,
+)
+
+# Default configuration (now Go2)
+DEFAULT_QUADRUPED_CFG = GO2_CFG
 
 
 # =============================================================================
@@ -402,43 +443,74 @@ if ISAACLAB_AVAILABLE:
 # Pinocchio model loading utilities
 # =============================================================================
 
-def load_pinocchio_model(urdf_path: Optional[str] = None, robot_name: str = "solo12"):
+def load_pinocchio_model(urdf_path: Optional[str] = None, robot_name: str = "go2"):
     """Load a Pinocchio model for MPC.
 
     Tries to load from:
     1. Provided URDF path
-    2. example-robot-data package (if installed)
-    3. Raises error if neither available
+    2. Go2 URDF from unitree_ros in project assets
+    3. example-robot-data package (if installed)
+    4. Raises error if none available
 
     Args:
-        urdf_path: Path to URDF file. If None, tries example-robot-data.
-        robot_name: Name of robot in example-robot-data ("solo12", "anymal", etc.)
+        urdf_path: Path to URDF file. If None, tries other sources.
+        robot_name: Name of robot ("go2", "solo12", "anymal", etc.)
 
     Returns:
         Tuple of (pinocchio.Model, urdf_path_used).
     """
+    import os
+
     try:
         import pinocchio
     except ImportError:
         raise ImportError("Pinocchio is required for loading robot models.")
 
+    # 1. Direct URDF path
     if urdf_path is not None:
         model = pinocchio.buildModelFromUrdf(urdf_path)
         return model, urdf_path
 
-    # Try example-robot-data
+    # 2. Try Go2 URDF from project assets directory
+    assets_dir = os.path.join(
+        os.path.dirname(os.path.dirname(__file__)),
+        "assets", "robots", "urdf"
+    )
+    local_urdf_map = {
+        "go2": os.path.join(assets_dir, "robots", "go2_description", "urdf", "go2_description.urdf"),
+    }
+    if robot_name in local_urdf_map:
+        local_path = local_urdf_map[robot_name]
+        if os.path.exists(local_path):
+            model = pinocchio.buildModelFromUrdf(local_path)
+            return model, local_path
+
+    # 3. Try UNITREE_ROS_DIR environment variable
+    unitree_ros_dir = os.environ.get("UNITREE_ROS_DIR")
+    if unitree_ros_dir:
+        urdf_candidates = [
+            os.path.join(unitree_ros_dir, "robots", f"{robot_name}_description", "urdf", f"{robot_name}_description.urdf"),
+            os.path.join(unitree_ros_dir, "robots", f"{robot_name}_description", "urdf", f"{robot_name}.urdf"),
+        ]
+        for candidate in urdf_candidates:
+            if os.path.exists(candidate):
+                model = pinocchio.buildModelFromUrdf(candidate)
+                return model, candidate
+
+    # 4. Try example-robot-data
     try:
         import example_robot_data
 
-        # Try generic loading first (works for all robots including b1)
         robot = example_robot_data.load(robot_name)
         urdf = getattr(robot, "urdf_path", getattr(robot, "urdf", None))
         return robot.model, urdf
 
     except ImportError:
         raise ImportError(
-            f"Could not load robot model. Either provide a URDF path or "
-            f"install example-robot-data: pip install example-robot-data"
+            f"Could not load robot model '{robot_name}'. Options:\n"
+            f"  1. Provide a URDF path directly\n"
+            f"  2. Set UNITREE_ROS_DIR environment variable\n"
+            f"  3. Install example-robot-data: pip install example-robot-data"
         )
     except Exception as e:
         raise RuntimeError(f"Failed to load robot '{robot_name}' from example-robot-data: {e}")
