@@ -72,10 +72,13 @@ class OCPFactory:
         "com_track": 1e6,
         "foot_track": 1e6,
         "state_reg": 1e1,
-        "ctrl_reg": 1e-1,
-        "friction_cone": 1e1,
+        "ctrl_reg": 1e0,           # Increased: reduce aggressive torques in turns
+        "friction_cone": 1e3,      # Increased from 1e1: must dominate to prevent
+                                    # downward GRF, especially on hind feet during curves
         "state_bounds": 1e3,
-        "orientation_track": 1e4,  # NEW: for curve walking
+        "orientation_track": 1e3,  # Reduced from 1e4: avoid conflict with friction cone
+                                    # during curve walking (yaw tracking less critical
+                                    # than physical constraint satisfaction)
     }
 
     def __init__(
