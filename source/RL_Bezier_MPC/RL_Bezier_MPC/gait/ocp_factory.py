@@ -254,11 +254,13 @@ class OCPFactory:
         # Friction cone constraints for each support foot
         for foot_id in support_foot_ids:
             # Create friction cone
+            # FrictionCone expects a 3x3 rotation matrix (not a normal vector).
+            # np.eye(3) means the cone normal is aligned with world z-axis (upward).
             cone = crocoddyl.FrictionCone(
-                np.array([0.0, 0.0, 1.0]),  # normal
-                self.mu,  # friction coefficient
-                4,  # number of cone faces
-                False,  # inner approximation
+                np.eye(3),     # rotation matrix (identity = z-up normal)
+                self.mu,       # friction coefficient
+                4,             # number of cone faces
+                False,         # inner approximation
             )
 
             friction_residual = crocoddyl.ResidualModelContactFrictionCone(
