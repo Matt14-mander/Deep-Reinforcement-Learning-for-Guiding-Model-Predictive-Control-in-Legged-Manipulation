@@ -277,8 +277,19 @@ class OCPFactory:
             )
 
         # State bounds (joint limits)
-        state_lb = np.concatenate([self.state.lb[:self.nv], self.state.lb[self.nv:]])
-        state_ub = np.concatenate([self.state.ub[:self.nv], self.state.ub[self.nv:]])
+        # state.lb/ub have dimension nx = nq + nv, but ResidualModelState
+        # outputs in tangent space with dimension ndx = 2*nv.
+        # For floating base: skip the first element (quaternion normalization)
+        # and take nv elements for position part, then nv for velocity part.
+        # Reference: Crocoddyl whole_body_manipulation example
+        state_lb = np.concatenate([
+            self.state.lb[1:self.nv + 1],   # position bounds in tangent space
+            self.state.lb[-self.nv:]         # velocity bounds
+        ])
+        state_ub = np.concatenate([
+            self.state.ub[1:self.nv + 1],   # position bounds in tangent space
+            self.state.ub[-self.nv:]         # velocity bounds
+        ])
 
         bounds_activation = crocoddyl.ActivationModelQuadraticBarrier(
             crocoddyl.ActivationBounds(state_lb, state_ub)
