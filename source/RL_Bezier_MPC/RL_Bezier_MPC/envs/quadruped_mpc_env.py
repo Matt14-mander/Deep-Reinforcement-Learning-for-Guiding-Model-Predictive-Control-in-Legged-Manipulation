@@ -158,6 +158,10 @@ class QuadrupedMPCEnv(DirectRLEnv):
         # Last MPC solution for debugging/visualization
         self.last_mpc_solutions: list[MPCSolution | None] = [None] * self.num_envs
 
+        # MPC cost and convergence tracking for constraint-aware rewards
+        self._last_mpc_costs = np.zeros(self.num_envs)
+        self._last_mpc_converged = np.zeros(self.num_envs, dtype=bool)
+
         # Action bounds for normalization
         bezier_low, bezier_high = self.trajectory_generator.get_param_bounds()
         gait_mod_low = np.array([
@@ -316,15 +320,21 @@ class QuadrupedMPCEnv(DirectRLEnv):
                     )
                     self.last_mpc_solutions[env_idx] = solution
                     joint_torques = solution.control
+                    self._last_mpc_costs[env_idx] = solution.cost
+                    self._last_mpc_converged[env_idx] = solution.converged
                 except Exception as e:
                     if env_idx == 0:
                         print(f"Warning: MPC solve failed for env {env_idx}: {e}")
                     joint_torques = np.zeros(self.cfg.num_joints)
                     self.last_mpc_solutions[env_idx] = None
+                    self._last_mpc_costs[env_idx] = 0.0
+                    self._last_mpc_converged[env_idx] = False
             else:
                 # Dummy mode: zero control
                 joint_torques = np.zeros(self.cfg.num_joints)
                 self.last_mpc_solutions[env_idx] = None
+                self._last_mpc_costs[env_idx] = 0.0
+                self._last_mpc_converged[env_idx] = False
 
             # Apply control to robot
             self._apply_control(env_idx, joint_torques)
@@ -484,6 +494,15 @@ class QuadrupedMPCEnv(DirectRLEnv):
             if target_dist < self.cfg.target_threshold:
                 target_bonus = self.cfg.reward_reached_target
 
+            # MPC cost penalty (high cost indicates constraint violations)
+            mpc_cost = self._last_mpc_costs[env_idx]
+            mpc_cost_penalty = self.cfg.reward_mpc_cost_penalty * min(mpc_cost / 1e4, 10.0)
+
+            # MPC convergence reward (converged = constraints satisfied)
+            mpc_convergence_reward = (
+                self.cfg.reward_mpc_convergence if self._last_mpc_converged[env_idx] else 0.0
+            )
+
             # Total reward
             rewards[env_idx] = (
                 com_reward
@@ -492,6 +511,8 @@ class QuadrupedMPCEnv(DirectRLEnv):
                 + torque_penalty
                 + alive_bonus
                 + target_bonus
+                + mpc_cost_penalty
+                + mpc_convergence_reward
             )
 
         return rewards

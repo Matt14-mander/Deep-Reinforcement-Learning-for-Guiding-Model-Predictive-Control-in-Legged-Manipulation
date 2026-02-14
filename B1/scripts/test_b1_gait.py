@@ -55,6 +55,7 @@ from quadruped_mpc.gait import (
     FootholdPlanner,
     ContactSequence,
     ContactPhase,
+    OCPFactory,
 )
 from quadruped_mpc.utils.math_utils import (
     bezier_curve,
@@ -233,8 +234,16 @@ def build_ocp_with_our_pipeline(
     foothold_plans: Dict[str, List],
     foot_frame_ids: Dict[str, int],
     dt: float = 0.02,
+    heading_trajectory: Optional[np.ndarray] = None,
 ) -> Tuple["crocoddyl.ShootingProblem", List]:
-    """Build OCP using our custom pipeline (not Crocoddyl's demo).
+    """Build OCP using OCPFactory with full constraints.
+
+    Uses OCPFactory which includes all necessary costs/constraints:
+    - Friction cone constraints (prevents downward GRF)
+    - State bounds (joint limits)
+    - Weighted state regularization (base orientation, joint, velocity weights)
+    - Body orientation tracking (for curve walking)
+    - Proper cost weights (1e6 for CoM/foot tracking)
 
     Args:
         rmodel: Pinocchio robot model.
@@ -244,142 +253,29 @@ def build_ocp_with_our_pipeline(
         foothold_plans: Foothold plans from FootholdPlanner.
         foot_frame_ids: Mapping from foot name to frame ID.
         dt: OCP timestep.
+        heading_trajectory: Target yaw angles per timestep. Optional.
 
     Returns:
         Tuple of (problem, running_models)
     """
-    # Create state and actuation models
-    state = crocoddyl.StateMultibody(rmodel)
-    actuation = crocoddyl.ActuationModelFloatingBase(state)
-
-    nu = actuation.nu
-
-    # Build running models
-    running_models = []
-    knot_index = 0
-
-    # Track swing indices for each foot
-    foot_swing_indices = {foot: 0 for foot in foot_frame_ids.keys()}
-
-    for phase in contact_sequence.phases:
-        num_knots = max(1, round(phase.duration / dt))
-
-        # Get support foot frame IDs
-        support_foot_ids = [
-            foot_frame_ids[foot]
-            for foot in phase.support_feet
-            if foot in foot_frame_ids
-        ]
-
-        for knot in range(num_knots):
-            # Get CoM target
-            traj_idx = min(knot_index, len(com_trajectory) - 1)
-            com_target = com_trajectory[traj_idx]
-
-            # Create contact model
-            contact_model = crocoddyl.ContactModelMultiple(state, nu)
-            for foot_id in support_foot_ids:
-                contact = crocoddyl.ContactModel3D(
-                    state, foot_id,
-                    np.array([0.0, 0.0, 0.0]),
-                    pinocchio.LOCAL_WORLD_ALIGNED,
-                    nu,
-                    np.array([0.0, 50.0])
-                )
-                contact_model.addContact(f"contact_{foot_id}", contact)
-
-            # Create cost model
-            cost_model = crocoddyl.CostModelSum(state, nu)
-
-            # CoM tracking cost
-            com_residual = crocoddyl.ResidualModelCoMPosition(state, com_target, nu)
-            com_cost = crocoddyl.CostModelResidual(state, com_residual)
-            cost_model.addCost("comTrack", com_cost, 1e4)
-
-            # Swing foot tracking costs
-            for foot_name in phase.swing_feet:
-                if foot_name not in foot_frame_ids:
-                    continue
-
-                frame_id = foot_frame_ids[foot_name]
-                swing_idx = foot_swing_indices[foot_name]
-
-                if swing_idx < len(foothold_plans.get(foot_name, [])):
-                    plan = foothold_plans[foot_name][swing_idx]
-
-                    if plan.trajectory is not None and len(plan.trajectory) > 0:
-                        traj_knot = min(knot, len(plan.trajectory) - 1)
-                        target_pos = plan.trajectory[traj_knot]
-                    else:
-                        alpha = knot / max(1, num_knots - 1)
-                        target_pos = (1 - alpha) * plan.start_pos + alpha * plan.end_pos
-
-                    foot_residual = crocoddyl.ResidualModelFrameTranslation(
-                        state, frame_id, target_pos, nu
-                    )
-                    foot_cost = crocoddyl.CostModelResidual(state, foot_residual)
-                    cost_model.addCost(f"footTrack_{foot_name}", foot_cost, 1e5)
-
-            # State regularization
-            state_residual = crocoddyl.ResidualModelState(state, x0, nu)
-            state_cost = crocoddyl.CostModelResidual(state, state_residual)
-            cost_model.addCost("stateReg", state_cost, 1e1)
-
-            # Control regularization
-            ctrl_residual = crocoddyl.ResidualModelControl(state, nu)
-            ctrl_cost = crocoddyl.CostModelResidual(state, ctrl_residual)
-            cost_model.addCost("ctrlReg", ctrl_cost, 1e-1)
-
-            # Differential model
-            dmodel = crocoddyl.DifferentialActionModelContactFwdDynamics(
-                state, actuation, contact_model, cost_model
-            )
-
-            # Integrated model
-            model = crocoddyl.IntegratedActionModelEuler(dmodel, dt)
-            running_models.append(model)
-            knot_index += 1
-
-        # Update swing indices after swing phase
-        if phase.phase_type == "swing":
-            for foot_name in phase.swing_feet:
-                if foot_name in foot_swing_indices:
-                    foot_swing_indices[foot_name] += 1
-
-    # Terminal model (all feet in contact)
-    all_foot_ids = list(foot_frame_ids.values())
-
-    terminal_contact = crocoddyl.ContactModelMultiple(state, nu)
-    for foot_id in all_foot_ids:
-        contact = crocoddyl.ContactModel3D(
-            state, foot_id,
-            np.array([0.0, 0.0, 0.0]),
-            pinocchio.LOCAL_WORLD_ALIGNED,
-            nu,
-            np.array([0.0, 0.0])
-        )
-        terminal_contact.addContact(f"contact_{foot_id}", contact)
-
-    terminal_cost = crocoddyl.CostModelSum(state, nu)
-
-    # Terminal CoM tracking (heavier weight)
-    com_target = com_trajectory[-1]
-    com_residual = crocoddyl.ResidualModelCoMPosition(state, com_target, nu)
-    terminal_cost.addCost("comTrack", crocoddyl.CostModelResidual(state, com_residual), 1e5)
-
-    # Terminal state regularization
-    state_residual = crocoddyl.ResidualModelState(state, x0, nu)
-    terminal_cost.addCost("stateReg", crocoddyl.CostModelResidual(state, state_residual), 1e2)
-
-    terminal_dmodel = crocoddyl.DifferentialActionModelContactFwdDynamics(
-        state, actuation, terminal_contact, terminal_cost
+    factory = OCPFactory(
+        rmodel=rmodel,
+        foot_frame_ids=foot_frame_ids,
+        mu=0.7,
     )
-    terminal_model = crocoddyl.IntegratedActionModelEuler(terminal_dmodel, 0.0)
+    # Use B1 standing configuration for regularization (not pinocchio.neutral)
+    factory.x0 = x0
 
-    # Create shooting problem
-    problem = crocoddyl.ShootingProblem(x0, running_models, terminal_model)
+    problem = factory.build_problem(
+        x0=x0,
+        contact_sequence=contact_sequence,
+        com_trajectory=com_trajectory,
+        foot_trajectories=foothold_plans,
+        dt=dt,
+        heading_trajectory=heading_trajectory,
+    )
 
-    return problem, running_models
+    return problem, list(problem.runningModels)
 
 
 # =============================================================================
@@ -498,8 +394,19 @@ def test_b1_gait(
         elif trajectory_type == "curve_right" and right_avg < left_avg:
             print("  [OK] Inner (right) feet take shorter steps")
 
+    # Compute heading trajectory from CoM trajectory tangent
+    heading_trajectory = np.zeros(len(com_trajectory))
+    for i in range(len(com_trajectory)):
+        if i == 0 and len(com_trajectory) > 1:
+            tangent = (com_trajectory[1] - com_trajectory[0]) / dt
+        elif i >= len(com_trajectory) - 1:
+            tangent = (com_trajectory[-1] - com_trajectory[-2]) / dt
+        else:
+            tangent = (com_trajectory[i + 1] - com_trajectory[i - 1]) / (2 * dt)
+        heading_trajectory[i] = heading_from_tangent(tangent[:2])
+
     # Build OCP
-    print("\nBuilding OCP with our pipeline...")
+    print("\nBuilding OCP with OCPFactory (includes friction cone, state bounds, etc.)...")
     problem, running_models = build_ocp_with_our_pipeline(
         rmodel=rmodel,
         x0=x0,
@@ -508,6 +415,7 @@ def test_b1_gait(
         foothold_plans=foothold_plans,
         foot_frame_ids=foot_frame_ids,
         dt=dt,
+        heading_trajectory=heading_trajectory,
     )
 
     print(f"  Running models: {len(running_models)}")
