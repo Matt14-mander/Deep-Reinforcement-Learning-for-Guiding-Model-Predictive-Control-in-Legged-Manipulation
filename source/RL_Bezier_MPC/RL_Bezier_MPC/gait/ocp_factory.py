@@ -305,20 +305,31 @@ class OCPFactory:
             # Create target rotation (only yaw matters for curve walking)
             target_rotation = pinocchio.utils.rpyToMatrix(0.0, 0.0, body_yaw_target)
 
-            # Orientation residual for base frame
-            base_frame_id = self.rmodel.getFrameId("base_link")
-            orientation_residual = crocoddyl.ResidualModelFrameRotation(
-                self.state,
-                base_frame_id,
-                target_rotation,
-                self.nu,
-            )
-            orientation_cost = crocoddyl.CostModelResidual(
-                self.state, orientation_residual
-            )
-            cost_model.addCost(
-                "bodyOrientation", orientation_cost, self.weights["orientation_track"]
-            )
+            # Find base body frame - try common names, fall back to first BODY frame
+            base_frame_id = None
+            for name in ["base_link", "base", "trunk", "body"]:
+                if self.rmodel.existFrame(name):
+                    base_frame_id = self.rmodel.getFrameId(name)
+                    break
+            if base_frame_id is None:
+                for i, frame in enumerate(self.rmodel.frames):
+                    if frame.type == pinocchio.FrameType.BODY and i > 0:
+                        base_frame_id = i
+                        break
+
+            if base_frame_id is not None:
+                orientation_residual = crocoddyl.ResidualModelFrameRotation(
+                    self.state,
+                    base_frame_id,
+                    target_rotation,
+                    self.nu,
+                )
+                orientation_cost = crocoddyl.CostModelResidual(
+                    self.state, orientation_residual
+                )
+                cost_model.addCost(
+                    "bodyOrientation", orientation_cost, self.weights["orientation_track"]
+                )
 
         # Create differential action model
         if self.fwddyn:
@@ -442,7 +453,9 @@ class OCPFactory:
         cost_model.addCost("stateReg", state_cost, self.weights["state_reg"] * 10)
 
         # Velocity damping (want zero velocity at terminal)
-        velocity_weights = np.zeros(self.nx)
+        # ResidualModelState outputs in tangent space (ndx = 2*nv)
+        ndx = 2 * self.nv
+        velocity_weights = np.zeros(ndx)
         velocity_weights[self.nv:] = 100.0  # High weight on velocity part
         velocity_activation = crocoddyl.ActivationModelWeightedQuad(velocity_weights)
         velocity_residual = crocoddyl.ResidualModelState(self.state, self.x0, self.nu)
@@ -454,16 +467,29 @@ class OCPFactory:
         # Body orientation
         if body_yaw_target is not None:
             target_rotation = pinocchio.utils.rpyToMatrix(0.0, 0.0, body_yaw_target)
-            base_frame_id = self.rmodel.getFrameId("base_link")
-            orientation_residual = crocoddyl.ResidualModelFrameRotation(
-                self.state, base_frame_id, target_rotation, self.nu
-            )
-            orientation_cost = crocoddyl.CostModelResidual(
-                self.state, orientation_residual
-            )
-            cost_model.addCost(
-                "bodyOrientation", orientation_cost, self.weights["orientation_track"]
-            )
+
+            # Find base body frame - try common names, fall back to first BODY frame
+            base_frame_id = None
+            for name in ["base_link", "base", "trunk", "body"]:
+                if self.rmodel.existFrame(name):
+                    base_frame_id = self.rmodel.getFrameId(name)
+                    break
+            if base_frame_id is None:
+                for i, frame in enumerate(self.rmodel.frames):
+                    if frame.type == pinocchio.FrameType.BODY and i > 0:
+                        base_frame_id = i
+                        break
+
+            if base_frame_id is not None:
+                orientation_residual = crocoddyl.ResidualModelFrameRotation(
+                    self.state, base_frame_id, target_rotation, self.nu
+                )
+                orientation_cost = crocoddyl.CostModelResidual(
+                    self.state, orientation_residual
+                )
+                cost_model.addCost(
+                    "bodyOrientation", orientation_cost, self.weights["orientation_track"]
+                )
 
         # Differential model
         dmodel = crocoddyl.DifferentialActionModelContactFwdDynamics(
