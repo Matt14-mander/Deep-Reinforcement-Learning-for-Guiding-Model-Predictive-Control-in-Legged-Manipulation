@@ -231,6 +231,10 @@ class QuadrupedMPCEnvCfg(DirectRLEnvCfg):
     reward_action_rate_penalty: float = -0.05
     reward_alive: float = 0.1
 
+    # MPC constraint-related rewards
+    reward_mpc_cost_penalty: float = -0.001    # Penalize high MPC cost (constraint violations)
+    reward_mpc_convergence: float = 0.2        # Reward MPC solver convergence
+
     # ==========================================================================
     # Termination Conditions
     # ==========================================================================
