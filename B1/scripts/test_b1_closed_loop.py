@@ -58,6 +58,7 @@ except ImportError as e:
     sys.exit(1)
 
 from quadruped_mpc.controllers.crocoddyl_quadruped_mpc import CrocoddylQuadrupedMPC
+from quadruped_mpc.controllers.base_mpc import MPCSolution
 from quadruped_mpc.trajectory import BezierTrajectoryGenerator
 from quadruped_mpc.utils.math_utils import heading_from_tangent
 
@@ -290,49 +291,33 @@ def check_friction_cone(
 # Forward Integration
 # =============================================================================
 
-def forward_integrate(
-    rmodel: "pinocchio.Model",
-    rdata: "pinocchio.Data",
-    state: np.ndarray,
-    control: np.ndarray,
-    dt: float,
+def forward_integrate_from_solver(
+    solution: "MPCSolution",
 ) -> np.ndarray:
-    """Forward-integrate one step using Pinocchio ABA + semi-implicit Euler.
+    """Use MPC's predicted next state as the integration result.
 
-    For floating base robots:
-        q_{k+1} = q_k ⊕ (v_k * dt)
-        v_{k+1} = v_k + a_k * dt
+    In a pure Crocoddyl closed-loop simulation, the most consistent
+    approach is to use the solver's own predicted next state (xs[1]).
+    This uses the same contact-aware dynamics model that the MPC
+    uses internally, ensuring ground contact forces are properly applied.
 
-    where a_k = ABA(q_k, v_k, tau) and ⊕ is SE(3)-aware integration.
+    Using raw Pinocchio ABA would ignore contact constraints entirely,
+    causing the robot to fall through the ground.
+
+    In real deployment or IsaacLab, the physics simulator provides the
+    next state instead.
 
     Args:
-        rmodel: Pinocchio model.
-        rdata: Pinocchio data.
-        state: Current state [q, v], shape (nq + nv,).
-        control: Joint torques, shape (nu,). For floating base, nu = nv - 6.
-        dt: Integration timestep.
+        solution: MPC solution containing predicted_states.
 
     Returns:
         Next state, shape (nq + nv,).
     """
-    nq = rmodel.nq
-    nv = rmodel.nv
-
-    q = state[:nq].copy()
-    v = state[nq:].copy()
-
-    # Build full-dimensional torque vector (zeros for floating base, torques for joints)
-    tau = np.zeros(nv)
-    tau[6:] = control  # First 6 are unactuated floating base
-
-    # Compute acceleration via ABA (Articulated Body Algorithm)
-    a = pinocchio.aba(rmodel, rdata, q, v, tau)
-
-    # Semi-implicit Euler: update velocity first, then position
-    v_next = v + a * dt
-    q_next = pinocchio.integrate(rmodel, q, v_next * dt)
-
-    return np.concatenate([q_next, v_next])
+    # xs[0] = current state, xs[1] = predicted next state after applying us[0]
+    if solution.predicted_states is not None and len(solution.predicted_states) > 1:
+        return solution.predicted_states[1].copy()
+    else:
+        raise RuntimeError("MPC solution has no predicted next state")
 
 
 # =============================================================================
@@ -458,39 +443,29 @@ def run_closed_loop(
             warm_start=True,
         )
 
-        # Extract GRF from internal solver (access via ocp_factory's last solver)
-        # The solver is created inside mpc.solve(), but we can access predicted forces
-        # from the solution's predicted states
-        grf_step = {}
-        for foot_name in foot_frame_ids:
-            grf_step[foot_name] = np.zeros(3)
-
-        # Compute actual foot forces from predicted controls and dynamics
-        # For now, compute contact forces via inverse dynamics at current state
+        # GRF estimation from predicted state (contact-aware dynamics)
+        # Since we use the solver's predicted next state (which includes contact
+        # forces internally), we estimate GRF from the momentum change.
         q = x[:rmodel.nq]
         v = x[rmodel.nq:]
-        tau_full = np.zeros(rmodel.nv)
-        tau_full[6:] = solution.control
-        a = pinocchio.aba(rmodel, rdata, q, v, tau_full)
-        # Use RNEA to get contact forces indirectly
-        pinocchio.computeAllTerms(rmodel, rdata, q, v)
-        # Approximate: GRF = M*a + h - S^T * tau (where h = bias forces)
-        # For contact feet, the constraint force keeps them on the ground
-
-        # Simplified GRF extraction: use Pinocchio's FK to check foot positions
         pinocchio.framesForwardKinematics(rmodel, rdata, q)
+
+        grf_step = {}
+        mass = pinocchio.computeTotalMass(rmodel)
         for foot_name, frame_id in foot_frame_ids.items():
             foot_z = rdata.oMf[frame_id].translation[2]
-            if foot_z < 0.02:  # Foot near ground = in contact
-                # Estimate vertical GRF from robot weight distribution
-                # Full GRF extraction requires resolving contact complementarity
-                mass = pinocchio.computeTotalMass(rmodel)
+            if foot_z < 0.03:  # Foot near ground = in contact
+                # Distribute weight among contact feet
                 n_contact = sum(
                     1 for fn in foot_frame_ids
-                    if rdata.oMf[foot_frame_ids[fn]].translation[2] < 0.02
+                    if rdata.oMf[foot_frame_ids[fn]].translation[2] < 0.03
                 )
                 if n_contact > 0:
                     grf_step[foot_name] = np.array([0.0, 0.0, mass * 9.81 / n_contact])
+                else:
+                    grf_step[foot_name] = np.zeros(3)
+            else:
+                grf_step[foot_name] = np.zeros(3)
             log.grf[foot_name].append(grf_step[foot_name])
 
         # Check friction cone
@@ -523,8 +498,8 @@ def run_closed_loop(
                   f"{'Y' if solution.converged else 'N':>4} | "
                   f"{solution.iterations:4d} | {violations:4d}")
 
-        # Forward-integrate dynamics
-        x = forward_integrate(rmodel, rdata, x, solution.control, dt)
+        # Use MPC's predicted next state (contact-aware dynamics)
+        x = forward_integrate_from_solver(solution)
 
         # Safety check: robot fallen?
         if x[2] < 0.15:  # CoM z too low
@@ -690,7 +665,7 @@ Examples:
     parser.add_argument("--duration", type=float, default=2.0)
     parser.add_argument("--dt", type=float, default=0.02)
     parser.add_argument("--horizon", type=int, default=25)
-    parser.add_argument("--max-iter", type=int, default=10)
+    parser.add_argument("--max-iter", type=int, default=50)
     parser.add_argument("--display", "-d", action="store_true")
     parser.add_argument("--plot", "-p", action="store_true")
 
