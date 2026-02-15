@@ -599,7 +599,7 @@ Examples:
         help="Trajectory type (default: straight)"
     )
     parser.add_argument(
-        "--distance", type=float, default=0.5,
+        "--distance", type=float, default=5,
         help="Forward distance in meters (default: 0.5)"
     )
     parser.add_argument(
