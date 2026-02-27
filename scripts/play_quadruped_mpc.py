@@ -163,6 +163,8 @@ def main():
                 actor_hidden_dims=[256, 256, 128],
                 critic_hidden_dims=[256, 256, 128],
                 activation="elu",
+                obs={},
+                obs_groups={},
             ).to(env.device)
 
             # Load weights
@@ -188,7 +190,7 @@ def main():
         print(f"\nEpisode {episode + 1}/{args.num_episodes}")
 
         # Reset environment
-        obs = env.reset()
+        obs, _ = env.reset()
         obs_tensor = obs["policy"]
 
         episode_reward = torch.zeros(env.num_envs, device=env.device)
