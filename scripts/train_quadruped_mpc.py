@@ -118,7 +118,7 @@ def create_ppo_config(env_cfg: QuadrupedMPCEnvCfg):
             "num_learning_epochs": 5,
             "num_mini_batches": 4,
             "learning_rate": 3e-4,
-            "schedule": "adaptive",
+            "schedule": "fixed", # adaptive
             "gamma": 0.99,
             "lam": 0.95,
             "desired_kl": 0.01,
