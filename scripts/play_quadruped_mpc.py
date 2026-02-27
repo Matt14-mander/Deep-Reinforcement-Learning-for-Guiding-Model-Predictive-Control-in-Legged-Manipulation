@@ -157,19 +157,21 @@ def main():
 
             # Create actor-critic network
             policy = ActorCritic(
-                num_actor_obs=env.cfg.num_observations,
-                num_critic_obs=env.cfg.num_observations,
-                num_actions=env.cfg.num_actions,
+                num_actor_obs=45,  
+                num_critic_obs=45,
+                num_actions=15,    
                 actor_hidden_dims=[256, 256, 128],
                 critic_hidden_dims=[256, 256, 128],
                 activation="elu",
-                obs={},
-                obs_groups={},
+                
+                obs={"policy": torch.zeros(1, 45, device=env.device)}, 
+                obs_groups={"policy": ["policy"], "critic": ["policy"]}
             ).to(env.device)
 
             # Load weights
             checkpoint = torch.load(args.checkpoint, map_location=env.device)
-            policy.load_state_dict(checkpoint["actor_critic_state_dict"])
+            
+            policy.load_state_dict(checkpoint["model_state_dict"]) 
             policy.eval()
 
             print(f"Loaded policy from: {args.checkpoint}")
@@ -206,7 +208,7 @@ def main():
             else:
                 # Random actions
                 actions = torch.rand(
-                    env.num_envs, env.cfg.num_actions, device=env.device
+                    env.num_envs, 15, device=env.device
                 ) * 2 - 1
 
             # Step environment
