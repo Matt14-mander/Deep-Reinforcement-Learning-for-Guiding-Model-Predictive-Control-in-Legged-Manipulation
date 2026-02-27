@@ -222,6 +222,7 @@ def main():
             # Video recording
             if args.video and episode == 0:  # Record first episode
                 # Video recording handled by Isaac Lab viewer
+                pass
 
         # Episode summary
         avg_reward = episode_reward.mean().item()
