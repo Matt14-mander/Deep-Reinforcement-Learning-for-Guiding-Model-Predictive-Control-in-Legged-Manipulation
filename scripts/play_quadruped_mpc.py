@@ -169,7 +169,7 @@ def main():
             ).to(env.device)
 
             # Load weights
-            checkpoint = torch.load(args.checkpoint, map_location=env.device)
+            checkpoint = torch.load(args.checkpoint, map_location=env.device, weights_only=False)
             
             policy.load_state_dict(checkpoint["model_state_dict"]) 
             policy.eval()
