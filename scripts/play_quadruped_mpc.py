@@ -7,21 +7,18 @@
 """Evaluation/play script for trained Quadruped MPC policies.
 
 This script loads a trained RL policy and runs it in the simulation
-for visualization and evaluation purposes.
+for visualization and evaluation purposes. Supports trajectory logging
+and matplotlib-based visualization for headless cloud servers.
 
 Usage:
     # Random policy (for testing)
-    python scripts/play_quadruped_mpc.py --num_envs 4 --headless
+    python scripts/play_quadruped_mpc.py --num_envs 1 --headless
 
-    # Load trained checkpoint
-    python scripts/play_quadruped_mpc.py --checkpoint logs/quadruped_mpc/model_final.pt
+    # Load trained checkpoint + save trajectory plot
+    python scripts/play_quadruped_mpc.py --checkpoint logs/quadruped_mpc/.../model_2999.pt --num_envs 1 --headless
 
-    # Record video (headless cloud server)
-    python scripts/play_quadruped_mpc.py --checkpoint model.pt --video --video_length 200 --headless
-
-Requirements:
-    - Isaac Lab (Isaac Sim 4.5+)
-    - Trained checkpoint (optional, uses random policy otherwise)
+    # Livestream (real-time viewing via browser)
+    python scripts/play_quadruped_mpc.py --checkpoint model.pt --num_envs 1 --headless --livestream 2
 """
 
 import argparse
@@ -34,8 +31,8 @@ parser = argparse.ArgumentParser(description="Play Quadruped MPC Policy")
 
 # Environment settings
 parser.add_argument(
-    "--num_envs", type=int, default=4,
-    help="Number of parallel environments (default: 4)",
+    "--num_envs", type=int, default=1,
+    help="Number of parallel environments (default: 1)",
 )
 parser.add_argument(
     "--gait", type=str, default="trot",
@@ -55,25 +52,23 @@ parser.add_argument(
 
 # Episode settings
 parser.add_argument(
-    "--num_episodes", type=int, default=5,
-    help="Number of episodes to run (default: 5)",
+    "--num_episodes", type=int, default=3,
+    help="Number of episodes to run (default: 3)",
 )
-
-# Video settings
-parser.add_argument("--video", action="store_true", help="Record video")
-parser.add_argument("--video_length", type=int, default=200, help="Video length in steps")
 parser.add_argument(
-    "--video_dir", type=str, default="videos",
-    help="Directory to save videos",
+    "--max_steps", type=int, default=300,
+    help="Maximum steps per episode (default: 300)",
 )
 
-# AppLauncher arguments (adds --headless, --device, etc.)
+# Output settings
+parser.add_argument(
+    "--plot_dir", type=str, default="plots",
+    help="Directory to save trajectory plots",
+)
+
+# AppLauncher arguments (adds --headless, --device, --livestream, etc.)
 AppLauncher.add_app_launcher_args(parser)
 args_cli = parser.parse_args()
-
-# Enable cameras for video
-if args_cli.video:
-    args_cli.enable_cameras = True
 
 # Launch app
 app_launcher = AppLauncher(args_cli)
@@ -83,7 +78,10 @@ simulation_app = app_launcher.app
 import os
 from pathlib import Path
 
-import gymnasium as gym
+import matplotlib
+matplotlib.use("Agg")  # Non-interactive backend for headless servers
+import matplotlib.pyplot as plt
+from matplotlib.patches import FancyArrowPatch
 import numpy as np
 import torch
 
@@ -92,6 +90,118 @@ SOURCE_DIR = Path(__file__).parent.parent / "source" / "RL_Bezier_MPC"
 sys.path.insert(0, str(SOURCE_DIR))
 
 from RL_Bezier_MPC.envs import QuadrupedMPCEnv, QuadrupedMPCEnvCfg
+
+
+def plot_episode_trajectory(positions, orientations, target_pos, rewards,
+                            episode_idx, save_dir):
+    """Plot the robot's CoM trajectory for one episode.
+
+    Generates a 2x2 figure:
+      - Top-left: XY trajectory (bird's eye view) with start/target markers
+      - Top-right: Height (Z) over time
+      - Bottom-left: Cumulative reward over time
+      - Bottom-right: Orientation (roll/pitch/yaw) over time
+
+    Args:
+        positions: (T, 3) numpy array of CoM positions.
+        orientations: (T, 4) numpy array of quaternions (w, x, y, z).
+        target_pos: (3,) target position.
+        rewards: (T,) reward per step.
+        episode_idx: Episode number for title.
+        save_dir: Directory to save the plot.
+    """
+    os.makedirs(save_dir, exist_ok=True)
+    T = len(positions)
+    time_steps = np.arange(T) * 0.02  # MPC dt = 0.02s
+
+    fig, axes = plt.subplots(2, 2, figsize=(14, 10))
+    fig.suptitle(f"Episode {episode_idx + 1}  |  {T} steps  |  "
+                 f"Total reward: {np.sum(rewards):.2f}", fontsize=14)
+
+    # --- Top-left: XY trajectory ---
+    ax = axes[0, 0]
+    ax.plot(positions[:, 0], positions[:, 1], "b-", linewidth=1.5, label="CoM path")
+    ax.plot(positions[0, 0], positions[0, 1], "go", markersize=10, label="Start")
+    ax.plot(positions[-1, 0], positions[-1, 1], "rs", markersize=10, label="End")
+    ax.plot(target_pos[0], target_pos[1], "r*", markersize=15, label="Target")
+
+    # Draw arrow for direction at several points
+    step = max(1, T // 10)
+    for i in range(0, T - 1, step):
+        dx = positions[i + 1, 0] - positions[i, 0]
+        dy = positions[i + 1, 1] - positions[i, 1]
+        if abs(dx) + abs(dy) > 1e-5:
+            ax.annotate("", xy=(positions[i, 0] + dx * 3, positions[i, 1] + dy * 3),
+                        xytext=(positions[i, 0], positions[i, 1]),
+                        arrowprops=dict(arrowstyle="->", color="blue", alpha=0.4))
+
+    ax.set_xlabel("X (m)")
+    ax.set_ylabel("Y (m)")
+    ax.set_title("XY Trajectory (Bird's Eye View)")
+    ax.legend(loc="best", fontsize=8)
+    ax.set_aspect("equal")
+    ax.grid(True, alpha=0.3)
+
+    # --- Top-right: Height over time ---
+    ax = axes[0, 1]
+    ax.plot(time_steps, positions[:, 2], "b-", linewidth=1.5)
+    ax.axhline(y=0.4, color="g", linestyle="--", alpha=0.5, label="Standing height (0.4m)")
+    ax.axhline(y=0.12, color="r", linestyle="--", alpha=0.5, label="Fall threshold")
+    ax.set_xlabel("Time (s)")
+    ax.set_ylabel("Height (m)")
+    ax.set_title("CoM Height")
+    ax.legend(fontsize=8)
+    ax.grid(True, alpha=0.3)
+
+    # --- Bottom-left: Cumulative reward ---
+    ax = axes[1, 0]
+    cum_reward = np.cumsum(rewards)
+    ax.plot(time_steps, cum_reward, "g-", linewidth=1.5)
+    ax.plot(time_steps, rewards, "b-", alpha=0.3, linewidth=0.8, label="Per-step reward")
+    ax.set_xlabel("Time (s)")
+    ax.set_ylabel("Reward")
+    ax.set_title("Reward (green=cumulative, blue=per-step)")
+    ax.grid(True, alpha=0.3)
+
+    # --- Bottom-right: Orientation ---
+    ax = axes[1, 1]
+    # Convert quaternion (w,x,y,z) to roll/pitch/yaw
+    rolls, pitches, yaws = [], [], []
+    for q in orientations:
+        w, x, y, z = q
+        # Roll
+        sinr = 2.0 * (w * x + y * z)
+        cosr = 1.0 - 2.0 * (x * x + y * y)
+        roll = np.arctan2(sinr, cosr)
+        # Pitch
+        sinp = 2.0 * (w * y - z * x)
+        sinp = np.clip(sinp, -1.0, 1.0)
+        pitch = np.arcsin(sinp)
+        # Yaw
+        siny = 2.0 * (w * z + x * y)
+        cosy = 1.0 - 2.0 * (y * y + z * z)
+        yaw = np.arctan2(siny, cosy)
+
+        rolls.append(np.degrees(roll))
+        pitches.append(np.degrees(pitch))
+        yaws.append(np.degrees(yaw))
+
+    ax.plot(time_steps, rolls, "r-", linewidth=1, label="Roll")
+    ax.plot(time_steps, pitches, "g-", linewidth=1, label="Pitch")
+    ax.plot(time_steps, yaws, "b-", linewidth=1, label="Yaw")
+    ax.axhline(y=45, color="k", linestyle="--", alpha=0.3)
+    ax.axhline(y=-45, color="k", linestyle="--", alpha=0.3)
+    ax.set_xlabel("Time (s)")
+    ax.set_ylabel("Angle (deg)")
+    ax.set_title("Body Orientation")
+    ax.legend(fontsize=8)
+    ax.grid(True, alpha=0.3)
+
+    plt.tight_layout()
+    save_path = os.path.join(save_dir, f"episode_{episode_idx + 1}.png")
+    fig.savefig(save_path, dpi=150, bbox_inches="tight")
+    plt.close(fig)
+    print(f"  Plot saved to: {save_path}")
 
 
 def main():
@@ -109,26 +219,10 @@ def main():
     print(f"  Gait type: {env_cfg.gait_type}")
     print(f"  Episode length: {env_cfg.episode_length_s}s")
 
-    # Create environment
+    # Create environment (no render_mode needed for trajectory logging)
     print("\nCreating environment...")
-    env = QuadrupedMPCEnv(
-        cfg=env_cfg,
-        render_mode="rgb_array" if args_cli.video else None,
-    )
-
-    # Save device reference before wrapping
+    env = QuadrupedMPCEnv(cfg=env_cfg)
     device = env.device
-
-    # Wrap with video recorder if requested
-    if args_cli.video:
-        video_kwargs = {
-            "video_folder": os.path.join(args_cli.video_dir, "play"),
-            "step_trigger": lambda step: step == 0,
-            "video_length": args_cli.video_length,
-            "disable_logger": True,
-        }
-        print(f"Recording video to: {video_kwargs['video_folder']}")
-        env = gym.wrappers.RecordVideo(env, **video_kwargs)
 
     # Load policy if checkpoint provided
     policy = None
@@ -163,8 +257,8 @@ def main():
     print(f"\nRunning {args_cli.num_episodes} episodes...")
     print("=" * 60)
 
-    episode_rewards = []
-    episode_lengths = []
+    episode_rewards_all = []
+    episode_lengths_all = []
 
     for episode in range(args_cli.num_episodes):
         print(f"\nEpisode {episode + 1}/{args_cli.num_episodes}")
@@ -173,14 +267,16 @@ def main():
         obs, _ = env.reset()
         obs_tensor = obs["policy"]
 
+        # Trajectory logging buffers
+        positions_log = []
+        orientations_log = []
+        rewards_log = []
+
         episode_reward = torch.zeros(args_cli.num_envs, device=device)
         episode_length = 0
         done = False
 
-        # Run episode
-        max_steps = args_cli.video_length if args_cli.video else int(
-            env_cfg.episode_length_s / (env_cfg.sim.dt * env_cfg.decimation)
-        )
+        max_steps = args_cli.max_steps
 
         while not done and episode_length < max_steps:
             # Get actions
@@ -200,6 +296,14 @@ def main():
             episode_reward += rewards
             episode_length += 1
 
+            # Log trajectory data (env 0)
+            robot_data = env.robot.data
+            pos = robot_data.root_pos_w[0].cpu().numpy().copy()
+            quat = robot_data.root_quat_w[0].cpu().numpy().copy()
+            positions_log.append(pos)
+            orientations_log.append(quat)
+            rewards_log.append(rewards[0].cpu().item())
+
             # Check if any environment is done
             dones = terminated | truncated
             if dones.any():
@@ -207,24 +311,33 @@ def main():
 
         # Episode summary
         avg_reward = episode_reward.mean().item()
-        episode_rewards.append(avg_reward)
-        episode_lengths.append(episode_length)
+        episode_rewards_all.append(avg_reward)
+        episode_lengths_all.append(episode_length)
 
         print(f"  Reward: {avg_reward:.2f}")
-        print(f"  Length: {episode_length} steps")
+        print(f"  Length: {episode_length} steps ({episode_length * 0.02:.1f}s)")
 
-        # For video mode, only record first episode then exit
-        if args_cli.video:
-            print(f"\nVideo recorded for episode 1.")
-            break
+        # Get target position for plot
+        target_pos = env.target_positions[0].cpu().numpy()
+
+        # Generate trajectory plot
+        positions_arr = np.array(positions_log)
+        orientations_arr = np.array(orientations_log)
+        rewards_arr = np.array(rewards_log)
+
+        plot_episode_trajectory(
+            positions_arr, orientations_arr, target_pos, rewards_arr,
+            episode, args_cli.plot_dir,
+        )
 
     # Print summary
     print("\n" + "=" * 60)
     print("Summary")
     print("=" * 60)
-    print(f"Episodes: {len(episode_rewards)}")
-    print(f"Average reward: {np.mean(episode_rewards):.2f} +/- {np.std(episode_rewards):.2f}")
-    print(f"Average length: {np.mean(episode_lengths):.1f} steps")
+    print(f"Episodes: {len(episode_rewards_all)}")
+    print(f"Average reward: {np.mean(episode_rewards_all):.2f} +/- {np.std(episode_rewards_all):.2f}")
+    print(f"Average length: {np.mean(episode_lengths_all):.1f} steps")
+    print(f"\nTrajectory plots saved to: {args_cli.plot_dir}/")
 
     # Cleanup
     env.close()
