@@ -67,13 +67,7 @@ parser.add_argument(
     help="Directory to save videos",
 )
 
-# Hardware settings
-parser.add_argument(
-    "--device", type=str, default="cuda:0",
-    help="Device for inference (default: cuda:0)",
-)
-
-# AppLauncher arguments (adds --headless, etc.)
+# AppLauncher arguments (adds --headless, --device, etc.)
 AppLauncher.add_app_launcher_args(parser)
 args_cli = parser.parse_args()
 
@@ -122,6 +116,9 @@ def main():
         render_mode="rgb_array" if args_cli.video else None,
     )
 
+    # Save device reference before wrapping
+    device = env.device
+
     # Wrap with video recorder if requested
     if args_cli.video:
         video_kwargs = {
@@ -147,11 +144,11 @@ def main():
                 actor_hidden_dims=[256, 256, 128],
                 critic_hidden_dims=[256, 256, 128],
                 activation="elu",
-            ).to(args_cli.device)
+            ).to(device)
 
             # Load weights
             checkpoint = torch.load(
-                args_cli.checkpoint, map_location=args_cli.device, weights_only=False,
+                args_cli.checkpoint, map_location=device, weights_only=False,
             )
             policy.load_state_dict(checkpoint["model_state_dict"])
             policy.eval()
@@ -176,7 +173,7 @@ def main():
         obs, _ = env.reset()
         obs_tensor = obs["policy"]
 
-        episode_reward = torch.zeros(args_cli.num_envs, device=args_cli.device)
+        episode_reward = torch.zeros(args_cli.num_envs, device=device)
         episode_length = 0
         done = False
 
@@ -193,7 +190,7 @@ def main():
             else:
                 # Random actions
                 actions = torch.rand(
-                    args_cli.num_envs, env_cfg.action_space, device=args_cli.device,
+                    args_cli.num_envs, env_cfg.action_space, device=device,
                 ) * 2 - 1
 
             # Step environment
