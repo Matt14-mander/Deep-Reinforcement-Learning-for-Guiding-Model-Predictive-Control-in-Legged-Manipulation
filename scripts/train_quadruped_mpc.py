@@ -64,6 +64,7 @@ import time
 from datetime import datetime
 from pathlib import Path
 
+import gymnasium as gym
 import torch
 
 # Add source to path
@@ -141,6 +142,17 @@ def train_with_rsl_rl(env_cfg: QuadrupedMPCEnvCfg, log_dir: str):
     """
     # Create environment
     env = QuadrupedMPCEnv(cfg=env_cfg, render_mode="rgb_array" if args_cli.video else None)
+
+    # Wrap with video recorder if requested
+    if args_cli.video:
+        video_kwargs = {
+            "video_folder": os.path.join(log_dir, "videos", "train"),
+            "step_trigger": lambda step: step % args_cli.video_interval == 0,
+            "video_length": args_cli.video_length,
+            "disable_logger": True,
+        }
+        print(f"Recording videos to: {video_kwargs['video_folder']}")
+        env = gym.wrappers.RecordVideo(env, **video_kwargs)
 
     # Wrap environment for RSL-RL
     env = RslRlVecEnvWrapper(env, clip_actions=1.0)
