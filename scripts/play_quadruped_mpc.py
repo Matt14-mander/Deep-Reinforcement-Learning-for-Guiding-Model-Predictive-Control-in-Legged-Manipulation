@@ -226,32 +226,73 @@ def main():
 
     # Load policy if checkpoint provided
     policy = None
+    policy_fn = None
     if args_cli.checkpoint and not args_cli.random:
         try:
-            from rsl_rl.modules import ActorCritic
+            from rsl_rl.runners import OnPolicyRunner
+            from isaaclab_rl.rsl_rl import RslRlVecEnvWrapper
+            from datetime import datetime
 
-            # Create actor-critic network
-            policy = ActorCritic(
-                num_actor_obs=env_cfg.observation_space,
-                num_critic_obs=env_cfg.observation_space,
-                num_actions=env_cfg.action_space,
-                actor_hidden_dims=[256, 256, 128],
-                critic_hidden_dims=[256, 256, 128],
-                activation="elu",
-            ).to(device)
+            # Wrap env for RSL-RL (same as training)
+            wrapped_env = RslRlVecEnvWrapper(env, clip_actions=1.0)
 
-            # Load weights
-            checkpoint = torch.load(
-                args_cli.checkpoint, map_location=device, weights_only=False,
+            # Create same PPO config as training
+            ppo_cfg = {
+                "seed": 42,
+                "device": str(device),
+                "num_steps_per_env": 24,
+                "max_iterations": 1,
+                "empirical_normalization": True,
+                "obs_groups": {},
+                "policy": {
+                    "class_name": "ActorCritic",
+                    "init_noise_std": 1.0,
+                    "actor_hidden_dims": [256, 256, 128],
+                    "critic_hidden_dims": [256, 256, 128],
+                    "activation": "elu",
+                },
+                "algorithm": {
+                    "class_name": "PPO",
+                    "value_loss_coef": 1.0,
+                    "use_clipped_value_loss": True,
+                    "clip_param": 0.2,
+                    "entropy_coef": 0.01,
+                    "num_learning_epochs": 5,
+                    "num_mini_batches": 4,
+                    "learning_rate": 3e-4,
+                    "schedule": "fixed",
+                    "gamma": 0.99,
+                    "lam": 0.95,
+                    "desired_kl": 0.01,
+                    "max_grad_norm": 1.0,
+                },
+                "save_interval": 100,
+                "log_interval": 10,
+                "experiment_name": "quadruped_mpc_play",
+                "run_name": datetime.now().strftime("%Y-%m-%d_%H-%M-%S"),
+            }
+
+            # Create runner and load checkpoint
+            runner = OnPolicyRunner(
+                wrapped_env,
+                ppo_cfg,
+                log_dir=None,
+                device=ppo_cfg["device"],
             )
-            policy.load_state_dict(checkpoint["model_state_dict"])
-            policy.eval()
+            runner.load(args_cli.checkpoint)
             print(f"Loaded policy from: {args_cli.checkpoint}")
 
+            # Get inference policy function
+            policy_fn = runner.get_inference_policy(device=device)
+            policy = "runner"  # Flag that we loaded successfully
+
         except Exception as e:
+            import traceback
             print(f"Warning: Could not load policy: {e}")
+            traceback.print_exc()
             print("Using random actions instead.")
             policy = None
+            policy_fn = None
 
     # Run episodes
     print(f"\nRunning {args_cli.num_episodes} episodes...")
@@ -280,9 +321,9 @@ def main():
 
         while not done and episode_length < max_steps:
             # Get actions
-            if policy is not None:
+            if policy is not None and policy_fn is not None:
                 with torch.no_grad():
-                    actions = policy.act_inference(obs_tensor)
+                    actions = policy_fn(obs_tensor)
             else:
                 # Random actions
                 actions = torch.rand(
