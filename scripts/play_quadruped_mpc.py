@@ -229,62 +229,80 @@ def main():
     policy_fn = None
     if args_cli.checkpoint and not args_cli.random:
         try:
-            from rsl_rl.runners import OnPolicyRunner
-            from isaaclab_rl.rsl_rl import RslRlVecEnvWrapper
-            from datetime import datetime
+            import torch.nn as nn
 
-            # Wrap env for RSL-RL (same as training)
-            wrapped_env = RslRlVecEnvWrapper(env, clip_actions=1.0)
-
-            # Create same PPO config as training
-            ppo_cfg = {
-                "seed": 42,
-                "device": str(device),
-                "num_steps_per_env": 24,
-                "max_iterations": 1,
-                "empirical_normalization": True,
-                "obs_groups": {},
-                "policy": {
-                    "class_name": "ActorCritic",
-                    "init_noise_std": 1.0,
-                    "actor_hidden_dims": [256, 256, 128],
-                    "critic_hidden_dims": [256, 256, 128],
-                    "activation": "elu",
-                },
-                "algorithm": {
-                    "class_name": "PPO",
-                    "value_loss_coef": 1.0,
-                    "use_clipped_value_loss": True,
-                    "clip_param": 0.2,
-                    "entropy_coef": 0.01,
-                    "num_learning_epochs": 5,
-                    "num_mini_batches": 4,
-                    "learning_rate": 3e-4,
-                    "schedule": "fixed",
-                    "gamma": 0.99,
-                    "lam": 0.95,
-                    "desired_kl": 0.01,
-                    "max_grad_norm": 1.0,
-                },
-                "save_interval": 100,
-                "log_interval": 10,
-                "experiment_name": "quadruped_mpc_play",
-                "run_name": datetime.now().strftime("%Y-%m-%d_%H-%M-%S"),
-            }
-
-            # Create runner and load checkpoint
-            runner = OnPolicyRunner(
-                wrapped_env,
-                ppo_cfg,
-                log_dir=None,
-                device=ppo_cfg["device"],
+            # Load checkpoint and inspect contents
+            checkpoint = torch.load(
+                args_cli.checkpoint, map_location=device, weights_only=False,
             )
-            runner.load(args_cli.checkpoint)
-            print(f"Loaded policy from: {args_cli.checkpoint}")
+            state_dict = checkpoint["model_state_dict"]
 
-            # Get inference policy function
-            policy_fn = runner.get_inference_policy(device=device)
-            policy = "runner"  # Flag that we loaded successfully
+            # Print checkpoint keys for debugging
+            print(f"\nCheckpoint keys: {list(state_dict.keys())[:20]}")
+
+            # ---- Build actor network manually (version-independent) ----
+            # Architecture: obs_dim → 256 → 256 → 128 → action_dim (ELU activation)
+            obs_dim = env_cfg.observation_space    # 45
+            action_dim = env_cfg.action_space      # 15
+            hidden_dims = [256, 256, 128]
+
+            # Build sequential actor layers
+            actor_layers = []
+            in_dim = obs_dim
+            for h_dim in hidden_dims:
+                actor_layers.append(nn.Linear(in_dim, h_dim))
+                actor_layers.append(nn.ELU())
+                in_dim = h_dim
+            actor_layers.append(nn.Linear(in_dim, action_dim))
+            actor_net = nn.Sequential(*actor_layers).to(device)
+
+            # Load actor weights from checkpoint
+            # RSL-RL stores as "actor.0.weight", "actor.0.bias", "actor.2.weight", ...
+            # In nn.Sequential: layer 0=Linear, 1=ELU, 2=Linear, 3=ELU, 4=Linear, 5=ELU, 6=Linear
+            actor_state = {}
+            for key, val in state_dict.items():
+                if key.startswith("actor."):
+                    # Remove "actor." prefix to match nn.Sequential keys
+                    actor_state[key[len("actor."):]] = val
+
+            if actor_state:
+                actor_net.load_state_dict(actor_state)
+                print(f"Loaded actor network weights ({len(actor_state)} tensors)")
+            else:
+                raise RuntimeError("No 'actor.*' keys found in checkpoint!")
+
+            actor_net.eval()
+
+            # ---- Load observation normalizer if present ----
+            obs_mean = None
+            obs_var = None
+            # Check various possible normalizer key patterns
+            for mean_key in ["actor_obs_normalizer._mean", "obs_normalizer._mean",
+                             "actor_obs_normalizer.running_mean"]:
+                if mean_key in state_dict:
+                    obs_mean = state_dict[mean_key].to(device)
+                    break
+
+            for var_key in ["actor_obs_normalizer._var", "obs_normalizer._var",
+                            "actor_obs_normalizer.running_var"]:
+                if var_key in state_dict:
+                    obs_var = state_dict[var_key].to(device)
+                    break
+
+            if obs_mean is not None and obs_var is not None:
+                obs_std = torch.sqrt(obs_var + 1e-8)
+                print(f"Loaded observation normalizer (mean shape: {obs_mean.shape})")
+
+                def policy_fn(obs):
+                    normalized = (obs - obs_mean) / obs_std
+                    return actor_net(normalized)
+            else:
+                print("No observation normalizer found, using raw observations")
+                def policy_fn(obs):
+                    return actor_net(obs)
+
+            policy = "loaded"
+            print(f"Successfully loaded policy from: {args_cli.checkpoint}")
 
         except Exception as e:
             import traceback
