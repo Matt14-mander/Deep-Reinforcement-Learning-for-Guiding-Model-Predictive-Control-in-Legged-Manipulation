@@ -157,7 +157,12 @@ class BezierTrajectoryGenerator(BaseTrajectoryGenerator):
         """Return bounds for Bezier control point offsets.
 
         P0 offset is constrained to [0, 0, 0] (start from current position).
-        Other control points can offset by ±max_displacement in each dimension.
+        Other control points can offset by ±max_displacement in XY,
+        but Z is tightly constrained to keep the CoM near standing height.
+
+        For a quadruped, the CoM should stay at ~0.4m height. Allowing
+        large Z offsets (e.g., ±1.5m) would create reference trajectories
+        that go underground, causing the MPC to slam the robot down.
 
         Returns:
             Tuple of (lower_bounds, upper_bounds), each with shape (param_dim,).
@@ -169,6 +174,15 @@ class BezierTrajectoryGenerator(BaseTrajectoryGenerator):
         # P0 offset should be zero (start from current position)
         low[: self.state_dim] = 0.0
         high[: self.state_dim] = 0.0
+
+        # Constrain Z offsets for all control points (P1, P2, P3)
+        # CoM height should stay near standing height (~0.4m),
+        # only allow small vertical variations
+        if self.state_dim >= 3:
+            for cp in range(1, self.num_control_points):
+                z_idx = cp * self.state_dim + 2  # Z component index
+                low[z_idx] = -0.05   # max 5cm below current height
+                high[z_idx] = 0.10   # max 10cm above current height
 
         return low, high
 
