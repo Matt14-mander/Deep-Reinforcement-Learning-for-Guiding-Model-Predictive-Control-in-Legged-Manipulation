@@ -130,6 +130,14 @@ class QuadrupedMPCEnv(DirectRLEnv):
                 mpc = None  # Dummy mode
             self.mpc_controllers.append(mpc)
 
+        # Build joint reordering maps between Isaac Lab and Pinocchio
+        # Isaac Lab (USD) and Pinocchio (URDF) may have different joint orderings
+        self._isaac_to_pin_joint_idx = None  # Isaac Lab index → Pinocchio index
+        self._pin_to_isaac_joint_idx = None  # Pinocchio index → Isaac Lab index
+
+        if self._pinocchio_model is not None:
+            self._build_joint_mapping()
+
         # Initialize CoM trajectory buffers
         # Shape: (num_envs, num_waypoints, 3)
         self.current_com_trajectories = np.zeros(
@@ -196,6 +204,63 @@ class QuadrupedMPCEnv(DirectRLEnv):
         self._pending_joint_efforts = torch.zeros(
             (self.num_envs, cfg.num_joints), device=self.device, dtype=torch.float32
         )
+
+    def _build_joint_mapping(self):
+        """Build joint index mapping between Isaac Lab and Pinocchio.
+
+        Isaac Lab (USD) and Pinocchio (URDF) may order joints differently.
+        For Go2: Isaac Lab uses FR, FL, RR, RL; URDF uses FL, FR, RL, RR.
+        This method dynamically builds the reordering arrays.
+        """
+        # Get Pinocchio joint names (skip universe joint at index 0)
+        pin_joint_names = []
+        for i in range(1, self._pinocchio_model.njoints):
+            pin_joint_names.append(self._pinocchio_model.names[i])
+
+        # Get Isaac Lab joint names (available after _setup_scene via super().__init__)
+        isaac_joint_names = list(self.robot.joint_names)
+
+        print(f"[JointMapping] Isaac Lab joints ({len(isaac_joint_names)}): {isaac_joint_names[:12]}")
+        print(f"[JointMapping] Pinocchio joints ({len(pin_joint_names)}): {pin_joint_names[:12]}")
+
+        # Build mapping: isaac_to_pin[isaac_idx] = pin_idx
+        # "For Isaac Lab joint at index i, what is its index in Pinocchio?"
+        n_joints = min(len(isaac_joint_names), 12)
+        self._isaac_to_pin_joint_idx = np.zeros(n_joints, dtype=np.int32)
+        self._pin_to_isaac_joint_idx = np.zeros(n_joints, dtype=np.int32)
+
+        for isaac_idx in range(n_joints):
+            isaac_name = isaac_joint_names[isaac_idx]
+            found = False
+            for pin_idx, pin_name in enumerate(pin_joint_names):
+                if pin_name == isaac_name:
+                    self._isaac_to_pin_joint_idx[isaac_idx] = pin_idx
+                    self._pin_to_isaac_joint_idx[pin_idx] = isaac_idx
+                    found = True
+                    break
+            if not found:
+                print(f"  WARNING: Isaac Lab joint '{isaac_name}' not found in Pinocchio!")
+                self._isaac_to_pin_joint_idx[isaac_idx] = isaac_idx  # fallback: identity
+
+        # Check if mapping is actually different from identity
+        identity = np.arange(n_joints)
+        if np.array_equal(self._isaac_to_pin_joint_idx, identity):
+            print("[JointMapping] Joint ordering is IDENTICAL - no reordering needed.")
+            self._isaac_to_pin_joint_idx = None
+            self._pin_to_isaac_joint_idx = None
+        else:
+            print(f"[JointMapping] Isaac→Pin mapping: {self._isaac_to_pin_joint_idx.tolist()}")
+            print(f"[JointMapping] Pin→Isaac mapping: {self._pin_to_isaac_joint_idx.tolist()}")
+
+        # Validate foot frame names
+        if self._pinocchio_model is not None:
+            cfg = self._env_cfg
+            for foot_key, frame_name in cfg.foot_frame_names.items():
+                fid = self._pinocchio_model.getFrameId(frame_name)
+                if fid >= self._pinocchio_model.nframes:
+                    print(f"  WARNING: Foot frame '{frame_name}' ({foot_key}) NOT found in Pinocchio!")
+                else:
+                    print(f"  [OK] Foot frame '{frame_name}' ({foot_key}) → frame_id={fid}")
 
     def _setup_scene(self):
         """Set up the simulation scene with Go2 quadruped and ground plane."""
@@ -367,6 +432,14 @@ class QuadrupedMPCEnv(DirectRLEnv):
             padded = np.zeros(num_joints)
             padded[:len(joint_torques)] = joint_torques
             joint_torques = padded
+
+        # Reorder torques: Pinocchio joint order → Isaac Lab joint order
+        if self._pin_to_isaac_joint_idx is not None:
+            reordered = np.zeros(num_joints)
+            for pin_idx in range(min(len(joint_torques), 12)):
+                isaac_idx = self._pin_to_isaac_joint_idx[pin_idx]
+                reordered[isaac_idx] = joint_torques[pin_idx]
+            joint_torques = reordered
 
         # Clamp torques to max
         joint_torques = np.clip(
@@ -742,11 +815,17 @@ class QuadrupedMPCEnv(DirectRLEnv):
         states[:, 5] = root_quat_wxyz[:, 3]  # qz
         states[:, 6] = root_quat_wxyz[:, 0]  # qw
 
-        # Joint positions from articulation
+        # Joint positions from articulation (reorder Isaac Lab → Pinocchio)
         if nq > 7:
             joint_pos = robot_data.joint_pos.cpu().numpy()
             num_robot_joints = min(joint_pos.shape[1], nq - 7)
-            states[:, 7:7 + num_robot_joints] = joint_pos[:, :num_robot_joints]
+            if self._isaac_to_pin_joint_idx is not None:
+                # Reorder: Isaac Lab joint order → Pinocchio joint order
+                for isaac_idx in range(min(num_robot_joints, 12)):
+                    pin_idx = self._isaac_to_pin_joint_idx[isaac_idx]
+                    states[:, 7 + pin_idx] = joint_pos[:, isaac_idx]
+            else:
+                states[:, 7:7 + num_robot_joints] = joint_pos[:, :num_robot_joints]
 
         # Root linear velocity
         root_lin_vel = robot_data.root_lin_vel_w.cpu().numpy()
@@ -756,11 +835,16 @@ class QuadrupedMPCEnv(DirectRLEnv):
         root_ang_vel = robot_data.root_ang_vel_w.cpu().numpy()
         states[:, nq + 3:nq + 6] = root_ang_vel
 
-        # Joint velocities from articulation
+        # Joint velocities from articulation (reorder Isaac Lab → Pinocchio)
         if nv > 6:
             joint_vel = robot_data.joint_vel.cpu().numpy()
             num_robot_joints = min(joint_vel.shape[1], nv - 6)
-            states[:, nq + 6:nq + 6 + num_robot_joints] = joint_vel[:, :num_robot_joints]
+            if self._isaac_to_pin_joint_idx is not None:
+                for isaac_idx in range(min(num_robot_joints, 12)):
+                    pin_idx = self._isaac_to_pin_joint_idx[isaac_idx]
+                    states[:, nq + 6 + pin_idx] = joint_vel[:, isaac_idx]
+            else:
+                states[:, nq + 6:nq + 6 + num_robot_joints] = joint_vel[:, :num_robot_joints]
 
         return states
 

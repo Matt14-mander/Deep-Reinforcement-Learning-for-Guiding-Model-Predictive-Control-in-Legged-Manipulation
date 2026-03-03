@@ -198,12 +198,17 @@ class QuadrupedMPCEnvCfg(DirectRLEnvCfg):
     )
 
     # Initial orientation randomization (yaw only)
-    initial_yaw_range: tuple = (-0.3, 0.3)  # radians
+    initial_yaw_range: tuple = (-0.1, 0.1)  # radians (~±6°, narrow for initial training)
 
     # Target generation (goal positions)
+    # Stage 1 (current): narrow forward cone, close targets
+    #   - Max angle from forward: arctan(0.5/1.5) ≈ 18°
+    #   - Ensures Crocoddyl only needs forward walking, no turning/backing
+    # Stage 2 (after stable walking): widen to y=±1.5, x=2~5
+    # Stage 3 (advanced): full range with turning behavior
     target_pos_range: tuple = (
-        2.0, 5.0,   # x_min, x_max (forward)
-        -2.0, 2.0,  # y_min, y_max
+        1.5, 3.0,   # x_min, x_max (close forward targets)
+        -0.5, 0.5,  # y_min, y_max (narrow lateral range)
         0.0, 0.0,   # z_min, z_max (ground level)
     )
 
