@@ -937,12 +937,18 @@ class QuadrupedMPCEnv(DirectRLEnv):
     def _denormalize_actions(self, actions: torch.Tensor) -> torch.Tensor:
         """Convert normalized actions [-1, 1] to parameter space.
 
+        The RL policy (actor network) may output values outside [-1, 1],
+        so we clamp first to prevent invalid gait parameters (e.g., negative
+        step frequency → negative duration → MPC crash).
+
         Args:
             actions: Normalized actions from RL policy.
 
         Returns:
-            Denormalized action parameters.
+            Denormalized action parameters clamped to valid range.
         """
+        # Clamp raw actions to [-1, 1] before denormalization
+        actions = torch.clamp(actions, -1.0, 1.0)
         return 0.5 * (actions + 1.0) * (
             self.action_high - self.action_low
         ) + self.action_low
