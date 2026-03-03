@@ -208,31 +208,56 @@ class QuadrupedMPCEnv(DirectRLEnv):
     def _build_joint_mapping(self):
         """Build joint index mapping between Isaac Lab and Pinocchio.
 
-        Isaac Lab (USD) and Pinocchio (URDF) may order joints differently.
-        For Go2: Isaac Lab uses FR, FL, RR, RL; URDF uses FL, FR, RL, RR.
-        This method dynamically builds the reordering arrays.
+        Isaac Lab (USD) and Pinocchio (URDF) order joints differently:
+          - Isaac Lab groups by joint TYPE: all hips, all thighs, all calves
+            e.g. [FL_hip, FR_hip, RL_hip, RR_hip, FL_thigh, FR_thigh, ...]
+          - Pinocchio groups by LEG: all joints of one leg together
+            e.g. [FL_hip, FL_thigh, FL_calf, FR_hip, FR_thigh, FR_calf, ...]
+
+        This method dynamically builds reordering arrays so that:
+          - isaac_to_pin[i] maps Isaac Lab actuated joint index → Pinocchio actuated joint index
+          - pin_to_isaac[j] maps Pinocchio actuated joint index → Isaac Lab actuated joint index
+
+        IMPORTANT: Pinocchio's joint list includes non-actuated joints (universe,
+        root_joint/floating base). These must be filtered out so that the mapping
+        indices correspond directly to positions in q[7:] and the control vector.
         """
-        # Get Pinocchio joint names (skip universe joint at index 0)
-        pin_joint_names = []
+        import pinocchio
+
+        # Get Pinocchio ACTUATED joint names only (skip universe + floating base)
+        # Filter: only 1-DOF joints (nq==1) are actuated revolute/prismatic
+        pin_actuated_names = []
         for i in range(1, self._pinocchio_model.njoints):
-            pin_joint_names.append(self._pinocchio_model.names[i])
+            joint = self._pinocchio_model.joints[i]
+            name = self._pinocchio_model.names[i]
+            if joint.nq == 1:  # 1-DOF = actuated revolute/prismatic
+                pin_actuated_names.append(name)
+            else:
+                print(f"[JointMapping] Skipping non-actuated Pinocchio joint: "
+                      f"'{name}' (nq={joint.nq}, nv={joint.nv})")
 
         # Get Isaac Lab joint names (available after _setup_scene via super().__init__)
         isaac_joint_names = list(self.robot.joint_names)
 
-        print(f"[JointMapping] Isaac Lab joints ({len(isaac_joint_names)}): {isaac_joint_names[:12]}")
-        print(f"[JointMapping] Pinocchio joints ({len(pin_joint_names)}): {pin_joint_names[:12]}")
+        print(f"[JointMapping] Isaac Lab actuated joints ({len(isaac_joint_names)}): "
+              f"{isaac_joint_names}")
+        print(f"[JointMapping] Pinocchio actuated joints ({len(pin_actuated_names)}): "
+              f"{pin_actuated_names}")
 
-        # Build mapping: isaac_to_pin[isaac_idx] = pin_idx
-        # "For Isaac Lab joint at index i, what is its index in Pinocchio?"
-        n_joints = min(len(isaac_joint_names), 12)
+        if len(pin_actuated_names) != len(isaac_joint_names):
+            print(f"  WARNING: Joint count mismatch! Isaac={len(isaac_joint_names)}, "
+                  f"Pinocchio={len(pin_actuated_names)}")
+
+        # Build mapping: isaac_to_pin[isaac_idx] = pin_actuated_idx
+        # "For Isaac Lab joint at index i, what is its index among Pinocchio actuated joints?"
+        n_joints = min(len(isaac_joint_names), len(pin_actuated_names), 12)
         self._isaac_to_pin_joint_idx = np.zeros(n_joints, dtype=np.int32)
         self._pin_to_isaac_joint_idx = np.zeros(n_joints, dtype=np.int32)
 
         for isaac_idx in range(n_joints):
             isaac_name = isaac_joint_names[isaac_idx]
             found = False
-            for pin_idx, pin_name in enumerate(pin_joint_names):
+            for pin_idx, pin_name in enumerate(pin_actuated_names):
                 if pin_name == isaac_name:
                     self._isaac_to_pin_joint_idx[isaac_idx] = pin_idx
                     self._pin_to_isaac_joint_idx[pin_idx] = isaac_idx
@@ -251,16 +276,21 @@ class QuadrupedMPCEnv(DirectRLEnv):
         else:
             print(f"[JointMapping] Isaac→Pin mapping: {self._isaac_to_pin_joint_idx.tolist()}")
             print(f"[JointMapping] Pin→Isaac mapping: {self._pin_to_isaac_joint_idx.tolist()}")
+            # Verify round-trip consistency
+            for i in range(n_joints):
+                j = self._isaac_to_pin_joint_idx[i]
+                k = self._pin_to_isaac_joint_idx[j]
+                assert k == i, f"Round-trip failed: isaac[{i}]→pin[{j}]→isaac[{k}]"
+            print("[JointMapping] Round-trip consistency check PASSED.")
 
         # Validate foot frame names
-        if self._pinocchio_model is not None:
-            cfg = self._env_cfg
-            for foot_key, frame_name in cfg.foot_frame_names.items():
-                fid = self._pinocchio_model.getFrameId(frame_name)
-                if fid >= self._pinocchio_model.nframes:
-                    print(f"  WARNING: Foot frame '{frame_name}' ({foot_key}) NOT found in Pinocchio!")
-                else:
-                    print(f"  [OK] Foot frame '{frame_name}' ({foot_key}) → frame_id={fid}")
+        cfg = self._env_cfg
+        for foot_key, frame_name in cfg.foot_frame_names.items():
+            fid = self._pinocchio_model.getFrameId(frame_name)
+            if fid >= self._pinocchio_model.nframes:
+                print(f"  WARNING: Foot frame '{frame_name}' ({foot_key}) NOT found in Pinocchio!")
+            else:
+                print(f"  [OK] Foot frame '{frame_name}' ({foot_key}) → frame_id={fid}")
 
     def _setup_scene(self):
         """Set up the simulation scene with Go2 quadruped and ground plane."""
