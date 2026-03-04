@@ -172,27 +172,37 @@ class QuadrupedMPCEnv(DirectRLEnv):
 
         # Action bounds for normalization
         bezier_low, bezier_high = self.trajectory_generator.get_param_bounds()
-        gait_mod_low = np.array([
-            cfg.step_length_mod_range[0],
-            cfg.step_height_mod_range[0],
-            cfg.step_frequency_mod_range[0],
-        ])
-        gait_mod_high = np.array([
-            cfg.step_length_mod_range[1],
-            cfg.step_height_mod_range[1],
-            cfg.step_frequency_mod_range[1],
-        ])
 
-        self.action_low = torch.tensor(
-            np.concatenate([bezier_low, gait_mod_low]),
-            device=self.device,
-            dtype=torch.float32
-        )
-        self.action_high = torch.tensor(
-            np.concatenate([bezier_high, gait_mod_high]),
-            device=self.device,
-            dtype=torch.float32
-        )
+        if cfg.fix_gait_params:
+            # Stage 1: only Bezier params (12D), gait is fixed
+            self.action_low = torch.tensor(
+                bezier_low, device=self.device, dtype=torch.float32
+            )
+            self.action_high = torch.tensor(
+                bezier_high, device=self.device, dtype=torch.float32
+            )
+            print(f"[ActionSpace] Stage 1: fixed gait, Bezier only ({len(bezier_low)}D)")
+        else:
+            # Stage 2: Bezier + gait modulation (15D)
+            gait_mod_low = np.array([
+                cfg.step_length_mod_range[0],
+                cfg.step_height_mod_range[0],
+                cfg.step_frequency_mod_range[0],
+            ])
+            gait_mod_high = np.array([
+                cfg.step_length_mod_range[1],
+                cfg.step_height_mod_range[1],
+                cfg.step_frequency_mod_range[1],
+            ])
+            self.action_low = torch.tensor(
+                np.concatenate([bezier_low, gait_mod_low]),
+                device=self.device, dtype=torch.float32
+            )
+            self.action_high = torch.tensor(
+                np.concatenate([bezier_high, gait_mod_high]),
+                device=self.device, dtype=torch.float32
+            )
+            print(f"[ActionSpace] Stage 2: Bezier + gait modulation ({len(bezier_low) + 3}D)")
 
         # Foot contact tracking
         self.foot_contacts = torch.zeros(
@@ -338,7 +348,12 @@ class QuadrupedMPCEnv(DirectRLEnv):
 
         # Parse action components
         bezier_params = actions_np[:, :self.cfg.num_bezier_actions]
-        gait_mods = actions_np[:, self.cfg.num_bezier_actions:]
+        if self.cfg.fix_gait_params:
+            # Stage 1: gait params fixed to defaults (1.0 = no modulation)
+            gait_mods = np.ones((self.num_envs, self.cfg.num_gait_mod_actions))
+        else:
+            # Stage 2: gait params from RL policy
+            gait_mods = actions_np[:, self.cfg.num_bezier_actions:]
 
         # Get current robot states
         robot_states = self._get_robot_states_numpy()

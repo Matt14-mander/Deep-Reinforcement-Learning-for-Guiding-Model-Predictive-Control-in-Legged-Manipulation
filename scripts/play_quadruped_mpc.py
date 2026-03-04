@@ -243,7 +243,7 @@ def main():
             # ---- Build actor network manually (version-independent) ----
             # Architecture: obs_dim → 256 → 256 → 128 → action_dim (ELU activation)
             obs_dim = env_cfg.observation_space    # 45
-            action_dim = env_cfg.action_space      # 15
+            action_dim = env_cfg.action_space      # 12 (fixed gait) or 15 (full)
             hidden_dims = [256, 256, 128]
 
             # Build sequential actor layers

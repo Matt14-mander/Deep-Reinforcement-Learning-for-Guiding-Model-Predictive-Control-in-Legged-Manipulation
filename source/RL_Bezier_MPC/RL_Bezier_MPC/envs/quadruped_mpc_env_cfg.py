@@ -99,10 +99,14 @@ class QuadrupedMPCEnvCfg(DirectRLEnvCfg):
     observation_space: int = 45
 
     # Action space:
-    #   - CoM Bezier control point offsets (12D): 4 points × 3D
-    #   - Gait modulation (3D): step_length, step_height, step_frequency modifiers
-    # Total: 15D
-    action_space: int = 15
+    #   When fix_gait_params=True (Stage 1 training):
+    #     - CoM Bezier control point offsets (12D): 4 points × 3D
+    #     Total: 12D  (gait params fixed to defaults from B1 testing)
+    #   When fix_gait_params=False (Stage 2 training):
+    #     - CoM Bezier control point offsets (12D): 4 points × 3D
+    #     - Gait modulation (3D): step_length, step_height, step_frequency
+    #     Total: 15D
+    action_space: int = 12  # Will be set in __post_init__ based on fix_gait_params
 
     # State space (for asymmetric actor-critic, 0 means same as observation)
     state_space: int = 0
@@ -110,6 +114,11 @@ class QuadrupedMPCEnvCfg(DirectRLEnvCfg):
     # Action sub-dimensions for parsing
     num_bezier_actions: int = 12
     num_gait_mod_actions: int = 3
+
+    # Stage 1: fix gait parameters to proven defaults from B1 testing
+    # This reduces action space from 15D to 12D, making RL learning much easier.
+    # Set to False for Stage 2 training after the robot can walk stably.
+    fix_gait_params: bool = True
 
     # ==========================================================================
     # MPC Configuration
@@ -311,13 +320,16 @@ class QuadrupedMPCEnvCfg(DirectRLEnvCfg):
         self.max_pitch_rad = math.radians(self.max_pitch_deg)
         self.max_roll_rad = math.radians(self.max_roll_deg)
 
+        # Set action space based on fix_gait_params flag
+        if self.fix_gait_params:
+            self.action_space = self.num_bezier_actions  # 12D (Bezier only)
+        else:
+            self.action_space = self.num_bezier_actions + self.num_gait_mod_actions  # 15D
+
         # Validate configuration
         assert self.decimation > 0, "Decimation must be positive"
         assert self.mpc_horizon_steps > 0, "MPC horizon must be positive"
         assert self.rl_policy_period > 0, "RL policy period must be positive"
-        assert self.action_space == self.num_bezier_actions + self.num_gait_mod_actions, (
-            "Action dimensions must sum correctly"
-        )
         assert self.num_bezier_waypoints > self.mpc_horizon_steps, (
             "Bezier horizon should be longer than MPC horizon"
         )
