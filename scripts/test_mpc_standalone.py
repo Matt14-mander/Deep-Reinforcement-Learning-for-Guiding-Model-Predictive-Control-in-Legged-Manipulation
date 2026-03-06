@@ -4,399 +4,523 @@
 #
 # SPDX-License-Identifier: BSD-3-Clause
 
-"""Standalone test for Bezier trajectory generation and Crocoddyl MPC.
+"""Standalone MPC diagnostic test: Does Crocoddyl MPC work inside Isaac Lab?
 
-This script tests the trajectory generator and MPC controller without
-requiring IsaacLab or GPU resources. It:
-1. Generates a Bezier trajectory from random parameters
-2. Simulates quadrotor dynamics with MPC tracking
-3. Plots the results for visualization
+This script bypasses the RL policy entirely and feeds a FIXED straight-line
+CoM reference trajectory to the MPC controller, running in the FULL Isaac Lab
+physics simulation. This isolates whether the problem is:
+  (A) MPC ↔ Isaac Lab integration (joint mapping, torque application, physics mismatch)
+  (B) RL training (bad trajectories, reward shaping, etc.)
 
-Run with:
-    python scripts/test_mpc_standalone.py
+If the robot FALLS in this test → problem is (A), fix MPC integration.
+If the robot WALKS stably → problem is (B), focus on RL training.
+
+Usage:
+    python scripts/test_mpc_standalone.py --num_envs 1 --headless
+    python scripts/test_mpc_standalone.py --num_envs 1 --headless --max_steps 500
+    python scripts/test_mpc_standalone.py --num_envs 1 --headless --mode stand
 """
 
 import argparse
 import sys
+
+from isaaclab.app import AppLauncher
+
+# Parse arguments before launching app
+parser = argparse.ArgumentParser(description="Standalone MPC Diagnostic Test")
+
+parser.add_argument(
+    "--num_envs", type=int, default=1,
+    help="Number of parallel environments (default: 1)",
+)
+parser.add_argument(
+    "--max_steps", type=int, default=500,
+    help="Maximum MPC steps to run (default: 500, = 10 seconds at 50Hz)",
+)
+parser.add_argument(
+    "--mode", type=str, default="walk",
+    choices=["stand", "walk", "walk_fast"],
+    help="Test mode: stand (stay in place), walk (slow forward), walk_fast (faster)",
+)
+parser.add_argument(
+    "--plot_dir", type=str, default="plots/mpc_diagnostic",
+    help="Directory to save diagnostic plots",
+)
+
+# AppLauncher arguments (adds --headless, --device, --livestream, etc.)
+AppLauncher.add_app_launcher_args(parser)
+args_cli = parser.parse_args()
+
+# Launch app
+app_launcher = AppLauncher(args_cli)
+simulation_app = app_launcher.app
+
+# Rest of imports after app launch
+import os
 from pathlib import Path
 
+import matplotlib
+matplotlib.use("Agg")
+import matplotlib.pyplot as plt
 import numpy as np
+import torch
 
-# Add the source directory to path
+# Add source to path
 SOURCE_DIR = Path(__file__).parent.parent / "source" / "RL_Bezier_MPC"
 sys.path.insert(0, str(SOURCE_DIR))
 
-from RL_Bezier_MPC.trajectory import BezierTrajectoryGenerator
+from RL_Bezier_MPC.envs import QuadrupedMPCEnv, QuadrupedMPCEnvCfg
 
 
-def simulate_quadrotor_simple(
-    initial_state: np.ndarray,
-    control: np.ndarray,
-    dt: float,
-    mass: float = 0.027,
-    inertia: np.ndarray = None,
-) -> np.ndarray:
-    """Simple quadrotor dynamics simulation (Euler integration).
+def generate_fixed_bezier_params(mode: str = "walk") -> np.ndarray:
+    """Generate fixed Bezier control point parameters for testing.
+
+    These are hand-crafted to produce a straight-line forward trajectory,
+    similar to what a well-trained RL policy should output.
 
     Args:
-        initial_state: State [pos(3), quat(4), vel(3), omega(3)]
-        control: Control [thrust, tau_x, tau_y, tau_z]
-        dt: Timestep
-        mass: Quadrotor mass
-        inertia: 3x3 inertia matrix
+        mode: "stand" = stay in place, "walk" = slow forward, "walk_fast" = faster
 
     Returns:
-        Next state after one timestep.
+        Bezier parameter array (12D): 4 control points × 3D
+        Values are in the DENORMALIZED action space (meters offset).
     """
-    if inertia is None:
-        inertia = np.diag([1.4e-5, 1.4e-5, 2.17e-5])
-
-    inertia_inv = np.linalg.inv(inertia)
-    gravity = np.array([0.0, 0.0, -9.81])
-
-    # Unpack state
-    pos = initial_state[0:3].copy()
-    quat = initial_state[3:7].copy()
-    vel = initial_state[7:10].copy()
-    omega = initial_state[10:13].copy()
-
-    # Normalize quaternion
-    quat = quat / np.linalg.norm(quat)
-
-    # Unpack control
-    thrust = control[0]
-    torque = control[1:4]
-
-    # Quaternion to rotation matrix
-    w, x, y, z = quat
-    R = np.array([
-        [1 - 2*y*y - 2*z*z, 2*x*y - 2*w*z, 2*x*z + 2*w*y],
-        [2*x*y + 2*w*z, 1 - 2*x*x - 2*z*z, 2*y*z - 2*w*x],
-        [2*x*z - 2*w*y, 2*y*z + 2*w*x, 1 - 2*x*x - 2*y*y]
-    ])
-
-    # Translational dynamics
-    thrust_body = np.array([0.0, 0.0, thrust])
-    thrust_world = R @ thrust_body
-    acc = thrust_world / mass + gravity
-
-    # Rotational dynamics
-    omega_cross_I_omega = np.cross(omega, inertia @ omega)
-    angular_acc = inertia_inv @ (torque - omega_cross_I_omega)
-
-    # Quaternion derivative
-    omega_quat = np.array([0.0, omega[0], omega[1], omega[2]])
-    quat_dot = 0.5 * quat_multiply(omega_quat, quat)
-
-    # Euler integration
-    pos_new = pos + vel * dt
-    vel_new = vel + acc * dt
-    quat_new = quat + quat_dot * dt
-    quat_new = quat_new / np.linalg.norm(quat_new)  # Normalize
-    omega_new = omega + angular_acc * dt
-
-    return np.concatenate([pos_new, quat_new, vel_new, omega_new])
-
-
-def quat_multiply(q1: np.ndarray, q2: np.ndarray) -> np.ndarray:
-    """Multiply two quaternions (w, x, y, z)."""
-    w1, x1, y1, z1 = q1
-    w2, x2, y2, z2 = q2
-    return np.array([
-        w1*w2 - x1*x2 - y1*y2 - z1*z2,
-        w1*x2 + x1*w2 + y1*z2 - z1*y2,
-        w1*y2 - x1*z2 + y1*w2 + z1*x2,
-        w1*z2 + x1*y2 - y1*x2 + z1*w2
-    ])
-
-
-def test_bezier_trajectory():
-    """Test Bezier trajectory generation."""
-    print("=" * 60)
-    print("Testing Bezier Trajectory Generator")
-    print("=" * 60)
-
-    # Create generator
-    generator = BezierTrajectoryGenerator(
-        degree=3,
-        state_dim=3,
-        max_displacement=2.0,
-    )
-
-    print(f"Parameter dimension: {generator.get_param_dim()}")
-    print(f"State dimension: {generator.get_state_dim()}")
-
-    low, high = generator.get_param_bounds()
-    print(f"Parameter bounds: [{low[0]:.2f}, {high[3]:.2f}]")
-
-    # Generate a test trajectory
-    # P0 offset = [0, 0, 0] (start at current position)
-    # P1 offset = [0.5, 0.5, 0.3] (first control point)
-    # P2 offset = [1.0, 0.0, 0.5] (second control point)
-    # P3 offset = [1.5, -0.3, 0.0] (end point)
-    params = np.array([
-        0.0, 0.0, 0.0,      # P0 offset (must be zero)
-        0.5, 0.5, 0.3,      # P1 offset
-        1.0, 0.0, 0.5,      # P2 offset
-        1.5, -0.3, 0.0,     # P3 offset (target)
-    ])
-
-    start_position = np.array([0.0, 0.0, 1.0])  # Start at height 1m
-    dt = 0.02  # 50 Hz
-    horizon = 1.5  # 1.5 seconds
-
-    waypoints = generator.params_to_waypoints(
-        params=params,
-        dt=dt,
-        horizon=horizon,
-        start_position=start_position,
-    )
-
-    print(f"Generated {len(waypoints)} waypoints over {horizon}s horizon")
-    print(f"Start position: {waypoints[0]}")
-    print(f"End position: {waypoints[-1]}")
-
-    # Also compute velocity and acceleration
-    velocity = generator.get_velocity(params, dt, horizon, start_position)
-    acceleration = generator.get_acceleration(params, dt, horizon, start_position)
-
-    print(f"Max velocity magnitude: {np.max(np.linalg.norm(velocity, axis=1)):.3f} m/s")
-    print(f"Max acceleration magnitude: {np.max(np.linalg.norm(acceleration, axis=1)):.3f} m/s²")
-
-    return waypoints, velocity, acceleration, start_position
-
-
-def test_mpc_tracking(reference_trajectory: np.ndarray, start_position: np.ndarray):
-    """Test MPC trajectory tracking with simple simulation.
-
-    Args:
-        reference_trajectory: Reference positions (T x 3)
-        start_position: Initial position
-
-    Returns:
-        Tuple of (actual_trajectory, controls)
-    """
-    print("\n" + "=" * 60)
-    print("Testing MPC Trajectory Tracking")
-    print("=" * 60)
-
-    try:
-        from RL_Bezier_MPC.controllers import CrocoddylQuadrotorMPC
-    except ImportError as e:
-        print(f"Crocoddyl not available: {e}")
-        print("Skipping MPC test. Install crocoddyl to run this test.")
-        return None, None
-
-    # Create MPC controller
-    mpc = CrocoddylQuadrotorMPC(
-        dt=0.02,
-        horizon_steps=25,
-        mass=0.027,
-        position_weight=100.0,
-        velocity_weight=10.0,
-        control_weight=0.1,
-        thrust_max=0.6,
-        torque_max=0.01,
-        max_iterations=10,
-        verbose=False,
-    )
-
-    print(f"MPC control dimension: {mpc.get_control_dim()}")
-    print(f"MPC state dimension: {mpc.get_state_dim()}")
-    print(f"MPC horizon: {mpc.horizon_steps} steps")
-
-    # Initial state: hovering at start position
-    state = np.zeros(13)
-    state[0:3] = start_position
-    state[3] = 1.0  # Identity quaternion (w, x, y, z)
-
-    # Simulation parameters
-    sim_dt = 0.02  # Match MPC rate
-    num_steps = len(reference_trajectory)
-
-    # Storage
-    actual_trajectory = [state[0:3].copy()]
-    controls = []
-    solve_times = []
-
-    print(f"Running simulation for {num_steps} steps...")
-
-    for i in range(num_steps - 1):
-        # Get reference slice for MPC horizon
-        ref_start = i
-        ref_end = min(i + mpc.horizon_steps, len(reference_trajectory))
-        reference_slice = reference_trajectory[ref_start:ref_end]
-
-        # Solve MPC
-        solution = mpc.solve(
-            current_state=state,
-            reference_trajectory=reference_slice,
-            warm_start=True,
-        )
-
-        controls.append(solution.control)
-        solve_times.append(solution.solve_time)
-
-        # Apply control and simulate
-        state = simulate_quadrotor_simple(state, solution.control, sim_dt)
-
-        # Store position
-        actual_trajectory.append(state[0:3].copy())
-
-        # Progress update
-        if (i + 1) % 20 == 0:
-            pos_error = np.linalg.norm(state[0:3] - reference_trajectory[i])
-            print(f"  Step {i+1}/{num_steps-1}, pos error: {pos_error:.4f} m, "
-                  f"solve time: {solution.solve_time*1000:.1f} ms")
-
-    actual_trajectory = np.array(actual_trajectory)
-    controls = np.array(controls)
-
-    # Statistics
-    tracking_errors = np.linalg.norm(
-        actual_trajectory[:-1] - reference_trajectory[:-1], axis=1
-    )
-    print(f"\nTracking Statistics:")
-    print(f"  Mean position error: {np.mean(tracking_errors):.4f} m")
-    print(f"  Max position error: {np.max(tracking_errors):.4f} m")
-    print(f"  Mean solve time: {np.mean(solve_times)*1000:.2f} ms")
-
-    return actual_trajectory, controls
-
-
-def plot_results(
-    reference: np.ndarray,
-    actual: np.ndarray = None,
-    velocity: np.ndarray = None,
-    controls: np.ndarray = None,
-    save_path: str = None,
-):
-    """Plot trajectory results.
-
-    Args:
-        reference: Reference trajectory (T x 3)
-        actual: Actual trajectory (T x 3), optional
-        velocity: Velocity profile (T x 3), optional
-        controls: Control inputs (T x 4), optional
-        save_path: Path to save figure, optional
-    """
-    # Defer matplotlib import to avoid Isaac Sim compatibility issues
-    # Must set backend via env var BEFORE importing matplotlib
-    import os
-    os.environ.setdefault('MPLBACKEND', 'Agg')
-    import matplotlib.pyplot as plt
-    from mpl_toolkits.mplot3d import Axes3D  # noqa: F401
-
-    fig = plt.figure(figsize=(15, 10))
-
-    # 3D trajectory plot
-    ax1 = fig.add_subplot(2, 2, 1, projection='3d')
-    ax1.plot(reference[:, 0], reference[:, 1], reference[:, 2],
-             'b-', label='Reference', linewidth=2)
-    if actual is not None:
-        ax1.plot(actual[:, 0], actual[:, 1], actual[:, 2],
-                 'r--', label='Actual', linewidth=2)
-    ax1.scatter(*reference[0], c='green', s=100, marker='o', label='Start')
-    ax1.scatter(*reference[-1], c='red', s=100, marker='x', label='End')
-    ax1.set_xlabel('X (m)')
-    ax1.set_ylabel('Y (m)')
-    ax1.set_zlabel('Z (m)')
-    ax1.set_title('3D Trajectory')
-    ax1.legend()
-
-    # Position over time
-    ax2 = fig.add_subplot(2, 2, 2)
-    t = np.arange(len(reference)) * 0.02
-    ax2.plot(t, reference[:, 0], 'b-', label='X ref')
-    ax2.plot(t, reference[:, 1], 'g-', label='Y ref')
-    ax2.plot(t, reference[:, 2], 'r-', label='Z ref')
-    if actual is not None:
-        t_actual = np.arange(len(actual)) * 0.02
-        ax2.plot(t_actual, actual[:, 0], 'b--', label='X actual')
-        ax2.plot(t_actual, actual[:, 1], 'g--', label='Y actual')
-        ax2.plot(t_actual, actual[:, 2], 'r--', label='Z actual')
-    ax2.set_xlabel('Time (s)')
-    ax2.set_ylabel('Position (m)')
-    ax2.set_title('Position vs Time')
-    ax2.legend()
-    ax2.grid(True)
-
-    # Velocity or tracking error
-    ax3 = fig.add_subplot(2, 2, 3)
-    if actual is not None and len(actual) == len(reference):
-        errors = np.linalg.norm(actual - reference, axis=1)
-        ax3.plot(t, errors, 'k-', linewidth=2)
-        ax3.set_xlabel('Time (s)')
-        ax3.set_ylabel('Tracking Error (m)')
-        ax3.set_title('Position Tracking Error')
-        ax3.grid(True)
-    elif velocity is not None:
-        vel_mag = np.linalg.norm(velocity, axis=1)
-        ax3.plot(t, vel_mag, 'b-', linewidth=2)
-        ax3.set_xlabel('Time (s)')
-        ax3.set_ylabel('Velocity (m/s)')
-        ax3.set_title('Velocity Magnitude')
-        ax3.grid(True)
-
-    # Control inputs
-    ax4 = fig.add_subplot(2, 2, 4)
-    if controls is not None:
-        t_ctrl = np.arange(len(controls)) * 0.02
-        ax4.plot(t_ctrl, controls[:, 0], 'k-', label='Thrust')
-        ax4.plot(t_ctrl, controls[:, 1], 'r-', label='τx')
-        ax4.plot(t_ctrl, controls[:, 2], 'g-', label='τy')
-        ax4.plot(t_ctrl, controls[:, 3], 'b-', label='τz')
-        ax4.set_xlabel('Time (s)')
-        ax4.set_ylabel('Control')
-        ax4.set_title('Control Inputs')
-        ax4.legend()
-        ax4.grid(True)
+    if mode == "stand":
+        # P0 = [0,0,0], P1-P3 = very small offsets → robot stays in place
+        params = np.array([
+            0.0, 0.0, 0.0,    # P0: start offset (always zero)
+            0.05, 0.0, 0.0,   # P1: tiny forward
+            0.05, 0.0, 0.0,   # P2: tiny forward
+            0.05, 0.0, 0.0,   # P3: end (barely moves)
+        ])
+    elif mode == "walk":
+        # Gentle forward trajectory (~0.5m over 1.5s = 0.33 m/s)
+        params = np.array([
+            0.0, 0.0, 0.0,     # P0: start
+            0.15, 0.0, 0.0,    # P1: control point
+            0.35, 0.0, 0.0,    # P2: control point
+            0.50, 0.0, 0.0,    # P3: end (~0.5m forward)
+        ])
+    elif mode == "walk_fast":
+        # Moderate forward trajectory (~1.0m over 1.5s = 0.67 m/s)
+        params = np.array([
+            0.0, 0.0, 0.0,     # P0: start
+            0.30, 0.0, 0.0,    # P1: control point
+            0.70, 0.0, 0.0,    # P2: control point
+            1.00, 0.0, 0.0,    # P3: end (~1.0m forward)
+        ])
     else:
-        ax4.text(0.5, 0.5, 'No control data', ha='center', va='center',
-                 transform=ax4.transAxes)
+        raise ValueError(f"Unknown mode: {mode}")
+
+    return params
+
+
+def normalize_params_to_actions(params: np.ndarray, action_low: np.ndarray,
+                                 action_high: np.ndarray) -> np.ndarray:
+    """Convert denormalized Bezier params to normalized [-1, 1] action space.
+
+    The environment expects actions in [-1, 1] and denormalizes internally.
+    So we need to reverse the denormalization:
+        denorm = 0.5 * (action + 1) * (high - low) + low
+        action = 2 * (denorm - low) / (high - low) - 1
+
+    Args:
+        params: Denormalized Bezier parameters (12D)
+        action_low: Lower bounds of action space
+        action_high: Upper bounds of action space
+
+    Returns:
+        Normalized actions in [-1, 1]
+    """
+    action_range = action_high - action_low
+    # Avoid division by zero
+    action_range = np.where(np.abs(action_range) < 1e-8, 1.0, action_range)
+    normalized = 2.0 * (params - action_low) / action_range - 1.0
+    return np.clip(normalized, -1.0, 1.0)
+
+
+def plot_diagnostic(positions, orientations, target_pos, rewards,
+                    joint_torques_log, joint_positions_log, mpc_converged_log,
+                    mpc_costs_log, mode, save_dir):
+    """Generate comprehensive 6-panel diagnostic plot.
+
+    Args:
+        positions: (T, 3) CoM positions
+        orientations: (T, 4) quaternions (w, x, y, z)
+        target_pos: (3,) target position
+        rewards: (T,) per-step reward
+        joint_torques_log: (T, 12) applied joint torques
+        joint_positions_log: (T, 12) joint positions
+        mpc_converged_log: (T,) bool convergence flags
+        mpc_costs_log: (T,) MPC costs
+        mode: test mode string
+        save_dir: directory to save plot
+    """
+    os.makedirs(save_dir, exist_ok=True)
+    T = len(positions)
+    time_steps = np.arange(T) * 0.02  # MPC dt = 0.02s
+
+    fig, axes = plt.subplots(3, 2, figsize=(16, 14))
+    fig.suptitle(
+        f"MPC Standalone Diagnostic | Mode: {mode} | {T} steps ({T*0.02:.1f}s)\n"
+        f"Final height: {positions[-1, 2]:.3f}m | "
+        f"Total reward: {np.sum(rewards):.2f} | "
+        f"MPC convergence: {np.mean(mpc_converged_log)*100:.0f}%",
+        fontsize=13
+    )
+
+    # --- Panel 1: XY Trajectory ---
+    ax = axes[0, 0]
+    ax.plot(positions[:, 0], positions[:, 1], "b-", linewidth=1.5, label="CoM path")
+    ax.plot(positions[0, 0], positions[0, 1], "go", markersize=10, label="Start")
+    ax.plot(positions[-1, 0], positions[-1, 1], "rs", markersize=10, label="End")
+    ax.plot(target_pos[0], target_pos[1], "r*", markersize=15, label="Target")
+    ax.set_xlabel("X (m)")
+    ax.set_ylabel("Y (m)")
+    ax.set_title("XY Trajectory (Bird's Eye)")
+    ax.legend(fontsize=8)
+    ax.set_aspect("equal")
+    ax.grid(True, alpha=0.3)
+
+    # --- Panel 2: Height (Z) over time ---
+    ax = axes[0, 1]
+    ax.plot(time_steps, positions[:, 2], "b-", linewidth=1.5, label="CoM height")
+    ax.axhline(y=0.4, color="g", linestyle="--", alpha=0.5, label="Standing (0.40m)")
+    ax.axhline(y=0.12, color="r", linestyle="--", alpha=0.5, label="Fall threshold (0.12m)")
+    ax.set_xlabel("Time (s)")
+    ax.set_ylabel("Height (m)")
+    ax.set_title("CoM Height")
+    ax.legend(fontsize=8)
+    ax.grid(True, alpha=0.3)
+
+    # --- Panel 3: Body Orientation ---
+    ax = axes[1, 0]
+    rolls, pitches, yaws = [], [], []
+    for q in orientations:
+        w, x, y, z = q
+        sinr = 2.0 * (w * x + y * z)
+        cosr = 1.0 - 2.0 * (x * x + y * y)
+        roll = np.arctan2(sinr, cosr)
+        sinp = 2.0 * (w * y - z * x)
+        sinp = np.clip(sinp, -1.0, 1.0)
+        pitch = np.arcsin(sinp)
+        siny = 2.0 * (w * z + x * y)
+        cosy = 1.0 - 2.0 * (y * y + z * z)
+        yaw = np.arctan2(siny, cosy)
+        rolls.append(np.degrees(roll))
+        pitches.append(np.degrees(pitch))
+        yaws.append(np.degrees(yaw))
+
+    ax.plot(time_steps, rolls, "r-", linewidth=1, label="Roll")
+    ax.plot(time_steps, pitches, "g-", linewidth=1, label="Pitch")
+    ax.plot(time_steps, yaws, "b-", linewidth=1, label="Yaw")
+    ax.axhline(y=45, color="k", linestyle="--", alpha=0.3)
+    ax.axhline(y=-45, color="k", linestyle="--", alpha=0.3)
+    ax.set_xlabel("Time (s)")
+    ax.set_ylabel("Angle (deg)")
+    ax.set_title("Body Orientation (Roll/Pitch/Yaw)")
+    ax.legend(fontsize=8)
+    ax.grid(True, alpha=0.3)
+
+    # --- Panel 4: Joint Torques ---
+    ax = axes[1, 1]
+    if len(joint_torques_log) > 0:
+        torques = np.array(joint_torques_log)
+        leg_names = ["FR_hip", "FR_thigh", "FR_calf",
+                     "FL_hip", "FL_thigh", "FL_calf",
+                     "RR_hip", "RR_thigh", "RR_calf",
+                     "RL_hip", "RL_thigh", "RL_calf"]
+        # Plot by leg (average of 3 joints per leg)
+        t_torques = np.arange(len(torques)) * 0.02
+        colors = ["red", "blue", "green", "orange"]
+        for leg_idx, (leg_name, color) in enumerate(
+            zip(["FR", "FL", "RR", "RL"], colors)):
+            leg_torques = torques[:, leg_idx*3:(leg_idx+1)*3]
+            ax.plot(t_torques, np.linalg.norm(leg_torques, axis=1),
+                    color=color, linewidth=0.8, alpha=0.7, label=f"{leg_name}")
+        ax.set_xlabel("Time (s)")
+        ax.set_ylabel("Torque magnitude (N·m)")
+        ax.set_title("Joint Torques by Leg")
+        ax.legend(fontsize=8)
+    ax.grid(True, alpha=0.3)
+
+    # --- Panel 5: Joint Positions ---
+    ax = axes[2, 0]
+    if len(joint_positions_log) > 0:
+        jpos = np.array(joint_positions_log)
+        t_jpos = np.arange(len(jpos)) * 0.02
+        # Isaac Lab joint order: FR_hip, FL_hip, RR_hip, RL_hip, FR_thigh, ...
+        # Plot hip, thigh, calf averages across legs
+        for j in range(min(12, jpos.shape[1])):
+            ax.plot(t_jpos, jpos[:, j], linewidth=0.5, alpha=0.6)
+        ax.set_xlabel("Time (s)")
+        ax.set_ylabel("Joint position (rad)")
+        ax.set_title("Joint Positions (all 12 joints)")
+    ax.grid(True, alpha=0.3)
+
+    # --- Panel 6: MPC Cost & Convergence ---
+    ax = axes[2, 1]
+    if len(mpc_costs_log) > 0:
+        t_mpc = np.arange(len(mpc_costs_log)) * 0.02
+        ax.semilogy(t_mpc, np.clip(mpc_costs_log, 1e-6, None),
+                    "b-", linewidth=1, label="MPC cost")
+        ax.set_xlabel("Time (s)")
+        ax.set_ylabel("MPC Cost (log scale)")
+        ax.set_title(f"MPC Cost (convergence rate: {np.mean(mpc_converged_log)*100:.0f}%)")
+        ax.legend(fontsize=8)
+    ax.grid(True, alpha=0.3)
 
     plt.tight_layout()
-
-    if save_path:
-        plt.savefig(save_path, dpi=150)
-        print(f"Figure saved to: {save_path}")
-    else:
-        # With Agg backend, show() does nothing - inform user
-        print("Plot created but not saved. Use --save <path> to save the figure.")
+    save_path = os.path.join(save_dir, f"mpc_diagnostic_{mode}.png")
+    fig.savefig(save_path, dpi=150, bbox_inches="tight")
+    plt.close(fig)
+    print(f"\nDiagnostic plot saved to: {save_path}")
 
 
 def main():
-    """Run standalone MPC test."""
-    parser = argparse.ArgumentParser(description="Test Bezier + MPC without IsaacLab")
-    parser.add_argument("--no-mpc", action="store_true",
-                        help="Skip MPC test (only test trajectory generation)")
-    parser.add_argument("--no-plot", action="store_true",
-                        help="Skip plotting (useful when matplotlib is unavailable)")
-    parser.add_argument("--save", type=str, default=None,
-                        help="Path to save plot (required when using Isaac Sim Python)")
-    args = parser.parse_args()
+    """Main MPC diagnostic test."""
+    print("=" * 70)
+    print("MPC STANDALONE DIAGNOSTIC TEST")
+    print("=" * 70)
+    print(f"Mode: {args_cli.mode}")
+    print(f"Max steps: {args_cli.max_steps} ({args_cli.max_steps * 0.02:.1f}s)")
+    print(f"Purpose: Test if MPC can control Go2 in Isaac Lab WITHOUT RL")
+    print("=" * 70)
 
-    # Test trajectory generation
-    waypoints, velocity, acceleration, start_pos = test_bezier_trajectory()
+    # Create environment configuration
+    env_cfg = QuadrupedMPCEnvCfg()
+    env_cfg.scene.num_envs = args_cli.num_envs
+    env_cfg.fix_gait_params = True  # Fixed gait for diagnostic
 
-    # Test MPC tracking
-    actual = None
-    controls = None
-    if not args.no_mpc:
-        actual, controls = test_mpc_tracking(waypoints, start_pos)
+    # Force target to be straight ahead (simple test)
+    env_cfg.target_pos_range = (2.0, 2.0, 0.0, 0.0, 0.0, 0.0)  # Fixed at x=2.0
 
-    # Plot results
-    if not args.no_plot:
-        if args.save is None:
-            print("\nNote: Using Agg backend (no display). Use --save <path> to save plot.")
-        plot_results(
-            reference=waypoints,
-            actual=actual,
-            velocity=velocity,
-            controls=controls,
-            save_path=args.save,
-        )
+    # Create environment
+    print("\nCreating environment...")
+    env = QuadrupedMPCEnv(cfg=env_cfg)
+    device = env.device
+
+    # Get action bounds from environment
+    action_low = env.action_low.cpu().numpy()
+    action_high = env.action_high.cpu().numpy()
+    print(f"Action bounds low:  {action_low}")
+    print(f"Action bounds high: {action_high}")
+
+    # Generate fixed Bezier parameters
+    bezier_params = generate_fixed_bezier_params(args_cli.mode)
+    print(f"\nFixed Bezier params (denormalized): {bezier_params}")
+
+    # Convert to normalized actions [-1, 1]
+    normalized_actions = normalize_params_to_actions(
+        bezier_params, action_low, action_high
+    )
+    print(f"Normalized actions: {normalized_actions}")
+
+    # Verify denormalization round-trip
+    denorm_check = 0.5 * (normalized_actions + 1.0) * (action_high - action_low) + action_low
+    print(f"Denorm round-trip:  {denorm_check}")
+    print(f"Round-trip error:   {np.max(np.abs(denorm_check - bezier_params)):.6f}")
+
+    # Create action tensor (same for all steps — fixed trajectory)
+    action_tensor = torch.tensor(
+        normalized_actions, dtype=torch.float32, device=device
+    ).unsqueeze(0).expand(args_cli.num_envs, -1)
+
+    # Reset environment
+    print("\n" + "=" * 70)
+    print("RUNNING SIMULATION")
+    print("=" * 70)
+    obs, _ = env.reset()
+
+    # Print initial state
+    robot_data = env.robot.data
+    init_pos = robot_data.root_pos_w[0].cpu().numpy()
+    init_quat = robot_data.root_quat_w[0].cpu().numpy()
+    print(f"Initial position: {init_pos}")
+    print(f"Initial orientation (quat): {init_quat}")
+
+    # Log buffers
+    positions_log = []
+    orientations_log = []
+    rewards_log = []
+    joint_torques_log = []
+    joint_positions_log = []
+    mpc_converged_log = []
+    mpc_costs_log = []
+
+    # Run simulation
+    for step in range(args_cli.max_steps):
+        # Apply FIXED actions (bypassing RL)
+        obs, rewards, terminated, truncated, info = env.step(action_tensor)
+
+        # Log data (env 0 only)
+        pos = robot_data.root_pos_w[0].cpu().numpy().copy()
+        quat = robot_data.root_quat_w[0].cpu().numpy().copy()
+        jpos = robot_data.joint_pos[0].cpu().numpy().copy()
+
+        positions_log.append(pos)
+        orientations_log.append(quat)
+        rewards_log.append(rewards[0].cpu().item())
+        joint_positions_log.append(jpos[:12])
+
+        # Log MPC info
+        if hasattr(env, '_pending_joint_efforts'):
+            torques = env._pending_joint_efforts[0].cpu().numpy().copy()
+            joint_torques_log.append(torques[:12])
+        if hasattr(env, '_last_mpc_converged'):
+            mpc_converged_log.append(env._last_mpc_converged[0])
+        if hasattr(env, '_last_mpc_costs'):
+            mpc_costs_log.append(env._last_mpc_costs[0])
+
+        # Print progress every 50 steps
+        if (step + 1) % 50 == 0:
+            height = pos[2]
+            # Compute pitch from quaternion
+            w, x, y, z = quat
+            sinp = 2.0 * (w * y - z * x)
+            sinp = np.clip(sinp, -1.0, 1.0)
+            pitch = np.degrees(np.arcsin(sinp))
+
+            conv_rate = np.mean(mpc_converged_log[-50:]) * 100 if mpc_converged_log else 0
+            print(f"  Step {step+1:4d}/{args_cli.max_steps}: "
+                  f"pos=[{pos[0]:+.3f}, {pos[1]:+.3f}, {pos[2]:.3f}], "
+                  f"pitch={pitch:+.1f}°, "
+                  f"reward={rewards[0].item():+.3f}, "
+                  f"MPC conv={conv_rate:.0f}%")
+
+        # Check termination
+        dones = terminated | truncated
+        if dones.any():
+            print(f"\n  *** TERMINATED at step {step + 1} "
+                  f"(terminated={terminated[0].item()}, truncated={truncated[0].item()}) ***")
+            break
+
+    # Convert logs to arrays
+    positions_arr = np.array(positions_log)
+    orientations_arr = np.array(orientations_log)
+    rewards_arr = np.array(rewards_log)
+    mpc_converged_arr = np.array(mpc_converged_log) if mpc_converged_log else np.array([])
+    mpc_costs_arr = np.array(mpc_costs_log) if mpc_costs_log else np.array([])
+
+    # Get target position
+    target_pos = env.target_positions[0].cpu().numpy()
+
+    # ========================= DIAGNOSTIC SUMMARY =========================
+    print("\n" + "=" * 70)
+    print("DIAGNOSTIC SUMMARY")
+    print("=" * 70)
+
+    T = len(positions_arr)
+    final_height = positions_arr[-1, 2]
+    min_height = np.min(positions_arr[:, 2])
+    max_height = np.max(positions_arr[:, 2])
+
+    # Compute pitch over time
+    pitches = []
+    for q in orientations_arr:
+        w, x, y, z = q
+        sinp = 2.0 * (w * y - z * x)
+        sinp = np.clip(sinp, -1.0, 1.0)
+        pitches.append(np.degrees(np.arcsin(sinp)))
+    pitches = np.array(pitches)
+
+    print(f"Test mode:         {args_cli.mode}")
+    print(f"Steps completed:   {T} / {args_cli.max_steps} ({T * 0.02:.1f}s)")
+    print(f"Final position:    [{positions_arr[-1, 0]:+.3f}, {positions_arr[-1, 1]:+.3f}, {positions_arr[-1, 2]:.3f}]")
+    print(f"Target position:   [{target_pos[0]:.3f}, {target_pos[1]:.3f}, {target_pos[2]:.3f}]")
+    print(f"Height range:      [{min_height:.3f}, {max_height:.3f}]m (standing: 0.40m)")
+    print(f"Pitch range:       [{np.min(pitches):.1f}°, {np.max(pitches):.1f}°]")
+    print(f"Total reward:      {np.sum(rewards_arr):.2f}")
+
+    if len(mpc_converged_arr) > 0:
+        print(f"MPC convergence:   {np.mean(mpc_converged_arr)*100:.1f}%")
+
+    # Distance traveled
+    x_traveled = positions_arr[-1, 0] - positions_arr[0, 0]
+    y_traveled = positions_arr[-1, 1] - positions_arr[0, 1]
+    total_dist = np.sqrt(x_traveled**2 + y_traveled**2)
+    print(f"X displacement:    {x_traveled:+.3f}m")
+    print(f"Y displacement:    {y_traveled:+.3f}m")
+    print(f"Total distance:    {total_dist:.3f}m")
+
+    # Check joint torques
+    if len(joint_torques_log) > 0:
+        torques_arr = np.array(joint_torques_log)
+        max_torque = np.max(np.abs(torques_arr))
+        mean_torque = np.mean(np.abs(torques_arr))
+        all_zero = np.allclose(torques_arr, 0.0, atol=1e-6)
+        print(f"Max |torque|:      {max_torque:.3f} N·m")
+        print(f"Mean |torque|:     {mean_torque:.3f} N·m")
+        if all_zero:
+            print("  *** WARNING: ALL TORQUES ARE ZERO — MPC not generating commands! ***")
+
+    # ========================= DIAGNOSIS =========================
+    print("\n" + "=" * 70)
+    print("DIAGNOSIS")
+    print("=" * 70)
+
+    fell = final_height < 0.15
+    pitch_collapsed = np.max(np.abs(pitches)) > 40
+
+    if fell and pitch_collapsed:
+        print("🔴 ROBOT FELL — Pitch collapsed and height dropped below 0.15m")
+        print("   → MPC cannot stabilize the robot in Isaac Lab physics.")
+        print("   → Problem is MPC ↔ Isaac Lab integration.")
+        print("   Possible causes:")
+        print("     1. Joint ordering still wrong (Isaac Lab vs Pinocchio)")
+        print("     2. Torque magnitudes too small/large for Isaac Lab physics")
+        print("     3. URDF/USD model mismatch between Pinocchio and Isaac Lab")
+        print("     4. Friction/contact parameters mismatch")
+        print("     5. Coordinate frame conventions differ")
+    elif fell:
+        print("🟡 ROBOT FELL (but pitch was ok) — Height dropped too low")
+        print("   → Possible leg coordination issue or insufficient support forces.")
+    elif pitch_collapsed:
+        print("🟡 ROBOT TILTED — Pitch exceeded 40° but didn't fully fall")
+        print("   → MPC is partially working but orientation control is weak.")
+    elif T < args_cli.max_steps * 0.8:
+        print("🟡 EARLY TERMINATION — Robot survived but terminated early")
+        print(f"   → Lasted {T * 0.02:.1f}s out of {args_cli.max_steps * 0.02:.1f}s")
+    else:
+        if args_cli.mode == "stand":
+            if abs(x_traveled) < 0.3 and abs(y_traveled) < 0.3:
+                print("🟢 ROBOT IS STANDING STABLY — MPC works for balance!")
+            else:
+                print("🟡 ROBOT DRIFTED while standing — MPC works but has bias")
+        else:
+            if x_traveled > 0.2:
+                print("🟢 ROBOT IS WALKING FORWARD — MPC works in Isaac Lab!")
+                print(f"   → Traveled {x_traveled:.2f}m forward in {T*0.02:.1f}s")
+                print("   → Problem is in RL training, not MPC integration.")
+            elif x_traveled < -0.2:
+                print("🟡 ROBOT WALKED BACKWARD — MPC has direction issue")
+                print("   → Check coordinate frame sign conventions.")
+            else:
+                print("🟡 ROBOT IS STABLE BUT NOT MOVING — MPC stabilizes but doesn't track")
+                print("   → Trajectory tracking may not be working correctly.")
+
+    if len(joint_torques_log) > 0 and all_zero:
+        print("\n⚠️  ALL TORQUES ARE ZERO!")
+        print("   → MPC is not generating any control commands.")
+        print("   → Check MPC solver initialization, Pinocchio model loading,")
+        print("     and whether CROCODDYL_AVAILABLE is True.")
+
+    # Generate plot
+    print("\n" + "=" * 70)
+    plot_diagnostic(
+        positions_arr, orientations_arr, target_pos, rewards_arr,
+        joint_torques_log, joint_positions_log,
+        mpc_converged_arr if len(mpc_converged_arr) > 0 else [True] * T,
+        mpc_costs_arr if len(mpc_costs_arr) > 0 else [0.0] * T,
+        args_cli.mode, args_cli.plot_dir,
+    )
+
+    # Cleanup
+    env.close()
 
 
 if __name__ == "__main__":
-    main()
+    try:
+        main()
+    finally:
+        simulation_app.close()
