@@ -302,20 +302,24 @@ class OCPFactory:
                 f"frictionCone_{foot_id}", friction_cost, self.weights["friction_cone"]
             )
 
-        # State bounds (joint limits)
-        # Crocoddyl's state.lb/ub have dimension ndx = 2*nv (tangent space).
-        # ResidualModelState outputs in the same tangent space.
-        # BUG FIX: lb[1:nv+1] was wrong — it skipped lb[0] (base-x bound) and
-        # grabbed lb[nv] (first velocity bound) as a position bound, mixing
-        # position and velocity constraints.
-        # Correct: lb[:nv] = position tangent space, lb[nv:] = velocity tangent space.
+        # State bounds (joint limits).
+        # state.lb/ub have dimension nx = nq + nv (full state space, NOT tangent ndx).
+        # ResidualModelState outputs in tangent space with dimension ndx = 2*nv.
+        # We need exactly ndx = 2*nv elements for ActivationBounds.
+        #
+        # Extraction: skip lb[0] (position-x has no meaningful lower bound in
+        # the tangent sense for floating base) and take nv elements from config
+        # space, then the last nv elements (velocity bounds).
+        #   lb[1:nv+1]  = config tangent bounds (nv elements, skipping lb[0])
+        #   lb[-nv:]    = velocity bounds (last nv elements)
+        # Together: 2*nv = ndx elements, matching ResidualModelState.nr.
         state_lb = np.concatenate([
-            self.state.lb[:self.nv],    # position bounds in tangent space (nv elements)
-            self.state.lb[self.nv:]     # velocity bounds (nv elements)
+            self.state.lb[1:self.nv + 1],   # config tangent bounds (nv elements)
+            self.state.lb[-self.nv:]         # velocity bounds (nv elements)
         ])
         state_ub = np.concatenate([
-            self.state.ub[:self.nv],
-            self.state.ub[self.nv:]
+            self.state.ub[1:self.nv + 1],
+            self.state.ub[-self.nv:]
         ])
 
         bounds_activation = crocoddyl.ActivationModelQuadraticBarrier(
