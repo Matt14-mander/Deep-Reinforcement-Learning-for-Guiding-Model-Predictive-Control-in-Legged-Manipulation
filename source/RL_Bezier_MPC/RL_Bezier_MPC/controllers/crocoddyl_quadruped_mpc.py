@@ -85,6 +85,7 @@ class CrocoddylQuadrupedMPC(BaseMPC):
         mu: float = 0.7,
         max_iterations: int = 50,
         convergence_threshold: float = 1e-4,
+        verbose: bool = False,
     ):
         """Initialize MPC with all sub-components.
 
@@ -103,6 +104,7 @@ class CrocoddylQuadrupedMPC(BaseMPC):
             mu: Friction coefficient.
             max_iterations: Maximum FDDP solver iterations.
             convergence_threshold: Solver convergence threshold.
+            verbose: If True, print detailed solver info for debugging.
         """
         if not CROCODDYL_AVAILABLE:
             raise ImportError(
@@ -122,6 +124,8 @@ class CrocoddylQuadrupedMPC(BaseMPC):
         self.mu = mu
         self.max_iterations = max_iterations
         self.convergence_threshold = convergence_threshold
+        self.verbose = verbose
+        self._solve_count = 0  # Track solve calls for selective verbose
 
         # Get frame IDs from names
         self.foot_frame_names = foot_frame_names
@@ -253,6 +257,29 @@ class CrocoddylQuadrupedMPC(BaseMPC):
         solver = crocoddyl.SolverFDDP(problem)
         solver.th_stop = self.convergence_threshold
 
+        # Verbose logging for debugging
+        self._solve_count += 1
+        is_verbose_call = self.verbose and self._solve_count <= 5
+
+        if is_verbose_call:
+            solver.setCallbacks([crocoddyl.CallbackVerbose()])
+            T = len(problem.runningModels)
+            print(f"\n[MPC Debug] Solve #{self._solve_count}")
+            print(f"  Problem: {T} running models, nu={self.actuation.nu}, nx={self.state.nx}")
+            print(f"  x0 pos: [{current_state[0]:.3f}, {current_state[1]:.3f}, {current_state[2]:.3f}]")
+            print(f"  x0 quat(xyzw): [{current_state[3]:.4f}, {current_state[4]:.4f}, {current_state[5]:.4f}, {current_state[6]:.4f}]")
+            quat_norm = np.linalg.norm(current_state[3:7])
+            print(f"  x0 quat norm: {quat_norm:.6f} (should be 1.0)")
+            print(f"  x0 vel (body): [{current_state[self.rmodel.nq]:.3f}, {current_state[self.rmodel.nq+1]:.3f}, {current_state[self.rmodel.nq+2]:.3f}]")
+            print(f"  x0 omega (body): [{current_state[self.rmodel.nq+3]:.3f}, {current_state[self.rmodel.nq+4]:.3f}, {current_state[self.rmodel.nq+5]:.3f}]")
+            print(f"  x0 joints[:6]: {current_state[7:13]}")
+            print(f"  CoM ref[0]: {com_reference[0]}")
+            print(f"  CoM ref[-1]: {com_reference[-1]}")
+            # Print foot positions
+            if current_foot_positions:
+                for fname, fpos in current_foot_positions.items():
+                    print(f"  Foot {fname}: [{fpos[0]:.3f}, {fpos[1]:.3f}, {fpos[2]:.3f}]")
+
         # Warm-start
         if warm_start and self._prev_xs is not None and self._prev_us is not None:
             # Shift previous solution by one step
@@ -265,14 +292,25 @@ class CrocoddylQuadrupedMPC(BaseMPC):
             us_init = self._adjust_length(us_init, T, np.zeros(self.actuation.nu))
 
             solver.setCandidate(xs_init, us_init, False)
+            if is_verbose_call:
+                print(f"  Warm-start: YES ({len(xs_init)} states, {len(us_init)} controls)")
+        elif is_verbose_call:
+            print(f"  Warm-start: NO (first solve)")
 
         # Solve
         converged = solver.solve(
             [], [],  # Initial guess (use candidate if set)
             self.max_iterations,
-            False,  # regInit
-            0.0,  # stopTh (use th_stop)
+            False,  # isFeasible
+            0.0,  # regInit (use default)
         )
+
+        if is_verbose_call:
+            print(f"  Result: converged={converged}, iters={solver.iter}, cost={solver.cost:.2f}")
+            if len(solver.us) > 0:
+                u0 = solver.us[0]
+                print(f"  Control u[0] (12D): [{', '.join(f'{v:.3f}' for v in u0)}]")
+                print(f"  |u[0]| = {np.linalg.norm(u0):.3f}")
 
         solve_time = time.time() - start_time
 

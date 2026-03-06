@@ -134,6 +134,9 @@ class QuadrupedMPCEnvCfg(DirectRLEnvCfg):
     # Previous value of 10 was too low → 0% convergence rate
     mpc_max_iterations: int = 50
 
+    # MPC verbose mode (print solver info for first 5 solves, for debugging)
+    mpc_verbose: bool = False
+
     # ==========================================================================
     # Trajectory Configuration
     # ==========================================================================
