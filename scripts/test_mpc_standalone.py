@@ -354,6 +354,15 @@ def main():
         # Apply FIXED actions (bypassing RL)
         obs, rewards, terminated, truncated, info = env.step(action_tensor)
 
+        # Print detailed MPC info for first 3 steps
+        if step < 3 and hasattr(env, 'last_mpc_solutions') and env.last_mpc_solutions[0] is not None:
+            sol = env.last_mpc_solutions[0]
+            print(f"\n  [Step {step}] MPC: converged={sol.converged}, "
+                  f"iters={sol.iterations}, cost={sol.cost:.1f}, "
+                  f"solve_time={sol.solve_time*1000:.0f}ms", flush=True)
+            print(f"    u[0]: [{', '.join(f'{v:.2f}' for v in sol.control[:6])}...] "
+                  f"|u|={np.linalg.norm(sol.control):.2f}", flush=True)
+
         # Log data (env 0 only)
         pos = robot_data.root_pos_w[0].cpu().numpy().copy()
         quat = robot_data.root_quat_w[0].cpu().numpy().copy()

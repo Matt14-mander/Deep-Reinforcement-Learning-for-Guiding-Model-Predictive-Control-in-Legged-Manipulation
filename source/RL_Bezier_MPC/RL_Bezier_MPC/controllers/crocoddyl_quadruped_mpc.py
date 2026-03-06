@@ -260,42 +260,50 @@ class CrocoddylQuadrupedMPC(BaseMPC):
         # Verbose logging for debugging
         self._solve_count += 1
         is_verbose_call = self.verbose and self._solve_count <= 5
+        T = len(problem.runningModels)
 
         if is_verbose_call:
+            import sys
             solver.setCallbacks([crocoddyl.CallbackVerbose()])
-            T = len(problem.runningModels)
-            print(f"\n[MPC Debug] Solve #{self._solve_count}")
-            print(f"  Problem: {T} running models, nu={self.actuation.nu}, nx={self.state.nx}")
-            print(f"  x0 pos: [{current_state[0]:.3f}, {current_state[1]:.3f}, {current_state[2]:.3f}]")
-            print(f"  x0 quat(xyzw): [{current_state[3]:.4f}, {current_state[4]:.4f}, {current_state[5]:.4f}, {current_state[6]:.4f}]")
+            print(f"\n[MPC Debug] Solve #{self._solve_count}", flush=True)
+            print(f"  Problem: {T} running models, nu={self.actuation.nu}, nx={self.state.nx}", flush=True)
+            print(f"  x0 pos: [{current_state[0]:.3f}, {current_state[1]:.3f}, {current_state[2]:.3f}]", flush=True)
+            print(f"  x0 quat(xyzw): [{current_state[3]:.4f}, {current_state[4]:.4f}, {current_state[5]:.4f}, {current_state[6]:.4f}]", flush=True)
             quat_norm = np.linalg.norm(current_state[3:7])
-            print(f"  x0 quat norm: {quat_norm:.6f} (should be 1.0)")
-            print(f"  x0 vel (body): [{current_state[self.rmodel.nq]:.3f}, {current_state[self.rmodel.nq+1]:.3f}, {current_state[self.rmodel.nq+2]:.3f}]")
-            print(f"  x0 omega (body): [{current_state[self.rmodel.nq+3]:.3f}, {current_state[self.rmodel.nq+4]:.3f}, {current_state[self.rmodel.nq+5]:.3f}]")
-            print(f"  x0 joints[:6]: {current_state[7:13]}")
-            print(f"  CoM ref[0]: {com_reference[0]}")
-            print(f"  CoM ref[-1]: {com_reference[-1]}")
-            # Print foot positions
+            print(f"  x0 quat norm: {quat_norm:.6f} (should be 1.0)", flush=True)
+            print(f"  x0 vel (body): [{current_state[self.rmodel.nq]:.3f}, {current_state[self.rmodel.nq+1]:.3f}, {current_state[self.rmodel.nq+2]:.3f}]", flush=True)
+            print(f"  x0 joints[:6]: {current_state[7:13]}", flush=True)
+            print(f"  CoM ref[0]: {com_reference[0]}", flush=True)
+            print(f"  CoM ref[-1]: {com_reference[-1]}", flush=True)
             if current_foot_positions:
                 for fname, fpos in current_foot_positions.items():
-                    print(f"  Foot {fname}: [{fpos[0]:.3f}, {fpos[1]:.3f}, {fpos[2]:.3f}]")
+                    print(f"  Foot {fname}: [{fpos[0]:.3f}, {fpos[1]:.3f}, {fpos[2]:.3f}]", flush=True)
+            sys.stdout.flush()
 
-        # Warm-start
+        # Warm-start or gravity-compensation cold-start
         if warm_start and self._prev_xs is not None and self._prev_us is not None:
             # Shift previous solution by one step
             xs_init = self._shift_trajectory(self._prev_xs, current_state)
             us_init = self._shift_controls(self._prev_us)
 
             # Ensure correct lengths
-            T = len(problem.runningModels)
             xs_init = self._adjust_length(xs_init, T + 1, current_state)
             us_init = self._adjust_length(us_init, T, np.zeros(self.actuation.nu))
 
             solver.setCandidate(xs_init, us_init, False)
             if is_verbose_call:
-                print(f"  Warm-start: YES ({len(xs_init)} states, {len(us_init)} controls)")
-        elif is_verbose_call:
-            print(f"  Warm-start: NO (first solve)")
+                print(f"  Warm-start: YES (shifted prev solution)", flush=True)
+        else:
+            # COLD START: Use gravity compensation as initial control guess
+            # Without this, the solver starts from zero controls (= robot falls)
+            # which is a terrible initial trajectory for FDDP to recover from.
+            u_grav = self._compute_gravity_compensation(current_state)
+            xs_init = [current_state.copy() for _ in range(T + 1)]
+            us_init = [u_grav.copy() for _ in range(T)]
+            solver.setCandidate(xs_init, us_init, False)
+            if is_verbose_call:
+                print(f"  Cold-start: gravity compensation |u|={np.linalg.norm(u_grav):.3f}", flush=True)
+                print(f"  u_grav: [{', '.join(f'{v:.2f}' for v in u_grav)}]", flush=True)
 
         # Solve
         converged = solver.solve(
@@ -306,11 +314,13 @@ class CrocoddylQuadrupedMPC(BaseMPC):
         )
 
         if is_verbose_call:
-            print(f"  Result: converged={converged}, iters={solver.iter}, cost={solver.cost:.2f}")
+            print(f"  Result: converged={converged}, iters={solver.iter}, cost={solver.cost:.2f}", flush=True)
             if len(solver.us) > 0:
                 u0 = solver.us[0]
-                print(f"  Control u[0] (12D): [{', '.join(f'{v:.3f}' for v in u0)}]")
-                print(f"  |u[0]| = {np.linalg.norm(u0):.3f}")
+                print(f"  u[0]: [{', '.join(f'{v:.2f}' for v in u0)}]", flush=True)
+                print(f"  |u[0]| = {np.linalg.norm(u0):.3f}", flush=True)
+            import sys
+            sys.stdout.flush()
 
         solve_time = time.time() - start_time
 
@@ -338,6 +348,36 @@ class CrocoddylQuadrupedMPC(BaseMPC):
             cost=float(solver.cost),
             iterations=int(solver.iter),
         )
+
+    def _compute_gravity_compensation(self, state: np.ndarray) -> np.ndarray:
+        """Compute gravity compensation torques for the current configuration.
+
+        Uses Pinocchio's RNEA (Recursive Newton-Euler Algorithm) with zero
+        velocity and zero acceleration to find the joint torques needed to
+        hold the robot in a static pose against gravity.
+
+        This provides a MUCH better initial guess for the FDDP solver than
+        zero controls (which would cause a free-fall trajectory).
+
+        Args:
+            state: Robot state (nq + nv).
+
+        Returns:
+            Joint torques (nu = nv-6 = 12D) for gravity compensation.
+        """
+        q = state[:self.rmodel.nq].copy()
+        v = np.zeros(self.rmodel.nv)
+        a = np.zeros(self.rmodel.nv)
+
+        # RNEA: tau = M(q)*a + C(q,v)*v + g(q)
+        # With v=0 and a=0, this gives tau = g(q) (gravity torques)
+        tau = pinocchio.rnea(self.rmodel, self.rdata, q, v, a)
+
+        # tau is (nv,) = 18D: [base(6), joints(12)]
+        # For ActuationModelFloatingBase, control is only joints (12D)
+        u_grav = tau[6:]  # Skip unactuated floating base
+
+        return u_grav
 
     def _compute_foot_positions(
         self, state: np.ndarray
