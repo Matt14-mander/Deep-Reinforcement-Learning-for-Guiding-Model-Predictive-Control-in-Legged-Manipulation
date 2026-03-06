@@ -124,7 +124,7 @@ class QuadrupedMPCEnv(DirectRLEnv):
                     support_duration=cfg.default_support_duration,
                     step_height=cfg.default_step_height,
                     mu=cfg.friction_coefficient,
-                    max_iterations=10,
+                    max_iterations=cfg.mpc_max_iterations,
                 )
             else:
                 mpc = None  # Dummy mode
@@ -872,13 +872,15 @@ class QuadrupedMPCEnv(DirectRLEnv):
             else:
                 states[:, 7:7 + num_robot_joints] = joint_pos[:, :num_robot_joints]
 
-        # Root linear velocity
-        root_lin_vel = robot_data.root_lin_vel_w.cpu().numpy()
-        states[:, nq:nq + 3] = root_lin_vel
+        # Root velocity in BODY frame (Pinocchio convention for FreeFlyer joint)
+        # Pinocchio's generalized velocity v[0:6] is the spatial velocity of the
+        # base expressed in the LOCAL (body) frame, NOT the world frame.
+        # Isaac Lab provides both world-frame and body-frame velocities.
+        root_lin_vel_b = robot_data.root_lin_vel_b.cpu().numpy()
+        states[:, nq:nq + 3] = root_lin_vel_b
 
-        # Root angular velocity
-        root_ang_vel = robot_data.root_ang_vel_w.cpu().numpy()
-        states[:, nq + 3:nq + 6] = root_ang_vel
+        root_ang_vel_b = robot_data.root_ang_vel_b.cpu().numpy()
+        states[:, nq + 3:nq + 6] = root_ang_vel_b
 
         # Joint velocities from articulation (reorder Isaac Lab → Pinocchio)
         if nv > 6:

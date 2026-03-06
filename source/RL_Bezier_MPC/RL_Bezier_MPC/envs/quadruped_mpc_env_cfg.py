@@ -130,6 +130,10 @@ class QuadrupedMPCEnvCfg(DirectRLEnvCfg):
     # MPC prediction horizon
     mpc_horizon_steps: int = 25  # 0.5s lookahead
 
+    # MPC solver max iterations (FDDP needs 50+ for 37D state problem)
+    # Previous value of 10 was too low → 0% convergence rate
+    mpc_max_iterations: int = 50
+
     # ==========================================================================
     # Trajectory Configuration
     # ==========================================================================

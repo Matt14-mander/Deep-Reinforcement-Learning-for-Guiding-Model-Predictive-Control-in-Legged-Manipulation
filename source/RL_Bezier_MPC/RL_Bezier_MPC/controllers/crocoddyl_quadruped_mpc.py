@@ -13,10 +13,14 @@ This controller integrates all the quadruped-specific components:
 - SolverFDDP → trajectory optimization
 
 State representation: (nq + nv) dimensional
-    For a 12-DOF quadruped:
-        q = [x, y, z, qw, qx, qy, qz, joint1...joint12] → nq = 19
+    For a 12-DOF quadruped (Pinocchio convention):
+        q = [x, y, z, qx, qy, qz, qw, joint1...joint12] → nq = 19
         v = [vx, vy, vz, ωx, ωy, ωz, dq1...dq12]       → nv = 18
         Full state: 37D
+
+    IMPORTANT: Pinocchio's FreeFlyer base velocity v[0:6] is in the LOCAL
+    (body) frame, NOT the world frame. The env must rotate Isaac Lab's
+    world-frame velocities before passing them here.
 
 Control: 12D joint torques (floating base is unactuated)
 """
@@ -79,7 +83,7 @@ class CrocoddylQuadrupedMPC(BaseMPC):
         support_duration: float = 0.05,
         step_height: float = 0.05,
         mu: float = 0.7,
-        max_iterations: int = 10,
+        max_iterations: int = 50,
         convergence_threshold: float = 1e-4,
     ):
         """Initialize MPC with all sub-components.
