@@ -305,12 +305,16 @@ class CrocoddylQuadrupedMPC(BaseMPC):
                 print(f"  Cold-start: gravity compensation |u|={np.linalg.norm(u_grav):.3f}", flush=True)
                 print(f"  u_grav: [{', '.join(f'{v:.2f}' for v in u_grav)}]", flush=True)
 
-        # Solve
+        # Solve.
+        # regInit=1e-9: provide a small non-zero initial regularization so
+        # FDDP's backward pass stays well-conditioned on the contact Hessian.
+        # With regInit=0 the solver may stall because preg/dreg never increase
+        # when the descent direction is poor but the Hessian is nominally PD.
         converged = solver.solve(
             [], [],  # Initial guess (use candidate if set)
             self.max_iterations,
-            False,  # isFeasible
-            0.0,  # regInit (use default)
+            False,  # isFeasible (warm-start trajectory is NOT dynamically feasible)
+            1e-9,   # regInit: small initial regularization for numerical stability
         )
 
         if is_verbose_call:
@@ -483,7 +487,9 @@ class CrocoddylQuadrupedMPC(BaseMPC):
         if len(xs) <= 1:
             return [x0]
 
-        shifted = [x0] + xs[2:]  # Skip first two, use x0 as new start
+        # BUG FIX: xs[2:] skipped xs[1] (2-step shift), inflating ||ffeas||.
+        # Correct 1-step shift: replace old x0 with new x0, keep x1 onward.
+        shifted = [x0] + list(xs[1:])
         # Pad with last element if needed
         while len(shifted) < len(xs):
             shifted.append(xs[-1].copy())

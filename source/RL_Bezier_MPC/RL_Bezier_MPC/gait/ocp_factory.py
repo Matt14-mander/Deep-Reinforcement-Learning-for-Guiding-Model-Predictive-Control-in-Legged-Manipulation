@@ -141,32 +141,55 @@ class OCPFactory:
             Default state vector (nq + nv).
         """
         x0 = np.zeros(self.nx)
-        # Default configuration: all joints at zero
-        x0[:self.nq] = pinocchio.neutral(self.rmodel)
+        q0 = pinocchio.neutral(self.rmodel)
+
+        # BUG FIX: pinocchio.neutral() returns all joints=0, which is NOT the
+        # standing pose for Go2 (needs thigh≈0.9 rad, calf≈-1.8 rad).
+        # Using the wrong reference with joint weight 0.01 actively pulls joints
+        # toward zero, causing leg collapse and the robot falling.
+        #
+        # Try referenceConfigurations["standing"] first, then scan joint names.
+        if hasattr(self.rmodel, 'referenceConfigurations') and \
+                "standing" in self.rmodel.referenceConfigurations:
+            q0 = self.rmodel.referenceConfigurations["standing"].copy()
+        else:
+            # Estimate standing pose from joint names.
+            for i in range(1, self.rmodel.njoints):
+                jname = self.rmodel.names[i].lower()
+                joint = self.rmodel.joints[i]
+                if joint.nq != 1:
+                    continue  # skip floating base / multi-dof joints
+                jid = joint.idx_q  # first q-index for this joint
+                if any(k in jname for k in ("thigh", "hfe", "upper", "hip_y")):
+                    q0[jid] = 0.9
+                elif any(k in jname for k in ("calf", "kfe", "lower", "knee", "shin")):
+                    q0[jid] = -1.8
+
+        x0[:self.nq] = q0
         return x0
 
     def _compute_state_weights(self):
         """Compute state regularization weights.
 
-        From Crocoddyl demo (lines 642-648):
-        - Base position (x,y,z): 0.0 (free to track CoM)
-        - Base orientation (roll,pitch,yaw): 500.0 (keep upright)
-        - Joint positions: 0.01 (light regularization)
+        - Base position (x,y,z): 0.0 (CoM is tracked separately via comTrack cost)
+        - Base orientation (roll,pitch,yaw): 500.0 (keep body upright — critical)
+        - Joint positions: 0.0 (no joint position regularization; the reference
+          x0 is an estimate and any error there would actively destabilize the robot)
         - Base velocity: 10.0 (moderate damping)
-        - Joint velocities: 1.0 (light damping)
+        - Joint velocities: 0.1 (light damping to prevent oscillation)
         """
-        # Configuration part (nq dimensions)
-        # Structure: [base_pos(3), base_quat(4), joints(nq-7)]
+        # Configuration tangent space (nv dimensions)
+        # Structure: [base_pos(3), base_SO3(3), joints(nv-6)]
         state_weights_q = np.array(
-            [0.0] * 3  # base position - free
-            + [500.0] * 3  # base orientation (we use 3D since Crocoddyl uses tangent)
-            + [0.01] * (self.nv - 6)  # joints
+            [0.0] * 3        # base position — free (tracked by comTrack)
+            + [500.0] * 3    # base orientation — keep upright (critical for balance)
+            + [0.0] * (self.nv - 6)  # joints — zero weight avoids wrong-reference pull
         )
 
-        # Velocity part (nv dimensions)
+        # Velocity tangent space (nv dimensions)
         state_weights_v = np.array(
-            [10.0] * 6  # base velocity
-            + [1.0] * (self.nv - 6)  # joint velocities
+            [10.0] * 6       # base linear+angular velocity damping
+            + [0.1] * (self.nv - 6)  # joint velocity damping (light)
         )
 
         self.state_weights = np.concatenate([state_weights_q, state_weights_v])
@@ -280,18 +303,19 @@ class OCPFactory:
             )
 
         # State bounds (joint limits)
-        # state.lb/ub have dimension nx = nq + nv, but ResidualModelState
-        # outputs in tangent space with dimension ndx = 2*nv.
-        # For floating base: skip the first element (quaternion normalization)
-        # and take nv elements for position part, then nv for velocity part.
-        # Reference: Crocoddyl whole_body_manipulation example
+        # Crocoddyl's state.lb/ub have dimension ndx = 2*nv (tangent space).
+        # ResidualModelState outputs in the same tangent space.
+        # BUG FIX: lb[1:nv+1] was wrong — it skipped lb[0] (base-x bound) and
+        # grabbed lb[nv] (first velocity bound) as a position bound, mixing
+        # position and velocity constraints.
+        # Correct: lb[:nv] = position tangent space, lb[nv:] = velocity tangent space.
         state_lb = np.concatenate([
-            self.state.lb[1:self.nv + 1],   # position bounds in tangent space
-            self.state.lb[-self.nv:]         # velocity bounds
+            self.state.lb[:self.nv],    # position bounds in tangent space (nv elements)
+            self.state.lb[self.nv:]     # velocity bounds (nv elements)
         ])
         state_ub = np.concatenate([
-            self.state.ub[1:self.nv + 1],   # position bounds in tangent space
-            self.state.ub[-self.nv:]         # velocity bounds
+            self.state.ub[:self.nv],
+            self.state.ub[self.nv:]
         ])
 
         bounds_activation = crocoddyl.ActivationModelQuadraticBarrier(
