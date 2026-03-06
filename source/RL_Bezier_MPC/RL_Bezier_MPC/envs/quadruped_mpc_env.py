@@ -125,6 +125,7 @@ class QuadrupedMPCEnv(DirectRLEnv):
                     step_height=cfg.default_step_height,
                     mu=cfg.friction_coefficient,
                     max_iterations=cfg.mpc_max_iterations,
+                    verbose=(cfg.mpc_verbose and _ == 0),  # Only verbose for env 0
                 )
             else:
                 mpc = None  # Dummy mode
