@@ -166,6 +166,13 @@ class CrocoddylQuadrupedMPC(BaseMPC):
         # Contact sequence cache
         self._cached_contact_sequence: Optional[ContactSequence] = None
 
+        # Gait phase tracking: tracks elapsed time within the current gait cycle.
+        # Advances by dt each solve so the OCP always starts from the CORRECT
+        # contact phase (support vs swing) rather than always restarting at t=0.
+        # Without this, the OCP always plans "wait in support, THEN swing" and
+        # us[0] is always a support-phase gravity-comp torque → robot never walks.
+        self._gait_phase: float = 0.0
+
     def solve(
         self,
         current_state: np.ndarray,
@@ -223,16 +230,29 @@ class CrocoddylQuadrupedMPC(BaseMPC):
         step_duration = self.step_duration / step_frequency_mod
         support_duration = self.support_duration / step_frequency_mod
 
-        # Determine number of gait cycles to fill horizon
+        # Determine number of gait cycles to fill horizon.
+        # Use +2 to ensure enough phases remain after phase_offset trimming.
         cycle_duration = self._get_cycle_duration(step_duration, support_duration)
-        num_cycles = max(1, int(np.ceil(self.horizon_steps * self.dt / cycle_duration)))
+        num_cycles = max(2, int(np.ceil(self.horizon_steps * self.dt / cycle_duration)) + 1)
 
+        # Generate contact sequence starting from current gait phase.
+        # phase_offset causes the sequence to start mid-cycle so the OCP
+        # correctly models whether feet are currently in support or swing.
+        # first_step_fraction=1.0: full steps (no ramping; phase tracking handles timing).
+        # include_final_support=False: avoid double-counting the support between cycles.
         contact_sequence = self.gait_scheduler.generate(
             gait_type=self.gait_type,
             step_duration=step_duration,
             support_duration=support_duration,
             num_cycles=num_cycles,
+            first_step_fraction=1.0,
+            include_initial_support=True,
+            include_final_support=False,
+            phase_offset=self._gait_phase,
         )
+
+        # Advance gait phase for next solve (mod cycle_duration to wrap around)
+        self._gait_phase = (self._gait_phase + self.dt) % cycle_duration
 
         # Compute heading trajectory from CoM reference tangent
         heading_trajectory = self._compute_heading_trajectory(com_reference, self.dt)
@@ -280,6 +300,11 @@ class CrocoddylQuadrupedMPC(BaseMPC):
             print(f"  CoM ref[0]: {com_reference[0]}", flush=True)
             print(f"  CoM ref[-1]: {com_reference[-1]}", flush=True)
             print(f"  OCP: {T} running nodes → terminal uses ref[{min(T, len(com_reference)-1)}] (NOT ref[-1]={com_reference[-1]})", flush=True)
+            # gait_phase was already advanced before this log (see below), subtract dt to show current
+            prev_phase = (self._gait_phase - self.dt) % cycle_duration
+            phase0 = contact_sequence.phases[0] if contact_sequence.phases else None
+            phase0_str = f"{phase0.phase_type}(feet={phase0.support_feet}, dur={phase0.duration:.3f}s)" if phase0 else "N/A"
+            print(f"  Gait phase: {prev_phase:.3f}s / {cycle_duration:.3f}s, first OCP phase: {phase0_str}", flush=True)
             if current_foot_positions:
                 for fname, fpos in current_foot_positions.items():
                     print(f"  Foot {fname}: [{fpos[0]:.3f}, {fpos[1]:.3f}, {fpos[2]:.3f}]", flush=True)
@@ -476,6 +501,18 @@ class CrocoddylQuadrupedMPC(BaseMPC):
 
         num_swing_groups = len(pattern["swing_groups"])
         return num_swing_groups * (step_duration + support_duration)
+
+    def reset(self):
+        """Reset MPC state for a new episode.
+
+        Clears warm-start cache and resets gait phase to 0 so the new episode
+        starts from the beginning of the gait cycle (full-support phase).
+        Call this from the environment's episode reset.
+        """
+        self._prev_xs = None
+        self._prev_us = None
+        self._gait_phase = 0.0
+        self._solve_count = 0
 
     def _shift_trajectory(
         self, xs: List[np.ndarray], x0: np.ndarray

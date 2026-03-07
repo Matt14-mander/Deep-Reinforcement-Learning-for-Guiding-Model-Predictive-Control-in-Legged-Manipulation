@@ -95,6 +95,7 @@ class GaitScheduler:
         first_step_fraction: float = 0.5,
         include_initial_support: bool = True,
         include_final_support: bool = True,
+        phase_offset: float = 0.0,
     ) -> ContactSequence:
         """Generate a complete ContactSequence for the requested gait.
 
@@ -112,6 +113,10 @@ class GaitScheduler:
             first_step_fraction: First step is this fraction of full step. Default 0.5.
             include_initial_support: Start with full support phase. Default True.
             include_final_support: End with full support phase. Default True.
+            phase_offset: Seconds to skip from the beginning of the sequence.
+                Used for gait phase tracking: the MPC advances this by dt each
+                step so the OCP always reflects the correct contact state.
+                E.g., 0.0 = start of support, 0.10 = start of swing_A, etc.
 
         Returns:
             ContactSequence with all phases for the gait.
@@ -183,7 +188,47 @@ class GaitScheduler:
                 )
             )
 
+        # Trim the first phase_offset seconds for gait phase tracking
+        if phase_offset > 0.0:
+            phases = self._trim_phases(phases, phase_offset)
+
         return ContactSequence(phases=phases)
+
+    def _trim_phases(
+        self, phases: List[ContactPhase], offset: float
+    ) -> List[ContactPhase]:
+        """Remove the first `offset` seconds from a phase list.
+
+        Used by generate() to implement gait phase tracking.  The MPC
+        advances phase_offset by dt each step, so the contact sequence
+        always starts at the correct point in the gait cycle.
+
+        Args:
+            phases: Original list of ContactPhase objects.
+            offset: Seconds to trim from the beginning.
+
+        Returns:
+            Trimmed list of ContactPhase objects.
+        """
+        remaining = offset
+        result = []
+        for phase in phases:
+            if remaining <= 0.0:
+                result.append(phase)
+            elif remaining >= phase.duration:
+                # This phase is fully consumed by the offset
+                remaining -= phase.duration
+            else:
+                # Partially consumed: trim the beginning
+                trimmed = ContactPhase(
+                    support_feet=phase.support_feet.copy(),
+                    swing_feet=phase.swing_feet.copy(),
+                    duration=phase.duration - remaining,
+                    phase_type=phase.phase_type,
+                )
+                result.append(trimmed)
+                remaining = 0.0
+        return result
 
     def generate_single_step(
         self,
