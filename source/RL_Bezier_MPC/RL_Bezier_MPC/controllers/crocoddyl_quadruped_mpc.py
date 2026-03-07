@@ -161,6 +161,7 @@ class CrocoddylQuadrupedMPC(BaseMPC):
         # Warm-start storage
         self._prev_xs: Optional[List[np.ndarray]] = None
         self._prev_us: Optional[List[np.ndarray]] = None
+        self._prev_converged: bool = False
         self._solver: Optional[Any] = None
 
         # Contact sequence cache
@@ -312,30 +313,35 @@ class CrocoddylQuadrupedMPC(BaseMPC):
                     print(f"  Foot {fname}: [{fpos[0]:.3f}, {fpos[1]:.3f}, {fpos[2]:.3f}]", flush=True)
             sys.stdout.flush()
 
-        # Warm-start or gravity-compensation cold-start
-        if warm_start and self._prev_xs is not None and self._prev_us is not None:
-            # Shift previous solution by one step
-            xs_init = self._shift_trajectory(self._prev_xs, current_state)
-            us_init = self._shift_controls(self._prev_us)
+        # Warm-start or gravity-compensation cold-start.
+        # KEY: always use problem.rollout(us) to get a FEASIBLE trajectory
+        # (ffeas=0). With infeasible warm-start (ffeas≈18), FDDP treats gaps as
+        # extra gradient terms → backward pass ill-conditioned → diverges.
+        # Only reuse prev controls if the prev solve actually converged; otherwise
+        # the shifted us may be garbage and make the next solve fail too.
+        use_warm = (
+            warm_start
+            and self._prev_us is not None
+            and self._prev_converged
+        )
 
-            # Ensure correct lengths
-            xs_init = self._adjust_length(xs_init, T + 1, current_state)
-            us_init = self._adjust_length(us_init, T, np.zeros(self.actuation.nu))
-
-            solver.setCandidate(xs_init, us_init, False)
+        if use_warm:
+            us_candidate = self._shift_controls(self._prev_us)
+            us_candidate = self._adjust_length(us_candidate, T, np.zeros(self.actuation.nu))
             if is_verbose_call:
-                print(f"  Warm-start: YES (shifted prev solution)", flush=True)
+                print(f"  Warm-start: YES (shifted prev solution, rolling out for feasibility)", flush=True)
         else:
-            # COLD START: Use gravity compensation as initial control guess
-            # Without this, the solver starts from zero controls (= robot falls)
-            # which is a terrible initial trajectory for FDDP to recover from.
+            # COLD START: gravity compensation controls
             u_grav = self._compute_gravity_compensation(current_state)
-            xs_init = [current_state.copy() for _ in range(T + 1)]
-            us_init = [u_grav.copy() for _ in range(T)]
-            solver.setCandidate(xs_init, us_init, False)
+            us_candidate = [u_grav.copy() for _ in range(T)]
             if is_verbose_call:
-                print(f"  Cold-start: gravity compensation |u|={np.linalg.norm(u_grav):.3f}", flush=True)
-                print(f"  u_grav: [{', '.join(f'{v:.2f}' for v in u_grav)}]", flush=True)
+                reason = "prev not converged" if (self._prev_us is not None and not self._prev_converged) else "no prev"
+                print(f"  Cold-start: gravity compensation ({reason}), |u|={np.linalg.norm(u_grav):.3f}", flush=True)
+
+        # Roll out to get a dynamically feasible xs (ffeas=0).
+        # This is much better than xs=[x0,x0,...] which has large gaps.
+        xs_candidate = problem.rollout(us_candidate)
+        solver.setCandidate(xs_candidate, us_candidate, True)  # True = feasible
 
         # Solve.
         # regInit=1e-9: provide a small non-zero initial regularization so
@@ -343,9 +349,9 @@ class CrocoddylQuadrupedMPC(BaseMPC):
         # With regInit=0 the solver may stall because preg/dreg never increase
         # when the descent direction is poor but the Hessian is nominally PD.
         converged = solver.solve(
-            [], [],  # Initial guess (use candidate if set)
+            [], [],  # Initial guess (use candidate set above)
             self.max_iterations,
-            False,  # isFeasible (warm-start trajectory is NOT dynamically feasible)
+            True,   # isFeasible=True: trajectory from problem.rollout() is feasible (ffeas=0)
             1e-9,   # regInit: small initial regularization for numerical stability
         )
 
@@ -364,9 +370,10 @@ class CrocoddylQuadrupedMPC(BaseMPC):
         xs = list(solver.xs)
         us = list(solver.us)
 
-        # Store for warm-start
+        # Store for warm-start — only mark converged if solver actually converged
         self._prev_xs = xs
         self._prev_us = us
+        self._prev_converged = bool(converged)
 
         # First control action
         control = us[0] if len(us) > 0 else np.zeros(self.actuation.nu)
@@ -513,6 +520,7 @@ class CrocoddylQuadrupedMPC(BaseMPC):
         """
         self._prev_xs = None
         self._prev_us = None
+        self._prev_converged = False
         self._gait_phase = 0.0
         self._solve_count = 0
 

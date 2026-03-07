@@ -473,7 +473,7 @@ class OCPFactory:
                 self.state, com_target, self.nu
             )
             com_cost = crocoddyl.CostModelResidual(self.state, com_residual)
-            cost_model.addCost("comTrack", com_cost, self.weights["com_track"] * 10)
+            cost_model.addCost("comTrack", com_cost, self.weights["com_track"] * 3)
 
         # State regularization (heavier for terminal)
         state_activation = crocoddyl.ActivationModelWeightedQuad(self.state_weights)
@@ -481,7 +481,7 @@ class OCPFactory:
         state_cost = crocoddyl.CostModelResidual(
             self.state, state_activation, state_residual
         )
-        cost_model.addCost("stateReg", state_cost, self.weights["state_reg"] * 10)
+        cost_model.addCost("stateReg", state_cost, self.weights["state_reg"] * 3)
 
         # Velocity damping (want zero velocity at terminal)
         # ResidualModelState outputs in tangent space (ndx = 2*nv)
