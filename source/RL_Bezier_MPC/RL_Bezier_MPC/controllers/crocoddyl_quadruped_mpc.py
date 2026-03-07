@@ -338,20 +338,21 @@ class CrocoddylQuadrupedMPC(BaseMPC):
                 reason = "prev not converged" if (self._prev_us is not None and not self._prev_converged) else "no prev"
                 print(f"  Cold-start: gravity compensation ({reason}), |u|={np.linalg.norm(u_grav):.3f}", flush=True)
 
-        # Roll out to get a dynamically feasible xs (ffeas=0).
-        # This is much better than xs=[x0,x0,...] which has large gaps.
+        # Roll out to get xs consistent with the dynamics, reducing initial ffeas.
+        # problem.rollout() uses problem.running_datas (separate from solver's data).
+        # We MUST use isFeasible=False so the solver runs its own forwardPass():
+        #   (1) populates SOLVER's data buffers needed by calcDiff
+        #   (2) gaps = xs_rollout_solver - xs_candidate ≈ 0 → ffeas ≈ 0
+        # isFeasible=True skips forwardPass → solver data uninitialised →
+        # calcDiff returns zeros → |grad|=0 → zero torque output.
         xs_candidate = problem.rollout(us_candidate)
-        solver.setCandidate(xs_candidate, us_candidate, True)  # True = feasible
+        solver.setCandidate(xs_candidate, us_candidate, False)
 
         # Solve.
-        # regInit=1e-9: provide a small non-zero initial regularization so
-        # FDDP's backward pass stays well-conditioned on the contact Hessian.
-        # With regInit=0 the solver may stall because preg/dreg never increase
-        # when the descent direction is poor but the Hessian is nominally PD.
         converged = solver.solve(
             [], [],  # Initial guess (use candidate set above)
             self.max_iterations,
-            True,   # isFeasible=True: trajectory from problem.rollout() is feasible (ffeas=0)
+            False,  # isFeasible=False: run forwardPass to initialise data buffers
             1e-9,   # regInit: small initial regularization for numerical stability
         )
 
