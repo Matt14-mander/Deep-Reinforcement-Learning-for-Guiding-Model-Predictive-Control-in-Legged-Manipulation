@@ -69,8 +69,8 @@ class OCPFactory:
 
     # Default cost weights (from Crocoddyl demo)
     DEFAULT_WEIGHTS = {
-        "com_track": 1e4,
-        "foot_track": 1e4,
+        "com_track": 1e6,
+        "foot_track": 1e6,
         "state_reg": 1e1,
         "ctrl_reg": 1e0,           # Increased: reduce aggressive torques in turns
         "friction_cone": 1e3,      # Increased from 1e1: must dominate to prevent
@@ -540,6 +540,7 @@ class OCPFactory:
         foot_trajectories: Dict[str, List[FootholdPlan]],
         dt: float,
         heading_trajectory: Optional[np.ndarray] = None,
+        max_nodes: Optional[int] = None,
     ) -> "crocoddyl.ShootingProblem":
         """Assemble a complete ShootingProblem from all components.
 
@@ -560,6 +561,8 @@ class OCPFactory:
             foot_trajectories: Dict from FootholdPlanner.
             dt: OCP timestep in seconds.
             heading_trajectory: Target yaw angles, shape (T,). Optional.
+            max_nodes: Maximum number of running models (knots) to build. If None,
+                uses all phases. Pass horizon_steps to cap OCP size.
 
         Returns:
             Crocoddyl ShootingProblem ready for solving.
@@ -572,8 +575,14 @@ class OCPFactory:
 
         # Iterate through contact sequence phases
         for phase_idx, phase in enumerate(contact_sequence.phases):
-            # Discretize phase into knots
+            # Stop if we've reached the node limit
+            if max_nodes is not None and knot_index >= max_nodes:
+                break
+
+            # Discretize phase into knots; clip to remaining budget
             num_knots = max(1, round(phase.duration / dt))
+            if max_nodes is not None:
+                num_knots = min(num_knots, max_nodes - knot_index)
 
             # Get support foot frame IDs for this phase
             support_foot_ids = [

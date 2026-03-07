@@ -267,7 +267,8 @@ class CrocoddylQuadrupedMPC(BaseMPC):
             step_height=step_height,
         )
 
-        # Build OCP
+        # Build OCP — cap at horizon_steps nodes so contact sequence length
+        # (which may be 2–3 cycles) doesn't bloat the OCP and cause divergence.
         problem = self.ocp_factory.build_problem(
             x0=current_state,
             contact_sequence=contact_sequence,
@@ -275,6 +276,7 @@ class CrocoddylQuadrupedMPC(BaseMPC):
             foot_trajectories=foothold_plans,
             dt=self.dt,
             heading_trajectory=heading_trajectory,
+            max_nodes=self.horizon_steps,
         )
 
         # Create solver
