@@ -473,7 +473,7 @@ class OCPFactory:
                 self.state, com_target, self.nu
             )
             com_cost = crocoddyl.CostModelResidual(self.state, com_residual)
-            cost_model.addCost("comTrack", com_cost, self.weights["com_track"] * 3)
+            cost_model.addCost("comTrack", com_cost, self.weights["com_track"] * 10)
 
         # State regularization (heavier for terminal)
         state_activation = crocoddyl.ActivationModelWeightedQuad(self.state_weights)
@@ -481,7 +481,7 @@ class OCPFactory:
         state_cost = crocoddyl.CostModelResidual(
             self.state, state_activation, state_residual
         )
-        cost_model.addCost("stateReg", state_cost, self.weights["state_reg"] * 3)
+        cost_model.addCost("stateReg", state_cost, self.weights["state_reg"] * 10)
 
         # Velocity damping (want zero velocity at terminal)
         # ResidualModelState outputs in tangent space (ndx = 2*nv)
@@ -540,7 +540,6 @@ class OCPFactory:
         foot_trajectories: Dict[str, List[FootholdPlan]],
         dt: float,
         heading_trajectory: Optional[np.ndarray] = None,
-        max_nodes: Optional[int] = None,
     ) -> "crocoddyl.ShootingProblem":
         """Assemble a complete ShootingProblem from all components.
 
@@ -561,8 +560,6 @@ class OCPFactory:
             foot_trajectories: Dict from FootholdPlanner.
             dt: OCP timestep in seconds.
             heading_trajectory: Target yaw angles, shape (T,). Optional.
-            max_nodes: Maximum number of running models (knots) to build. If None,
-                uses all phases. Pass horizon_steps to cap OCP size.
 
         Returns:
             Crocoddyl ShootingProblem ready for solving.
@@ -575,14 +572,8 @@ class OCPFactory:
 
         # Iterate through contact sequence phases
         for phase_idx, phase in enumerate(contact_sequence.phases):
-            # Stop if we've reached the node limit
-            if max_nodes is not None and knot_index >= max_nodes:
-                break
-
-            # Discretize phase into knots; clip to remaining budget
+            # Discretize phase into knots
             num_knots = max(1, round(phase.duration / dt))
-            if max_nodes is not None:
-                num_knots = min(num_knots, max_nodes - knot_index)
 
             # Get support foot frame IDs for this phase
             support_foot_ids = [
@@ -643,19 +634,8 @@ class OCPFactory:
                         foot_swing_indices[foot_name] += 1
 
         # Build terminal model
-        # IMPORTANT: use the waypoint at OCP horizon end (knot_index), NOT the
-        # last waypoint of the full Bezier trajectory (com_trajectory[-1]).
-        # com_trajectory[-1] corresponds to t=bezier_horizon (e.g. 1.5s), but the
-        # OCP only covers ~num_running_models * dt seconds (e.g. 0.68s).
-        # Using the far-future target creates a terminal cost whose residual is
-        # ~0.3m, blowing the cost to >1e7 and causing FDDP regularization to
-        # explode to 1e7 → solver stalls → random large torques → robot falls.
-        terminal_idx = min(knot_index, len(com_trajectory) - 1)
-        terminal_com = com_trajectory[terminal_idx] if len(com_trajectory) > 0 else None
-        terminal_yaw = (
-            heading_trajectory[min(knot_index, len(heading_trajectory) - 1)]
-            if heading_trajectory is not None else None
-        )
+        terminal_com = com_trajectory[-1] if len(com_trajectory) > 0 else None
+        terminal_yaw = heading_trajectory[-1] if heading_trajectory is not None else None
 
         terminal_model = self.build_terminal_node(
             com_target=terminal_com,
