@@ -162,9 +162,16 @@ class QuadrupedMPCEnvCfg(DirectRLEnvCfg):
     gait_type: str = "trot"
 
     # Gait timing defaults
-    default_step_duration: float = 0.15  # seconds per swing phase
-    default_support_duration: float = 0.05  # double support duration
+    # Increased from 0.15/0.05: longer swing/support gives MPC 1 gait cycle per
+    # horizon (vs 2 cycles), halving OCP node count and improving convergence.
+    # Also gives physics more time to establish contact before next swing.
+    default_step_duration: float = 0.25  # seconds per swing phase
+    default_support_duration: float = 0.10  # double support duration
     default_step_height: float = 0.15  # meters
+
+    # Go2 foot sphere radius (m). FootholdPlanner sets foot z-target to this
+    # value so the MPC doesn't try to push the foot center into the ground.
+    foot_radius: float = 0.02
 
     # Gait modulation bounds (multipliers around 1.0)
     step_length_mod_range: tuple = (0.5, 2.0)

@@ -79,9 +79,10 @@ class CrocoddylQuadrupedMPC(BaseMPC):
         gait_type: str = "trot",
         dt: float = 0.02,
         horizon_steps: int = 25,
-        step_duration: float = 0.15,
-        support_duration: float = 0.05,
+        step_duration: float = 0.25,
+        support_duration: float = 0.10,
         step_height: float = 0.05,
+        foot_radius: float = 0.02,
         mu: float = 0.7,
         max_iterations: int = 50,
         convergence_threshold: float = 1e-4,
@@ -101,6 +102,8 @@ class CrocoddylQuadrupedMPC(BaseMPC):
             step_duration: Duration of each swing phase in seconds.
             support_duration: Double-support duration between swings.
             step_height: Default foot swing height.
+            foot_radius: Foot sphere radius (m). Used as default_ground_height
+                so MPC targets the foot sphere center correctly above ground.
             mu: Friction coefficient.
             max_iterations: Maximum FDDP solver iterations.
             convergence_threshold: Solver convergence threshold.
@@ -141,6 +144,7 @@ class CrocoddylQuadrupedMPC(BaseMPC):
         self.gait_scheduler = GaitScheduler()
         self.foothold_planner = FootholdPlanner(
             hip_offsets=hip_offsets,
+            default_ground_height=foot_radius,  # sphere center sits above ground
             step_height=step_height,
         )
         self.foot_trajectory_gen = BezierFootTrajectory(step_height=step_height)

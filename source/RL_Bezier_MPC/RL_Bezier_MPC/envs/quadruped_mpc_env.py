@@ -123,6 +123,7 @@ class QuadrupedMPCEnv(DirectRLEnv):
                     step_duration=cfg.default_step_duration,
                     support_duration=cfg.default_support_duration,
                     step_height=cfg.default_step_height,
+                    foot_radius=cfg.foot_radius,
                     mu=cfg.friction_coefficient,
                     max_iterations=cfg.mpc_max_iterations,
                     verbose=(cfg.mpc_verbose and _ == 0),  # Only verbose for env 0
