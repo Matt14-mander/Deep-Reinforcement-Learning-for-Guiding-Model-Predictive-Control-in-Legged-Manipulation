@@ -69,8 +69,8 @@ class OCPFactory:
 
     # Default cost weights (from Crocoddyl demo)
     DEFAULT_WEIGHTS = {
-        "com_track": 1e6,
-        "foot_track": 1e6,
+        "com_track": 1e4,
+        "foot_track": 1e4,
         "state_reg": 1e1,
         "ctrl_reg": 1e0,           # Increased: reduce aggressive torques in turns
         "friction_cone": 1e3,      # Increased from 1e1: must dominate to prevent
