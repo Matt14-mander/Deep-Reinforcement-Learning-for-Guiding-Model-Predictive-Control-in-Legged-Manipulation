@@ -279,6 +279,7 @@ class CrocoddylQuadrupedMPC(BaseMPC):
             print(f"  x0 joints[:6]: {current_state[7:13]}", flush=True)
             print(f"  CoM ref[0]: {com_reference[0]}", flush=True)
             print(f"  CoM ref[-1]: {com_reference[-1]}", flush=True)
+            print(f"  OCP: {T} running nodes → terminal uses ref[{min(T, len(com_reference)-1)}] (NOT ref[-1]={com_reference[-1]})", flush=True)
             if current_foot_positions:
                 for fname, fpos in current_foot_positions.items():
                     print(f"  Foot {fname}: [{fpos[0]:.3f}, {fpos[1]:.3f}, {fpos[2]:.3f}]", flush=True)

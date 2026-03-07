@@ -634,8 +634,19 @@ class OCPFactory:
                         foot_swing_indices[foot_name] += 1
 
         # Build terminal model
-        terminal_com = com_trajectory[-1] if len(com_trajectory) > 0 else None
-        terminal_yaw = heading_trajectory[-1] if heading_trajectory is not None else None
+        # IMPORTANT: use the waypoint at OCP horizon end (knot_index), NOT the
+        # last waypoint of the full Bezier trajectory (com_trajectory[-1]).
+        # com_trajectory[-1] corresponds to t=bezier_horizon (e.g. 1.5s), but the
+        # OCP only covers ~num_running_models * dt seconds (e.g. 0.68s).
+        # Using the far-future target creates a terminal cost whose residual is
+        # ~0.3m, blowing the cost to >1e7 and causing FDDP regularization to
+        # explode to 1e7 → solver stalls → random large torques → robot falls.
+        terminal_idx = min(knot_index, len(com_trajectory) - 1)
+        terminal_com = com_trajectory[terminal_idx] if len(com_trajectory) > 0 else None
+        terminal_yaw = (
+            heading_trajectory[min(knot_index, len(heading_trajectory) - 1)]
+            if heading_trajectory is not None else None
+        )
 
         terminal_model = self.build_terminal_node(
             com_target=terminal_com,
