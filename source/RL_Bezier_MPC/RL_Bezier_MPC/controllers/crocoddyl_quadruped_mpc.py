@@ -162,6 +162,13 @@ class CrocoddylQuadrupedMPC(BaseMPC):
         # Contact sequence cache
         self._cached_contact_sequence: Optional[ContactSequence] = None
 
+        # Gait phase clock: tracks elapsed time in the gait cycle across MPC calls.
+        # Incremented by dt after each solve so that successive calls generate contact
+        # sequences starting from the correct phase (not always from the beginning).
+        # Without this, every solve starts with "initial support phase" and the robot
+        # never reaches the swing phases — the "Groundhog Day" bug.
+        self._gait_clock: float = 0.0
+
     def solve(
         self,
         current_state: np.ndarray,
@@ -223,11 +230,18 @@ class CrocoddylQuadrupedMPC(BaseMPC):
         cycle_duration = self._get_cycle_duration(step_duration, support_duration)
         num_cycles = max(1, int(np.ceil(self.horizon_steps * self.dt / cycle_duration)))
 
-        contact_sequence = self.gait_scheduler.generate(
+        # Compute phase offset from the global gait clock.
+        # This ensures each MPC call starts the contact sequence from the correct
+        # position in the gait cycle, rather than always starting at t=0 (the
+        # "Groundhog Day" bug that caused the robot to always execute support torques).
+        phase_offset = self._gait_clock % cycle_duration
+
+        contact_sequence = self.gait_scheduler.generate_from_phase_offset(
             gait_type=self.gait_type,
             step_duration=step_duration,
             support_duration=support_duration,
             num_cycles=num_cycles,
+            phase_offset=phase_offset,
         )
 
         # Compute heading trajectory from CoM reference tangent
@@ -335,6 +349,10 @@ class CrocoddylQuadrupedMPC(BaseMPC):
         # Store for warm-start
         self._prev_xs = xs
         self._prev_us = us
+
+        # Advance the gait phase clock so the next solve starts from the correct
+        # position in the gait cycle (fixes the "Groundhog Day" bug).
+        self._gait_clock += self.dt
 
         # First control action
         control = us[0] if len(us) > 0 else np.zeros(self.actuation.nu)
@@ -554,11 +572,12 @@ class CrocoddylQuadrupedMPC(BaseMPC):
         return self.dt
 
     def reset(self):
-        """Reset controller state (clear warm-start buffers)."""
+        """Reset controller state (clear warm-start buffers and gait clock)."""
         self._prev_xs = None
         self._prev_us = None
         self._solver = None
         self._cached_contact_sequence = None
+        self._gait_clock = 0.0
 
     def set_gait_type(self, gait_type: str):
         """Change the gait type.

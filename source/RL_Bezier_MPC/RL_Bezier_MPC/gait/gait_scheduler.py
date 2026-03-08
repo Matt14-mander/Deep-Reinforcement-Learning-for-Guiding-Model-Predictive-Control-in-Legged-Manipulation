@@ -307,6 +307,69 @@ class GaitScheduler:
 
         return ContactSequence(phases=phases)
 
+    def generate_from_phase_offset(
+        self,
+        gait_type: str,
+        step_duration: float = 0.15,
+        support_duration: float = 0.05,
+        num_cycles: int = 4,
+        phase_offset: float = 0.0,
+    ) -> ContactSequence:
+        """Generate a contact sequence starting from a phase offset in the gait cycle.
+
+        Unlike generate(), this never includes an initial support phase and instead
+        starts mid-cycle based on phase_offset. This enables continuous gait replanning
+        across MPC calls without always resetting to the beginning of the gait cycle.
+
+        Args:
+            gait_type: Type of gait ("trot", "walk", "pace", "bound").
+            step_duration: Duration of each swing phase in seconds.
+            support_duration: Double-support duration between swings.
+            num_cycles: Number of gait cycles to generate (before trimming).
+            phase_offset: Time (seconds) to skip at the start of the sequence.
+                          Typically: gait_clock % cycle_duration.
+
+        Returns:
+            ContactSequence starting from phase_offset into the gait cycle.
+        """
+        # Generate extra cycles to ensure enough phases remain after trimming
+        extra = max(1, int(phase_offset / max(step_duration + support_duration, 1e-6)) + 1)
+        seq = self.generate(
+            gait_type=gait_type,
+            step_duration=step_duration,
+            support_duration=support_duration,
+            num_cycles=num_cycles + extra,
+            first_step_fraction=1.0,  # Uniform durations when starting mid-cycle
+            include_initial_support=False,
+            include_final_support=False,
+        )
+
+        if phase_offset <= 1e-6:
+            return seq
+
+        # Trim the first phase_offset seconds from the sequence
+        phases = [p.copy() for p in seq.phases]
+        remaining = phase_offset
+
+        while phases and remaining > 1e-6:
+            if phases[0].duration <= remaining + 1e-6:
+                remaining -= phases[0].duration
+                phases.pop(0)
+            else:
+                phases[0].duration -= remaining
+                remaining = 0.0
+
+        if not phases:
+            # Fallback: return a short support phase
+            phases = [ContactPhase(
+                support_feet=self.FOOT_NAMES.copy(),
+                swing_feet=[],
+                duration=support_duration,
+                phase_type="support",
+            )]
+
+        return ContactSequence(phases=phases)
+
     def generate_from_modulation(
         self,
         gait_type: str,
