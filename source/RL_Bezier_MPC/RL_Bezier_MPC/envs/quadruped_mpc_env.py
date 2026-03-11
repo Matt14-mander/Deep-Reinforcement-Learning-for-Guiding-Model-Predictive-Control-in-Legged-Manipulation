@@ -212,7 +212,7 @@ class QuadrupedMPCEnv(DirectRLEnv):
 
         # Pending joint effort buffer for batch application
         # Shape: (num_envs, num_joints)
-        self._pending_joint_efforts = torch.zeros(
+        self._pending_joint_positions = torch.zeros(
             (self.num_envs, cfg.num_joints), device=self.device, dtype=torch.float32
         )
 
@@ -317,14 +317,6 @@ class QuadrupedMPCEnv(DirectRLEnv):
         robot_cfg = UNITREE_GO2_CFG.replace(
             prim_path="/World/envs/env_.*/Robot",
         )
-
-        if "base_legs" in robot_cfg.actuators:
-            robot_cfg.actuators["base_legs"].stiffness = 0.0
-            robot_cfg.actuators["base_legs"].damping = 0.0
-        elif "legs" in robot_cfg.actuators:
-            robot_cfg.actuators["legs"].stiffness = 0.0
-            robot_cfg.actuators["legs"].damping = 0.0
-            
         self.robot = Articulation(robot_cfg)
 
         # Add lights
@@ -436,75 +428,72 @@ class QuadrupedMPCEnv(DirectRLEnv):
                         current_foot_positions=foot_positions,
                         gait_params=gait_params,
                         warm_start=True,
+                        # time=current_gait_time, # 如果你之前加了time，记得保留！
                     )
                     self.last_mpc_solutions[env_idx] = solution
-                    joint_torques = solution.control
+                    
+                    # === 【关键修改】提取 MPC 预测的下一步关节期望位置 ===
+                    # solution.xs[1] 是预测的下一步状态。
+                    # Pinocchio 状态向量前7位是浮动基座(pos+quat)，第7到19位是 12 个关节位置
+                    joint_positions = solution.xs[1][7:19] 
+                    
                     self._last_mpc_costs[env_idx] = solution.cost
                     self._last_mpc_converged[env_idx] = solution.converged
                 except Exception as e:
                     if env_idx == 0:
                         print(f"Warning: MPC solve failed for env {env_idx}: {e}")
-                    joint_torques = np.zeros(self.cfg.num_joints)
+                    # 如果求解失败，保持当前物理引擎中的关节位置不变（防抽搐）
+                    joint_positions = robot_states[env_idx][7:19]
                     self.last_mpc_solutions[env_idx] = None
-                    self._last_mpc_costs[env_idx] = 0.0
+                    self._last_mpc_costs[env_idx] = 1e6 # 惩罚失败
                     self._last_mpc_converged[env_idx] = False
             else:
-                # Dummy mode: zero control
-                joint_torques = np.zeros(self.cfg.num_joints)
+                # Dummy mode: keep current state
+                joint_positions = robot_states[env_idx][7:19]
                 self.last_mpc_solutions[env_idx] = None
                 self._last_mpc_costs[env_idx] = 0.0
                 self._last_mpc_converged[env_idx] = False
 
             # Apply control to robot
-            self._apply_control(env_idx, joint_torques)
-
-            # Increment counters
-            self.trajectory_phases[env_idx] += 1
-            self.mpc_step_counter[env_idx] += 1
+            self._apply_control(env_idx, joint_positions)
 
     def _apply_action(self):
-        """Apply accumulated joint effort targets to the robot."""
-        self.robot.set_joint_effort_target(self._pending_joint_efforts)
+        """Apply accumulated joint position targets to the robot."""
+        # === 【关键修改】使用 set_joint_position_target 代替 effort ===
+        self.robot.set_joint_position_target(self._pending_joint_positions)
 
-    def _apply_control(self, env_idx: int, joint_torques: np.ndarray):
-        """Apply joint torque control to Go2 quadruped.
+    def _apply_control(self, env_idx: int, joint_positions: np.ndarray):
+        """Apply joint position control to Go2 quadruped.
 
-        Maps MPC output (joint torques) to Isaac Lab articulation joint effort targets.
+        Maps MPC output (joint positions) to Isaac Lab articulation joint position targets.
 
         Args:
             env_idx: Environment index.
-            joint_torques: Joint torque vector (12D from MPC or dummy).
+            joint_positions: Joint position vector (12D from MPC or fallback).
         """
         # Ensure correct dimension (12 joints for Go2)
         num_joints = self.cfg.num_joints
-        if len(joint_torques) > num_joints:
-            # MPC may output more DOFs (including floating base)
-            # Take only the actuated joints
-            joint_torques = joint_torques[:num_joints]
-        elif len(joint_torques) < num_joints:
-            # Pad with zeros if MPC outputs fewer
+        if len(joint_positions) > num_joints:
+            joint_positions = joint_positions[:num_joints]
+        elif len(joint_positions) < num_joints:
             padded = np.zeros(num_joints)
-            padded[:len(joint_torques)] = joint_torques
-            joint_torques = padded
+            padded[:len(joint_positions)] = joint_positions
+            joint_positions = padded
 
-        # Reorder torques: Pinocchio joint order → Isaac Lab joint order
+        # Reorder positions: Pinocchio joint order → Isaac Lab joint order
         if self._pin_to_isaac_joint_idx is not None:
             reordered = np.zeros(num_joints)
-            for pin_idx in range(min(len(joint_torques), 12)):
+            for pin_idx in range(min(len(joint_positions), 12)):
                 isaac_idx = self._pin_to_isaac_joint_idx[pin_idx]
-                reordered[isaac_idx] = joint_torques[pin_idx]
-            joint_torques = reordered
+                reordered[isaac_idx] = joint_positions[pin_idx]
+            joint_positions = reordered
 
-        # Clamp torques to max
-        joint_torques = np.clip(
-            joint_torques,
-            -self.cfg.max_joint_torque,
-            self.cfg.max_joint_torque,
-        )
+        # Optional: You can clip the joint positions here to self.cfg.joint_limits 
+        # to ensure absolute safety, but MPC usually respects the bounds.
 
-        # Store pending joint efforts for batch application
-        self._pending_joint_efforts[env_idx, :] = torch.tensor(
-            joint_torques, device=self.device, dtype=torch.float32
+        # Store pending joint positions for batch application
+        self._pending_joint_positions[env_idx, :] = torch.tensor(
+            joint_positions, device=self.device, dtype=torch.float32
         )
 
     def _get_observations(self) -> Dict[str, torch.Tensor]:
@@ -746,8 +735,8 @@ class QuadrupedMPCEnv(DirectRLEnv):
             default_joint_pos, default_joint_vel, env_ids=env_ids
         )
 
-        # Reset pending joint efforts
-        self._pending_joint_efforts[env_ids] = 0.0
+        # Reset pending joint positions to default standing pose
+        self._pending_joint_positions[env_ids] = default_joint_pos
 
         # Generate new target positions
         target_range = self.cfg.target_pos_range
