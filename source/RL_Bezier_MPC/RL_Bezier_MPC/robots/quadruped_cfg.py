@@ -213,7 +213,7 @@ ANYMAL_C_CFG = QuadrupedCfg(
     ),
     joints=QuadrupedJointsCfg(
         max_torque=40.0,
-        kp=80.0,
+        kp=90.0,
         kd=2.0,
     ),
     frames=QuadrupedFramesCfg(
