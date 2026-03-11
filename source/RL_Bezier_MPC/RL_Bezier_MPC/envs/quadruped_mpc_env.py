@@ -215,6 +215,10 @@ class QuadrupedMPCEnv(DirectRLEnv):
         self._pending_joint_positions = torch.zeros(
             (self.num_envs, cfg.num_joints), device=self.device, dtype=torch.float32
         )
+        # Pending joint effort buffer
+        self._pending_joint_efforts = torch.zeros(
+            (self.num_envs, cfg.num_joints), device=self.device, dtype=torch.float32
+        )
 
     def _build_joint_mapping(self):
         """Build joint index mapping between Isaac Lab and Pinocchio.
@@ -428,77 +432,97 @@ class QuadrupedMPCEnv(DirectRLEnv):
                         current_foot_positions=foot_positions,
                         gait_params=gait_params,
                         warm_start=True,
-                        # time=current_gait_time, # 如果你之前加了time，记得保留！
                     )
                     self.last_mpc_solutions[env_idx] = solution
+                    print("MPCSolution 拥有的属性:", dir(solution))
+                    # 1. 提取前馈扭矩 (MPC 的核心产出)
+                    joint_torques = solution.control
                     
-                    # === 【关键修改】提取 MPC 预测的下一步关节期望位置 ===
-                    # solution.xs[1] 是预测的下一步状态。
-                    # Pinocchio 状态向量前7位是浮动基座(pos+quat)，第7到19位是 12 个关节位置
-                    if hasattr(solution, 'state_trajectory'):
+                    # 2. 提取/设置目标位置
+                    if hasattr(solution, 'state_trajectory') and len(solution.state_trajectory) > 1:
                         joint_positions = solution.state_trajectory[1][7:19]
+                    elif hasattr(solution, 'xs') and len(solution.xs) > 1:
+                        joint_positions = solution.xs[1][7:19]
                     else:
-                        # 极端兜底：如果啥都没有，就保持原来站立发力
-                        joint_positions = robot_states[env_idx][7:19]
-                    
+                        # 【关键】如果拿不到预测轨迹，千万别用当前状态！
+                        # 应该用纯数学模型里的“标准站立姿态”兜底
+                        # q_ref[7:19] 就是纯正的 Pinocchio 顺序下的默认站立关节角
+                        if hasattr(self._pinocchio_model, 'referenceConfigurations') and "standing" in self._pinocchio_model.referenceConfigurations:
+                            joint_positions = self._pinocchio_model.referenceConfigurations["standing"][7:19]
+                        else:
+                            # 终极硬编码兜底 (Pinocchio顺序: 4条腿的 HAA, HFE, KFE)
+                            joint_positions = np.array([0.1, 0.8, -1.5, -0.1, 0.8, -1.5, 0.1, 0.8, -1.5, -0.1, 0.8, -1.5])
+                            
                     self._last_mpc_costs[env_idx] = solution.cost
                     self._last_mpc_converged[env_idx] = solution.converged
+                    
                 except Exception as e:
                     if env_idx == 0:
                         print(f"Warning: MPC solve failed for env {env_idx}: {e}")
-                    # 如果求解失败，保持当前物理引擎中的关节位置不变（防抽搐）
-                    joint_positions = robot_states[env_idx][7:19]
+                    joint_torques = np.zeros(self.cfg.num_joints)
+                    if hasattr(self._pinocchio_model, 'referenceConfigurations') and "standing" in self._pinocchio_model.referenceConfigurations:
+                        joint_positions = self._pinocchio_model.referenceConfigurations["standing"][7:19]
+                    else:
+                        joint_positions = np.array([0.1, 0.8, -1.5, -0.1, 0.8, -1.5, 0.1, 0.8, -1.5, -0.1, 0.8, -1.5])
+                    
                     self.last_mpc_solutions[env_idx] = None
-                    self._last_mpc_costs[env_idx] = 1e6 # 惩罚失败
+                    self._last_mpc_costs[env_idx] = 1e6
                     self._last_mpc_converged[env_idx] = False
             else:
-                # Dummy mode: keep current state
-                joint_positions = robot_states[env_idx][7:19]
+                # Dummy mode
+                joint_torques = np.zeros(self.cfg.num_joints)
+                joint_positions = np.array([0.1, 0.8, -1.5, -0.1, 0.8, -1.5, 0.1, 0.8, -1.5, -0.1, 0.8, -1.5])
                 self.last_mpc_solutions[env_idx] = None
                 self._last_mpc_costs[env_idx] = 0.0
                 self._last_mpc_converged[env_idx] = False
 
-            # Apply control to robot
-            self._apply_control(env_idx, joint_positions)
+            # Apply control to robot (注意这里要传两个参数了！)
+            self._apply_control(env_idx, joint_positions, joint_torques)
 
     def _apply_action(self):
-        """Apply accumulated joint position targets to the robot."""
-        # === 【关键修改】使用 set_joint_position_target 代替 effort ===
+        """Apply both accumulated joint position targets and feedforward efforts."""
+        # 让 IsaacLab 底层同时接受目标位置和前馈力矩
+        # 物理引擎底层公式：tau_总 = tau_前馈 + Kp*(q_目标 - q) + Kd*(dq_目标 - dq)
         self.robot.set_joint_position_target(self._pending_joint_positions)
+        self.robot.set_joint_effort_target(self._pending_joint_efforts)
 
-    def _apply_control(self, env_idx: int, joint_positions: np.ndarray):
-        """Apply joint position control to Go2 quadruped.
-
-        Maps MPC output (joint positions) to Isaac Lab articulation joint position targets.
-
-        Args:
-            env_idx: Environment index.
-            joint_positions: Joint position vector (12D from MPC or fallback).
-        """
-        # Ensure correct dimension (12 joints for Go2)
+    def _apply_control(self, env_idx: int, joint_positions: np.ndarray, joint_torques: np.ndarray):
+        """Apply joint position and feedforward torque control."""
         num_joints = self.cfg.num_joints
+        
+        # --- 1. 处理位置 ---
         if len(joint_positions) > num_joints:
             joint_positions = joint_positions[:num_joints]
         elif len(joint_positions) < num_joints:
-            padded = np.zeros(num_joints)
-            padded[:len(joint_positions)] = joint_positions
-            joint_positions = padded
+            padded_p = np.zeros(num_joints)
+            padded_p[:len(joint_positions)] = joint_positions
+            joint_positions = padded_p
+            
+        # --- 2. 处理扭矩 ---
+        if len(joint_torques) > num_joints:
+            joint_torques = joint_torques[:num_joints]
+        elif len(joint_torques) < num_joints:
+            padded_t = np.zeros(num_joints)
+            padded_t[:len(joint_torques)] = joint_torques
+            joint_torques = padded_t
 
-        # Reorder positions: Pinocchio joint order → Isaac Lab joint order
+        # --- 3. 顺序重映射 (Pinocchio -> IsaacLab) ---
         if self._pin_to_isaac_joint_idx is not None:
-            reordered = np.zeros(num_joints)
+            reordered_pos = np.zeros(num_joints)
+            reordered_tor = np.zeros(num_joints)
             for pin_idx in range(min(len(joint_positions), 12)):
                 isaac_idx = self._pin_to_isaac_joint_idx[pin_idx]
-                reordered[isaac_idx] = joint_positions[pin_idx]
-            joint_positions = reordered
+                reordered_pos[isaac_idx] = joint_positions[pin_idx]
+                reordered_tor[isaac_idx] = joint_torques[pin_idx]
+            joint_positions = reordered_pos
+            joint_torques = reordered_tor
 
-        # Optional: You can clip the joint positions here to self.cfg.joint_limits 
-        # to ensure absolute safety, but MPC usually respects the bounds.
+        # 限制扭矩最大值
+        joint_torques = np.clip(joint_torques, -self.cfg.max_joint_torque, self.cfg.max_joint_torque)
 
-        # Store pending joint positions for batch application
-        self._pending_joint_positions[env_idx, :] = torch.tensor(
-            joint_positions, device=self.device, dtype=torch.float32
-        )
+        # 写入 Buffer
+        self._pending_joint_positions[env_idx, :] = torch.tensor(joint_positions, device=self.device, dtype=torch.float32)
+        self._pending_joint_efforts[env_idx, :] = torch.tensor(joint_torques, device=self.device, dtype=torch.float32)
 
     def _get_observations(self) -> Dict[str, torch.Tensor]:
         """Compute observations for RL policy.
