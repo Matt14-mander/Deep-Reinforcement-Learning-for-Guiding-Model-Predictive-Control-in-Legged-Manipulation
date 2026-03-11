@@ -264,6 +264,10 @@ class QuadrupedMPCEnvCfg(DirectRLEnvCfg):
     min_body_height_ratio: float = 0.2  # Too low = fallen
     max_body_height_ratio: float = 1.5  # Too high = jumping
 
+    # Grace period: only terminate if body height is too low for this many consecutive steps
+    # Prevents transient dips during normal trot swing from killing the episode
+    min_body_height_consecutive_steps: int = 5
+
     # Orientation limits (degrees from upright)
     max_pitch_deg: float = 45.0
     max_roll_deg: float = 45.0

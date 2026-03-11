@@ -171,6 +171,16 @@ class QuadrupedMPCEnv(DirectRLEnv):
         self._last_mpc_costs = np.zeros(self.num_envs)
         self._last_mpc_converged = np.zeros(self.num_envs, dtype=bool)
 
+        # Z-velocity EMA filter state (one value per env)
+        # Prevents foot-impact spikes and gradual fall speeds from blowing up MPC GRF planning
+        self._z_vel_filtered = np.zeros(self.num_envs)
+
+        # Last-good MPC solution per env (used as fallback when MPC diverges)
+        self._last_good_solutions: list = [None] * self.num_envs
+
+        # Consecutive-step counter for height termination grace period
+        self._too_low_counter = torch.zeros(self.num_envs, dtype=torch.long, device=self.device)
+
         # Action bounds for normalization
         bezier_low, bezier_high = self.trajectory_generator.get_param_bounds()
 
@@ -409,11 +419,15 @@ class QuadrupedMPCEnv(DirectRLEnv):
             if len(com_reference) < self.cfg.mpc_horizon_steps:
                 pad_length = self.cfg.mpc_horizon_steps - len(com_reference)
                 if len(com_reference) > 1:
-                    # 线性外推：算出最后两点的偏移量
-                    step_delta = com_reference[-1] - com_reference[-2]
-                    # 顺延生成新点
+                    # 计算最后两点偏移量；保持 Z 不变 + 匀减速，防止"恒速撞墙"
+                    step_delta = (com_reference[-1] - com_reference[-2]).copy()
+                    step_delta[2] = 0.0  # 禁止外推 Z 轴（防止 MPC 被告知无限上升/下降）
                     last_point = com_reference[-1]
-                    padding_points = np.array([last_point + step_delta * (i + 1) for i in range(pad_length)])
+                    # 匀减速外推：scale 从 1→0，平滑停止而非恒速冲墙
+                    padding_points = np.array([
+                        last_point + step_delta * max(0.0, 1.0 - (i + 1) / pad_length)
+                        for i in range(pad_length)
+                    ])
                 elif len(com_reference) == 1:
                     padding_points = np.repeat(com_reference, pad_length, axis=0)
                 else:
@@ -442,10 +456,34 @@ class QuadrupedMPCEnv(DirectRLEnv):
                         warm_start=True,
                     )
                     self.last_mpc_solutions[env_idx] = solution
-                    
+
+                    # MPC 发散保护：代价爆炸且未收敛时，回退到上一次有效解
+                    # 阈值 5e4：远高于正常收敛代价（数百量级），低于发散代价（百万量级）
+                    _COST_THRESHOLD = 5e4
+                    if not solution.converged and solution.cost > _COST_THRESHOLD:
+                        if self._last_good_solutions[env_idx] is not None:
+                            # 用上一次有效解代替本次失败结果
+                            solution = self._last_good_solutions[env_idx]
+                            if env_idx == 0:
+                                print(f"[MPC Guard] env {env_idx}: cost={self._last_mpc_costs[env_idx]:.0f} → fallback to last-good solution", flush=True)
+                        else:
+                            # 无历史有效解：零前馈 + 站立姿态
+                            joint_torques = np.zeros(self.cfg.num_joints)
+                            if hasattr(self._pinocchio_model, 'referenceConfigurations') and "standing" in self._pinocchio_model.referenceConfigurations:
+                                joint_positions = self._pinocchio_model.referenceConfigurations["standing"][7:19]
+                            else:
+                                joint_positions = np.array([0.1, 0.8, -1.5, -0.1, 0.8, -1.5, 0.1, 0.8, -1.5, -0.1, 0.8, -1.5])
+                            self._last_mpc_costs[env_idx] = solution.cost
+                            self._last_mpc_converged[env_idx] = False
+                            self._apply_control(env_idx, joint_positions, joint_torques)
+                            continue  # 跳过后续正常提取，直接进入下一个 env_idx
+                    else:
+                        # 本次解有效，更新 last_good
+                        self._last_good_solutions[env_idx] = solution
+
                     # 1. 提取前馈扭矩
                     joint_torques = solution.control
-                    
+
                     # 2. 提取预测的目标位置 (重点！)
                     if hasattr(solution, 'predicted_states') and len(solution.predicted_states) > 1:
                         joint_positions = solution.predicted_states[1][7:19]
@@ -455,7 +493,7 @@ class QuadrupedMPCEnv(DirectRLEnv):
                             joint_positions = self._pinocchio_model.referenceConfigurations["standing"][7:19]
                         else:
                             joint_positions = np.array([0.1, 0.8, -1.5, -0.1, 0.8, -1.5, 0.1, 0.8, -1.5, -0.1, 0.8, -1.5])
-                            
+
                     self._last_mpc_costs[env_idx] = solution.cost
                     self._last_mpc_converged[env_idx] = solution.converged
                     
@@ -677,8 +715,12 @@ class QuadrupedMPCEnv(DirectRLEnv):
         terminated = torch.zeros(self.num_envs, dtype=torch.bool, device=self.device)
         truncated = torch.zeros(self.num_envs, dtype=torch.bool, device=self.device)
 
-        # Height check (fallen)
-        too_low = position[:, 2] < self.cfg.min_body_height
+        # Height check with grace period: only terminate after N consecutive steps below threshold
+        # Prevents normal trot-gait body oscillations from prematurely killing the episode
+        currently_low = position[:, 2] < self.cfg.min_body_height
+        self._too_low_counter[currently_low] += 1
+        self._too_low_counter[~currently_low] = 0
+        too_low = self._too_low_counter >= self.cfg.min_body_height_consecutive_steps
         too_high = position[:, 2] > self.cfg.max_body_height
 
         # Orientation check (flipped)
@@ -803,6 +845,11 @@ class QuadrupedMPCEnv(DirectRLEnv):
             if self.mpc_controllers[env_idx] is not None:
                 self.mpc_controllers[env_idx].reset()
 
+            # Reset per-env smoothing and fallback state
+            self._z_vel_filtered[env_idx] = 0.0
+            self._last_good_solutions[env_idx] = None
+            self._too_low_counter[env_idx] = 0
+
             # Reset stored params
             self.prev_bezier_params[env_idx] = initial_params
             self.prev_gait_mods[env_idx] = np.ones(self.cfg.num_gait_mod_actions)
@@ -909,8 +956,11 @@ class QuadrupedMPCEnv(DirectRLEnv):
         # Root velocity in BODY frame
         root_lin_vel_b = robot_data.root_lin_vel_b.cpu().numpy()
         
-        # 加入 Z 轴速度钳制，防止下落速度导致扭矩爆炸
-        root_lin_vel_b[:, 2] = np.clip(root_lin_vel_b[:, 2], -0.2, 0.2)
+        # Z 轴速度：EMA 低通滤波 + 收紧钳位，防止足端冲击脉冲和下落速度引爆 MPC 代价
+        # alpha=0.3：新值权重；0.7 保留历史，有效抑制单帧尖峰
+        _alpha = 0.3
+        self._z_vel_filtered = _alpha * root_lin_vel_b[:, 2] + (1.0 - _alpha) * self._z_vel_filtered
+        root_lin_vel_b[:, 2] = np.clip(self._z_vel_filtered, -0.15, 0.15)
         
         states[:, nq:nq + 3] = root_lin_vel_b
 
