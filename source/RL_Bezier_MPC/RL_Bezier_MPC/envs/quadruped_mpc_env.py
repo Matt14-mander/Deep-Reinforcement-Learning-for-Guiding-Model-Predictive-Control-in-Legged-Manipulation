@@ -321,9 +321,16 @@ class QuadrupedMPCEnv(DirectRLEnv):
         """Set up the simulation scene with Go2 quadruped and ground plane."""
         from isaaclab_assets.robots.unitree import UNITREE_GO2_CFG
 
+        physics_material = sim_utils.RigidBodyMaterialCfg(
+            static_friction=1.5,   
+            dynamic_friction=1.5,
+            restitution=0.0        
+        )
+
         # Spawn ground plane
         ground_cfg = sim_utils.GroundPlaneCfg(
             size=(100.0, 100.0),
+            physics_material=physics_material
         )
         ground_cfg.func("/World/ground", ground_cfg)
 
