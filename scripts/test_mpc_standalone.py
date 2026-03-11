@@ -290,7 +290,7 @@ def main():
     # Create environment configuration
     env_cfg = QuadrupedMPCEnvCfg()
     env_cfg.scene.num_envs = args_cli.num_envs
-    env_cfg.fix_gait_params = True  # Fixed gait for diagnostic
+    env_cfg.fix_gait_params = False  # Fixed gait for diagnostic
     env_cfg.mpc_verbose = True  # Enable verbose MPC debugging (first 5 solves)
 
     # Force target to be straight ahead (simple test)

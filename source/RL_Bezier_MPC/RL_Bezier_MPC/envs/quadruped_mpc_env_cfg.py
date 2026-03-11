@@ -210,7 +210,7 @@ class QuadrupedMPCEnvCfg(DirectRLEnvCfg):
     initial_pos_range: tuple = (
         -0.2, 0.2,  # x_min, x_max
         -0.2, 0.2,  # y_min, y_max
-        0.40, 0.50,  # z_min, z_max (near standing height)
+        0.35, 0.38,  # z_min, z_max (near standing height)
     )
 
     # Initial orientation randomization (yaw only)

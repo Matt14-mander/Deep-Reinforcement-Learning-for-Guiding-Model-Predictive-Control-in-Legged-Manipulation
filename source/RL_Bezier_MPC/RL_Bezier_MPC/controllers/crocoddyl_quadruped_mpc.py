@@ -253,7 +253,7 @@ class CrocoddylQuadrupedMPC(BaseMPC):
         # foot_track cost explosion when feet are above ground at initialization)
         if current_foot_positions:
             ground_z = min(pos[2] for pos in current_foot_positions.values())
-            self.foothold_planner.default_ground_height = ground_z
+            self.foothold_planner.default_ground_height = 0.02
 
         # Plan footholds
         step_height = self.step_height * step_height_mod

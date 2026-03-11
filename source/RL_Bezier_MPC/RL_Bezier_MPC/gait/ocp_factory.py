@@ -421,7 +421,7 @@ class OCPFactory:
                 0,  # nu=0 for impulse
             )
             velocity_cost = crocoddyl.CostModelResidual(self.state, velocity_residual)
-            cost_model.addCost(f"impactVel_{foot_id}", velocity_cost, 1e4)
+            cost_model.addCost(f"impactVel_{foot_id}", velocity_cost, 1e2)
 
         # State regularization
         state_residual = crocoddyl.ResidualModelState(self.state, self.x0, 0)
