@@ -142,6 +142,7 @@ class CrocoddylQuadrupedMPC(BaseMPC):
         self.foothold_planner = FootholdPlanner(
             hip_offsets=hip_offsets,
             step_height=step_height,
+            default_ground_height=0.02,  # foot sphere radius; updated dynamically in solve()
         )
         self.foot_trajectory_gen = BezierFootTrajectory(step_height=step_height)
         self.ocp_factory = OCPFactory(
@@ -247,6 +248,12 @@ class CrocoddylQuadrupedMPC(BaseMPC):
 
         # Compute heading trajectory from CoM reference tangent
         heading_trajectory = self._compute_heading_trajectory(com_reference, self.dt)
+
+        # Update ground height estimate from current foot positions (Fix: eliminates
+        # foot_track cost explosion when feet are above ground at initialization)
+        if current_foot_positions:
+            ground_z = min(pos[2] for pos in current_foot_positions.values())
+            self.foothold_planner.default_ground_height = ground_z
 
         # Plan footholds
         step_height = self.step_height * step_height_mod

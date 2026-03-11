@@ -73,7 +73,7 @@ class OCPFactory:
         "foot_track": 1e4,
         "state_reg": 1e1,
         "ctrl_reg": 1e0,           # Increased: reduce aggressive torques in turns
-        "friction_cone": 1e3,      # Increased from 1e1: must dominate to prevent
+        "friction_cone": 1e4,      # Increased from 1e1: must dominate to prevent
                                     # downward GRF, especially on hind feet during curves
         "state_bounds": 1e3,
         "orientation_track": 1e3,  # Reduced from 1e4: avoid conflict with friction cone

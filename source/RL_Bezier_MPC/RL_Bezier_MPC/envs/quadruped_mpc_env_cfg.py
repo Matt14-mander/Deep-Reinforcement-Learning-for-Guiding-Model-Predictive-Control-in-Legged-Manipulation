@@ -162,8 +162,8 @@ class QuadrupedMPCEnvCfg(DirectRLEnvCfg):
     gait_type: str = "trot"
 
     # Gait timing defaults
-    default_step_duration: float = 0.15  # seconds per swing phase
-    default_support_duration: float = 0.05  # double support duration
+    default_step_duration: float = 0.25  # seconds per swing phase
+    default_support_duration: float = 0.10  # double support duration
     default_step_height: float = 0.15  # meters
 
     # Gait modulation bounds (multipliers around 1.0)
