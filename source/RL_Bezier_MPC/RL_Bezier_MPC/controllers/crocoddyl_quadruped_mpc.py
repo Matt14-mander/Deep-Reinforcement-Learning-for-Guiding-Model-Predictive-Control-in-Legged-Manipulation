@@ -309,21 +309,27 @@ class CrocoddylQuadrupedMPC(BaseMPC):
                 print(f"  Cold-start: gravity compensation |u|={np.linalg.norm(u_grav):.3f}", flush=True)
                 print(f"  u_grav: [{', '.join(f'{v:.2f}' for v in u_grav)}]", flush=True)
 
-        # Rollout us_init from x0 to get dynamically feasible xs (ffeas=0).
+        # Rollout us_init from x0 to get dynamically feasible xs (ffeas≈0).
         # This is critical: shifted xs from a non-converged solve have ffeas≈18,
         # which makes FDDP's backward pass ill-conditioned (preg→1e7+, diverges).
-        # Rollout re-integrates the dynamics with us_init, guaranteeing ffeas=0
+        # Rollout re-integrates the dynamics with us_init, guaranteeing ffeas≈0
         # so FDDP starts with a well-conditioned backward pass every call.
         xs_init = list(problem.rollout(us_init))
-        solver.setCandidate(xs_init, us_init, True)  # True = isFeasible after rollout
+        # IMPORTANT: use isFeasible=False in both setCandidate and solve().
+        # Passing isFeasible=True to solve() with empty init lists ([], []) causes
+        # Crocoddyl to silently ignore setCandidate and re-initialize from x0 with
+        # u=0 (trivially feasible zeros), discarding the warm-start entirely.
+        # With isFeasible=False, FDDP computes gaps from xs (≈0 after rollout),
+        # which correctly benefits from the warm-start.
+        solver.setCandidate(xs_init, us_init, False)
 
         # Solve.
         # regInit=1e-9: provide a small non-zero initial regularization so
         # FDDP's backward pass stays well-conditioned on the contact Hessian.
         converged = solver.solve(
-            [], [],  # Initial guess (use candidate if set)
+            [], [],  # Initial guess (use candidate set above via setCandidate)
             self.max_iterations,
-            True,   # isFeasible=True (we ensured this via rollout above)
+            False,  # isFeasible=False: FDDP computes gaps (≈0 since xs=rollout)
             1e-9,   # regInit: small initial regularization for numerical stability
         )
 
