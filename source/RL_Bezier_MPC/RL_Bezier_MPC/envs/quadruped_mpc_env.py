@@ -435,7 +435,14 @@ class QuadrupedMPCEnv(DirectRLEnv):
                     # === 【关键修改】提取 MPC 预测的下一步关节期望位置 ===
                     # solution.xs[1] 是预测的下一步状态。
                     # Pinocchio 状态向量前7位是浮动基座(pos+quat)，第7到19位是 12 个关节位置
-                    joint_positions = solution.xs[1][7:19] 
+                    raw_solver = self.mpc_controllers[env_idx].solver
+                    
+                    # 确保 solver 里面至少有 2 个状态节点（当前状态 xs[0] 和下一步状态 xs[1]）
+                    if len(raw_solver.xs) > 1:
+                        joint_positions = raw_solver.xs[1][7:19]
+                    else:
+                        # 如果没有下一步，就用当前状态兜底
+                        joint_positions = raw_solver.xs[0][7:19]
                     
                     self._last_mpc_costs[env_idx] = solution.cost
                     self._last_mpc_converged[env_idx] = solution.converged
