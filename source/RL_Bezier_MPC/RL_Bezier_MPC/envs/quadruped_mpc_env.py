@@ -434,23 +434,20 @@ class QuadrupedMPCEnv(DirectRLEnv):
                         warm_start=True,
                     )
                     self.last_mpc_solutions[env_idx] = solution
-                    print("MPCSolution 拥有的属性:", dir(solution))
-                    # 1. 提取前馈扭矩 (MPC 的核心产出)
+                    
+                    # 1. 提取前馈扭矩 (用作前馈补偿)
                     joint_torques = solution.control
                     
-                    # 2. 提取/设置目标位置
-                    if hasattr(solution, 'state_trajectory') and len(solution.state_trajectory) > 1:
-                        joint_positions = solution.state_trajectory[1][7:19]
-                    elif hasattr(solution, 'xs') and len(solution.xs) > 1:
-                        joint_positions = solution.xs[1][7:19]
+                    # 2. 提取预测的下一步关节目标位置 (用作 PD 控制器的弹簧锚点)
+                    # === 盲盒破解：使用 predicted_states ===
+                    if hasattr(solution, 'predicted_states') and len(solution.predicted_states) > 1:
+                        # [7:19] 是剔除了浮动基座(3位置+4四元数)后的12个关节位置
+                        joint_positions = solution.predicted_states[1][7:19]
                     else:
-                        # 【关键】如果拿不到预测轨迹，千万别用当前状态！
-                        # 应该用纯数学模型里的“标准站立姿态”兜底
-                        # q_ref[7:19] 就是纯正的 Pinocchio 顺序下的默认站立关节角
+                        # 安全兜底：如果没拿到，用站立姿态，千万别用当前状态！
                         if hasattr(self._pinocchio_model, 'referenceConfigurations') and "standing" in self._pinocchio_model.referenceConfigurations:
                             joint_positions = self._pinocchio_model.referenceConfigurations["standing"][7:19]
                         else:
-                            # 终极硬编码兜底 (Pinocchio顺序: 4条腿的 HAA, HFE, KFE)
                             joint_positions = np.array([0.1, 0.8, -1.5, -0.1, 0.8, -1.5, 0.1, 0.8, -1.5, -0.1, 0.8, -1.5])
                             
                     self._last_mpc_costs[env_idx] = solution.cost
@@ -476,7 +473,7 @@ class QuadrupedMPCEnv(DirectRLEnv):
                 self._last_mpc_costs[env_idx] = 0.0
                 self._last_mpc_converged[env_idx] = False
 
-            # Apply control to robot (注意这里要传两个参数了！)
+            # Apply control to robot (同时下发位置和扭矩)
             self._apply_control(env_idx, joint_positions, joint_torques)
 
     def _apply_action(self):
