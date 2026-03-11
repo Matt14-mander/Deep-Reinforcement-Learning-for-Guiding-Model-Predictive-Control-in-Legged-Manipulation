@@ -69,14 +69,14 @@ class OCPFactory:
 
     # Default cost weights (from Crocoddyl demo)
     DEFAULT_WEIGHTS = {
-        "com_track": 1e2,
+        "com_track": 1e1,
         "foot_track": 1e2,
-        "state_reg": 1e1,
+        "state_reg": 1e0,
         "ctrl_reg": 1e-2,           # Increased: reduce aggressive torques in turns
         "friction_cone": 1e3,      # Increased from 1e1: must dominate to prevent
                                     # downward GRF, especially on hind feet during curves
-        "state_bounds": 1e3,
-        "orientation_track": 1e2,  # Reduced from 1e4: avoid conflict with friction cone
+        "state_bounds": 1e2,
+        "orientation_track": 1e1,  # Reduced from 1e4: avoid conflict with friction cone
                                     # during curve walking (yaw tracking less critical
                                     # than physical constraint satisfaction)
     }

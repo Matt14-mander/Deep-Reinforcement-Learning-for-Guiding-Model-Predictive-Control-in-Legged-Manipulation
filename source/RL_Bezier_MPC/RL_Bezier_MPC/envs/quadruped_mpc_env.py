@@ -435,16 +435,14 @@ class QuadrupedMPCEnv(DirectRLEnv):
                     )
                     self.last_mpc_solutions[env_idx] = solution
                     
-                    # 1. 提取前馈扭矩 (用作前馈补偿)
+                    # 1. 提取前馈扭矩
                     joint_torques = solution.control
                     
-                    # 2. 提取预测的下一步关节目标位置 (用作 PD 控制器的弹簧锚点)
-                    # === 盲盒破解：使用 predicted_states ===
+                    # 2. 提取预测的目标位置 (重点！)
                     if hasattr(solution, 'predicted_states') and len(solution.predicted_states) > 1:
-                        # [7:19] 是剔除了浮动基座(3位置+4四元数)后的12个关节位置
                         joint_positions = solution.predicted_states[1][7:19]
                     else:
-                        # 安全兜底：如果没拿到，用站立姿态，千万别用当前状态！
+                        # 兜底：站立姿态
                         if hasattr(self._pinocchio_model, 'referenceConfigurations') and "standing" in self._pinocchio_model.referenceConfigurations:
                             joint_positions = self._pinocchio_model.referenceConfigurations["standing"][7:19]
                         else:
@@ -473,7 +471,7 @@ class QuadrupedMPCEnv(DirectRLEnv):
                 self._last_mpc_costs[env_idx] = 0.0
                 self._last_mpc_converged[env_idx] = False
 
-            # Apply control to robot (同时下发位置和扭矩)
+            # === 务必确认同时应用了位置和扭矩！===
             self._apply_control(env_idx, joint_positions, joint_torques)
 
     def _apply_action(self):
@@ -900,28 +898,18 @@ class QuadrupedMPCEnv(DirectRLEnv):
         # base expressed in the LOCAL (body) frame, NOT the world frame.
         # Isaac Lab provides both world-frame and body-frame velocities.
         # Root velocity in BODY frame (Pinocchio convention for FreeFlyer joint)
+        # Root velocity in BODY frame
         root_lin_vel_b = robot_data.root_lin_vel_b.cpu().numpy()
         
-        # === 【核心修复】Z 轴速度钳制 (Z-Velocity Clamping) ===
-        # 物理引擎在脚触地瞬间会产生极大的 Z 轴速度震荡
-        # 我们强制将传入 MPC 的 Z 轴速度限制在一个非常安全的范围内
-        # 甚至在初期测试时，可以直接将其阻尼掉 (乘以 0.1) 或者归零
-        # 这样 MPC 就不会因为瞬间的下落速度而算出狂暴的力矩
-        z_vel_limit = 0.1 # 允许的最大 Z 轴速度 (m/s)
-        root_lin_vel_b[:, 2] = np.clip(root_lin_vel_b[:, 2], -z_vel_limit, z_vel_limit)
-        
-        # 你甚至可以尝试直接把 Z 速度置零进行终极排错：
-        # root_lin_vel_b[:, 2] = 0.0
-        # ========================================================
+        # 加入 Z 轴速度钳制，防止下落速度导致扭矩爆炸
+        root_lin_vel_b[:, 2] = np.clip(root_lin_vel_b[:, 2], -0.2, 0.2)
         
         states[:, nq:nq + 3] = root_lin_vel_b
 
         root_ang_vel_b = robot_data.root_ang_vel_b.cpu().numpy()
         
-        # === 【附加修复】角速度也进行适当钳制防爆 ===
-        ang_vel_limit = 1.0 # rad/s
-        root_ang_vel_b = np.clip(root_ang_vel_b, -ang_vel_limit, ang_vel_limit)
-        # ========================================================
+        # 加入角速度钳制
+        root_ang_vel_b = np.clip(root_ang_vel_b, -1.0, 1.0)
         
         states[:, nq + 3:nq + 6] = root_ang_vel_b
 
