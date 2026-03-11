@@ -296,32 +296,33 @@ class CrocoddylQuadrupedMPC(BaseMPC):
                     print(f"  Foot {fname}: [{fpos[0]:.3f}, {fpos[1]:.3f}, {fpos[2]:.3f}]", flush=True)
             sys.stdout.flush()
 
-        # Build initial control guess: shift previous controls or use gravity comp.
-        if warm_start and self._prev_us is not None:
+        # Warm-start: shift previous solution, OR cold-start with gravity comp + rollout.
+        #
+        # CRITICAL FINDING: calling problem.rollout(us_init) BEFORE setCandidate corrupts
+        # Crocoddyl's running model contact-Jacobian cache. When FDDP then calls calcDiff
+        # internally, it gets different dynamics → ffeas≈21 even though rollout gave 0.
+        # Therefore: use rollout ONLY for cold-start (fresh problem, no stale cache).
+        # For warm-start, use shift_trajectory + shift_controls (original approach),
+        # which keeps ffeas low for stand mode and acceptable for walk mode.
+        if warm_start and self._prev_xs is not None and self._prev_us is not None:
+            # Shift previous solution by one step (xs stays near current state)
+            xs_init = self._shift_trajectory(self._prev_xs, current_state)
             us_init = self._shift_controls(self._prev_us)
+            xs_init = self._adjust_length(xs_init, T + 1, current_state)
             us_init = self._adjust_length(us_init, T, np.zeros(self.actuation.nu))
+            solver.setCandidate(xs_init, us_init, False)
             if is_verbose_call:
-                print(f"  Warm-start: YES (shifted prev controls)", flush=True)
+                print(f"  Warm-start: YES (shifted prev solution)", flush=True)
         else:
+            # Cold-start: gravity comp controls, rollout to get near-feasible xs.
+            # Rollout is safe here (fresh problem, no cached contact state to corrupt).
             u_grav = self._compute_gravity_compensation(current_state)
             us_init = [u_grav.copy() for _ in range(T)]
+            xs_init = list(problem.rollout(us_init))
+            solver.setCandidate(xs_init, us_init, False)
             if is_verbose_call:
                 print(f"  Cold-start: gravity compensation |u|={np.linalg.norm(u_grav):.3f}", flush=True)
                 print(f"  u_grav: [{', '.join(f'{v:.2f}' for v in u_grav)}]", flush=True)
-
-        # Rollout us_init from x0 to get dynamically feasible xs (ffeas≈0).
-        # This is critical: shifted xs from a non-converged solve have ffeas≈18,
-        # which makes FDDP's backward pass ill-conditioned (preg→1e7+, diverges).
-        # Rollout re-integrates the dynamics with us_init, guaranteeing ffeas≈0
-        # so FDDP starts with a well-conditioned backward pass every call.
-        xs_init = list(problem.rollout(us_init))
-        # IMPORTANT: use isFeasible=False in both setCandidate and solve().
-        # Passing isFeasible=True to solve() with empty init lists ([], []) causes
-        # Crocoddyl to silently ignore setCandidate and re-initialize from x0 with
-        # u=0 (trivially feasible zeros), discarding the warm-start entirely.
-        # With isFeasible=False, FDDP computes gaps from xs (≈0 after rollout),
-        # which correctly benefits from the warm-start.
-        solver.setCandidate(xs_init, us_init, False)
 
         # Solve.
         # regInit=1e-9: provide a small non-zero initial regularization so
@@ -329,7 +330,7 @@ class CrocoddylQuadrupedMPC(BaseMPC):
         converged = solver.solve(
             [], [],  # Initial guess (use candidate set above via setCandidate)
             self.max_iterations,
-            False,  # isFeasible=False: FDDP computes gaps (≈0 since xs=rollout)
+            False,  # isFeasible=False: FDDP computes and handles gaps normally
             1e-9,   # regInit: small initial regularization for numerical stability
         )
 
