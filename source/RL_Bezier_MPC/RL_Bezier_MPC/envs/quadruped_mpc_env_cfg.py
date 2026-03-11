@@ -142,7 +142,7 @@ class QuadrupedMPCEnvCfg(DirectRLEnvCfg):
     # ==========================================================================
 
     # Bezier trajectory duration
-    bezier_horizon: float = 1.5  # seconds
+    bezier_horizon: float = 3.0  # seconds
 
     # RL policy update period (in MPC steps)
     # 10 MPC steps @ 50Hz = 5 Hz policy rate (slower for quadruped)

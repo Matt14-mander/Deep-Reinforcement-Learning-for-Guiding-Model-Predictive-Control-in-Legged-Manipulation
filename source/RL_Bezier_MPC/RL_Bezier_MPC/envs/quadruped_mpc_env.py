@@ -405,14 +405,22 @@ class QuadrupedMPCEnv(DirectRLEnv):
             com_reference = self.current_com_trajectories[env_idx, phase:end_phase]
 
             # Pad if necessary
+            # Pad if necessary
             if len(com_reference) < self.cfg.mpc_horizon_steps:
                 pad_length = self.cfg.mpc_horizon_steps - len(com_reference)
-                last_point = com_reference[-1:] if len(com_reference) > 0 else np.zeros((1, 3))
-                com_reference = np.concatenate([
-                    com_reference,
-                    np.repeat(last_point, pad_length, axis=0)
-                ], axis=0)
-
+                if len(com_reference) > 1:
+                    # 线性外推：算出最后两点的偏移量
+                    step_delta = com_reference[-1] - com_reference[-2]
+                    # 顺延生成新点
+                    last_point = com_reference[-1]
+                    padding_points = np.array([last_point + step_delta * (i + 1) for i in range(pad_length)])
+                elif len(com_reference) == 1:
+                    padding_points = np.repeat(com_reference, pad_length, axis=0)
+                else:
+                    padding_points = np.zeros((pad_length, 3))
+                
+                com_reference = np.concatenate([com_reference, padding_points], axis=0)
+                
             # Parse gait modulation parameters
             gait_params = {
                 "step_length": gait_mods[env_idx, 0],
