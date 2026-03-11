@@ -317,6 +317,14 @@ class QuadrupedMPCEnv(DirectRLEnv):
         robot_cfg = UNITREE_GO2_CFG.replace(
             prim_path="/World/envs/env_.*/Robot",
         )
+
+        if "base_legs" in robot_cfg.actuators:
+            robot_cfg.actuators["base_legs"].stiffness = 0.0
+            robot_cfg.actuators["base_legs"].damping = 0.0
+        elif "legs" in robot_cfg.actuators:
+            robot_cfg.actuators["legs"].stiffness = 0.0
+            robot_cfg.actuators["legs"].damping = 0.0
+            
         self.robot = Articulation(robot_cfg)
 
         # Add lights
