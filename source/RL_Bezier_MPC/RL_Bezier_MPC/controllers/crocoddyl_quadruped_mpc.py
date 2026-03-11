@@ -169,10 +169,6 @@ class CrocoddylQuadrupedMPC(BaseMPC):
         # never reaches the swing phases — the "Groundhog Day" bug.
         self._gait_clock: float = 0.0
 
-        # Track whether the previous solve converged. Only use shifted warm-start
-        # when the previous solution was valid; otherwise fall back to gravity comp.
-        # Using a diverged warm-start inflates ffeas, causing FDDP to diverge further.
-        self._prev_converged: bool = False
 
     def solve(
         self,
@@ -300,42 +296,34 @@ class CrocoddylQuadrupedMPC(BaseMPC):
                     print(f"  Foot {fname}: [{fpos[0]:.3f}, {fpos[1]:.3f}, {fpos[2]:.3f}]", flush=True)
             sys.stdout.flush()
 
-        # Warm-start only when the previous solve actually converged.
-        # A diverged warm-start yields large infeasibility (ffeas≈18) which makes
-        # FDDP's backward pass ill-conditioned and escalates preg/dreg to 1e7+.
-        if warm_start and self._prev_xs is not None and self._prev_us is not None and self._prev_converged:
-            # Shift previous solution by one step
-            xs_init = self._shift_trajectory(self._prev_xs, current_state)
+        # Build initial control guess: shift previous controls or use gravity comp.
+        if warm_start and self._prev_us is not None:
             us_init = self._shift_controls(self._prev_us)
-
-            # Ensure correct lengths
-            xs_init = self._adjust_length(xs_init, T + 1, current_state)
             us_init = self._adjust_length(us_init, T, np.zeros(self.actuation.nu))
-
-            solver.setCandidate(xs_init, us_init, False)
             if is_verbose_call:
-                print(f"  Warm-start: YES (shifted prev solution)", flush=True)
+                print(f"  Warm-start: YES (shifted prev controls)", flush=True)
         else:
-            # COLD START: Use gravity compensation as initial control guess
-            # Without this, the solver starts from zero controls (= robot falls)
-            # which is a terrible initial trajectory for FDDP to recover from.
             u_grav = self._compute_gravity_compensation(current_state)
-            xs_init = [current_state.copy() for _ in range(T + 1)]
             us_init = [u_grav.copy() for _ in range(T)]
-            solver.setCandidate(xs_init, us_init, False)
             if is_verbose_call:
                 print(f"  Cold-start: gravity compensation |u|={np.linalg.norm(u_grav):.3f}", flush=True)
                 print(f"  u_grav: [{', '.join(f'{v:.2f}' for v in u_grav)}]", flush=True)
 
+        # Rollout us_init from x0 to get dynamically feasible xs (ffeas=0).
+        # This is critical: shifted xs from a non-converged solve have ffeas≈18,
+        # which makes FDDP's backward pass ill-conditioned (preg→1e7+, diverges).
+        # Rollout re-integrates the dynamics with us_init, guaranteeing ffeas=0
+        # so FDDP starts with a well-conditioned backward pass every call.
+        xs_init = list(problem.rollout(us_init))
+        solver.setCandidate(xs_init, us_init, True)  # True = isFeasible after rollout
+
         # Solve.
         # regInit=1e-9: provide a small non-zero initial regularization so
         # FDDP's backward pass stays well-conditioned on the contact Hessian.
-        # With regInit=0 the solver may stall because preg/dreg never increase
-        # when the descent direction is poor but the Hessian is nominally PD.
         converged = solver.solve(
             [], [],  # Initial guess (use candidate if set)
             self.max_iterations,
-            False,  # isFeasible (warm-start trajectory is NOT dynamically feasible)
+            True,   # isFeasible=True (we ensured this via rollout above)
             1e-9,   # regInit: small initial regularization for numerical stability
         )
 
@@ -354,10 +342,9 @@ class CrocoddylQuadrupedMPC(BaseMPC):
         xs = list(solver.xs)
         us = list(solver.us)
 
-        # Store for warm-start (only reuse on next call if this solve converged)
+        # Store controls for next warm-start (always reuse, rollout ensures feasibility)
         self._prev_xs = xs
         self._prev_us = us
-        self._prev_converged = bool(converged)
 
         # Advance the gait phase clock so the next solve starts from the correct
         # position in the gait cycle (fixes the "Groundhog Day" bug).
@@ -587,7 +574,6 @@ class CrocoddylQuadrupedMPC(BaseMPC):
         self._solver = None
         self._cached_contact_sequence = None
         self._gait_clock = 0.0
-        self._prev_converged = False
 
     def set_gait_type(self, gait_type: str):
         """Change the gait type.
