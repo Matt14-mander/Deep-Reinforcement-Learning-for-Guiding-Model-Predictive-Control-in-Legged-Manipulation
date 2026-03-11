@@ -473,7 +473,7 @@ class OCPFactory:
                 self.state, com_target, self.nu
             )
             com_cost = crocoddyl.CostModelResidual(self.state, com_residual)
-            cost_model.addCost("comTrack", com_cost, self.weights["com_track"] * 10)
+            cost_model.addCost("comTrack", com_cost, self.weights["com_track"] * 3)
 
         # State regularization (heavier for terminal)
         state_activation = crocoddyl.ActivationModelWeightedQuad(self.state_weights)
@@ -481,7 +481,7 @@ class OCPFactory:
         state_cost = crocoddyl.CostModelResidual(
             self.state, state_activation, state_residual
         )
-        cost_model.addCost("stateReg", state_cost, self.weights["state_reg"] * 10)
+        cost_model.addCost("stateReg", state_cost, self.weights["state_reg"] * 3)
 
         # Velocity damping (want zero velocity at terminal)
         # ResidualModelState outputs in tangent space (ndx = 2*nv)
@@ -540,6 +540,7 @@ class OCPFactory:
         foot_trajectories: Dict[str, List[FootholdPlan]],
         dt: float,
         heading_trajectory: Optional[np.ndarray] = None,
+        max_nodes: Optional[int] = None,
     ) -> "crocoddyl.ShootingProblem":
         """Assemble a complete ShootingProblem from all components.
 
@@ -560,6 +561,9 @@ class OCPFactory:
             foot_trajectories: Dict from FootholdPlanner.
             dt: OCP timestep in seconds.
             heading_trajectory: Target yaw angles, shape (T,). Optional.
+            max_nodes: If set, cap the number of running nodes at this value.
+                Prevents OCP overflow when contact_sequence generates more nodes
+                than the intended horizon length (e.g. due to extra gait cycles).
 
         Returns:
             Crocoddyl ShootingProblem ready for solving.
@@ -571,7 +575,11 @@ class OCPFactory:
         foot_swing_indices = {foot: 0 for foot in self.foot_frame_ids.keys()}
 
         # Iterate through contact sequence phases
+        done = False
         for phase_idx, phase in enumerate(contact_sequence.phases):
+            if done:
+                break
+
             # Discretize phase into knots
             num_knots = max(1, round(phase.duration / dt))
 
@@ -583,6 +591,11 @@ class OCPFactory:
             ]
 
             for knot in range(num_knots):
+                # Enforce node cap: stop adding running models once limit is reached
+                if max_nodes is not None and knot_index >= max_nodes:
+                    done = True
+                    break
+
                 # Get CoM target at this timestep
                 traj_idx = min(knot_index, len(com_trajectory) - 1)
                 com_target = com_trajectory[traj_idx]
@@ -628,14 +641,17 @@ class OCPFactory:
                 knot_index += 1
 
             # After each swing phase, increment the swing index for those feet
-            if phase.phase_type == "swing":
+            if phase.phase_type == "swing" and not done:
                 for foot_name in phase.swing_feet:
                     if foot_name in foot_swing_indices:
                         foot_swing_indices[foot_name] += 1
 
-        # Build terminal model
-        terminal_com = com_trajectory[-1] if len(com_trajectory) > 0 else None
-        terminal_yaw = heading_trajectory[-1] if heading_trajectory is not None else None
+        # Terminal target: the waypoint at the end of the actual OCP horizon.
+        # Using the index of the last running node ensures the terminal cost
+        # targets a reachable position rather than an arbitrary trajectory endpoint.
+        terminal_idx = min(knot_index, len(com_trajectory) - 1)
+        terminal_com = com_trajectory[terminal_idx] if len(com_trajectory) > 0 else None
+        terminal_yaw = heading_trajectory[terminal_idx] if heading_trajectory is not None else None
 
         terminal_model = self.build_terminal_node(
             com_target=terminal_com,

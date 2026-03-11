@@ -169,6 +169,11 @@ class CrocoddylQuadrupedMPC(BaseMPC):
         # never reaches the swing phases — the "Groundhog Day" bug.
         self._gait_clock: float = 0.0
 
+        # Track whether the previous solve converged. Only use shifted warm-start
+        # when the previous solution was valid; otherwise fall back to gravity comp.
+        # Using a diverged warm-start inflates ffeas, causing FDDP to diverge further.
+        self._prev_converged: bool = False
+
     def solve(
         self,
         current_state: np.ndarray,
@@ -257,7 +262,7 @@ class CrocoddylQuadrupedMPC(BaseMPC):
             step_height=step_height,
         )
 
-        # Build OCP
+        # Build OCP (cap at horizon_steps to prevent node overflow from long contact sequences)
         problem = self.ocp_factory.build_problem(
             x0=current_state,
             contact_sequence=contact_sequence,
@@ -265,6 +270,7 @@ class CrocoddylQuadrupedMPC(BaseMPC):
             foot_trajectories=foothold_plans,
             dt=self.dt,
             heading_trajectory=heading_trajectory,
+            max_nodes=self.horizon_steps,
         )
 
         # Create solver
@@ -294,8 +300,10 @@ class CrocoddylQuadrupedMPC(BaseMPC):
                     print(f"  Foot {fname}: [{fpos[0]:.3f}, {fpos[1]:.3f}, {fpos[2]:.3f}]", flush=True)
             sys.stdout.flush()
 
-        # Warm-start or gravity-compensation cold-start
-        if warm_start and self._prev_xs is not None and self._prev_us is not None:
+        # Warm-start only when the previous solve actually converged.
+        # A diverged warm-start yields large infeasibility (ffeas≈18) which makes
+        # FDDP's backward pass ill-conditioned and escalates preg/dreg to 1e7+.
+        if warm_start and self._prev_xs is not None and self._prev_us is not None and self._prev_converged:
             # Shift previous solution by one step
             xs_init = self._shift_trajectory(self._prev_xs, current_state)
             us_init = self._shift_controls(self._prev_us)
@@ -346,9 +354,10 @@ class CrocoddylQuadrupedMPC(BaseMPC):
         xs = list(solver.xs)
         us = list(solver.us)
 
-        # Store for warm-start
+        # Store for warm-start (only reuse on next call if this solve converged)
         self._prev_xs = xs
         self._prev_us = us
+        self._prev_converged = bool(converged)
 
         # Advance the gait phase clock so the next solve starts from the correct
         # position in the gait cycle (fixes the "Groundhog Day" bug).
@@ -578,6 +587,7 @@ class CrocoddylQuadrupedMPC(BaseMPC):
         self._solver = None
         self._cached_contact_sequence = None
         self._gait_clock = 0.0
+        self._prev_converged = False
 
     def set_gait_type(self, gait_type: str):
         """Change the gait type.
