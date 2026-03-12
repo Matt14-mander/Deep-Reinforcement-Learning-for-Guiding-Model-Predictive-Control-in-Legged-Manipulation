@@ -321,16 +321,23 @@ class QuadrupedMPCEnv(DirectRLEnv):
         """Set up the simulation scene with Go2 quadruped and ground plane."""
         from isaaclab_assets.robots.unitree import UNITREE_GO2_CFG
 
+        # High-friction ground material (SESSION 7 fix).
+        # Default IsaacLab ground has friction ≈ 0.5–1.0, which allows foot slip.
+        # Foot slip at 50 Hz MPC causes large lateral velocity errors in the robot state
+        # that are fed back into the OCP, destabilizing Crocoddyl's contact model and
+        # causing MPC cost to spike (→ divergence).  Setting static and dynamic friction
+        # to 1.5 eliminates foot slip during stance, keeping the OCP cost well-conditioned.
+        # restitution=0: ground absorbs foot-impact energy (prevents bouncing oscillations).
         physics_material = sim_utils.RigidBodyMaterialCfg(
-            static_friction=1.5,   
-            dynamic_friction=1.5,
-            restitution=0.0        
+            static_friction=1.5,    # was ~0.5-1.0 (default); now "sticky" to prevent slip
+            dynamic_friction=1.5,   # same for sliding contacts
+            restitution=0.0,        # no bounce on impact
         )
 
         # Spawn ground plane
         ground_cfg = sim_utils.GroundPlaneCfg(
             size=(100.0, 100.0),
-            physics_material=physics_material
+            physics_material=physics_material,
         )
         ground_cfg.func("/World/ground", ground_cfg)
 

@@ -305,24 +305,63 @@ class CrocoddylQuadrupedMPC(BaseMPC):
 
         # Warm-start: shift previous solution, OR cold-start with gravity comp + rollout.
         #
-        # CRITICAL FINDING: calling problem.rollout(us_init) BEFORE setCandidate corrupts
-        # Crocoddyl's running model contact-Jacobian cache. When FDDP then calls calcDiff
-        # internally, it gets different dynamics → ffeas≈21 even though rollout gave 0.
-        # Therefore: use rollout ONLY for cold-start (fresh problem, no stale cache).
-        # For warm-start, use shift_trajectory + shift_controls (original approach),
-        # which keeps ffeas low for stand mode and acceptable for walk mode.
+        # ADAPTIVE WARM/COLD-START STRATEGY:
+        # In walk mode, the contact sequence changes at every solve.  Shifting xs from
+        # a previous OCP into a new OCP with different contact phases produces large
+        # dynamics gaps (||ffeas|| ≈ 15 for a 25-node trot horizon).  FDDP cannot
+        # recover from ffeas > ~5 within 50 iterations — it diverges and produces
+        # garbage controls.
+        #
+        # Fix (two-pronged):
+        # 1. Before committing to warm-start, estimate the initial ||ffeas|| by running
+        #    one forward pass.  If ffeas > FFEAS_THRESHOLD, fall back to cold-start.
+        #    Cold-start with gravity_comp + rollout gives ffeas ≈ 1.5, which FDDP
+        #    handles reliably.
+        # 2. After solving, only update _prev_xs/_prev_us when cost < STORE_THRESHOLD.
+        #    Diverged solves (cost >> 1e4) produce garbage xs; storing them makes the
+        #    NEXT warm-start's ffeas even higher, cascading the divergence.
+        #
+        # NOTE on rollout safety: problem.rollout(gravity_comp) is safe for cold-start
+        # because gravity_comp contains no old contact forces.  The MEMORY bug about
+        # "rollout-corrupts-Jacobian" was specific to rollout(shifted_prev_us) where
+        # shifted controls carry stale contact forces from the previous gait phase.
+        FFEAS_THRESHOLD = 5.0  # warm-start ffeas above this → cold-start instead
+
+        use_warm_start = False
         if warm_start and self._prev_xs is not None and self._prev_us is not None:
-            # Shift previous solution by one step (xs stays near current state)
+            # Build candidate warm-start trajectory
             xs_init = self._shift_trajectory(self._prev_xs, current_state)
             us_init = self._shift_controls(self._prev_us)
             xs_init = self._adjust_length(xs_init, T + 1, current_state)
             us_init = self._adjust_length(us_init, T, np.zeros(self.actuation.nu))
-            solver.setCandidate(xs_init, us_init, False)
-            if is_verbose_call:
-                print(f"  Warm-start: YES (shifted prev solution)", flush=True)
-        else:
+
+            # Estimate initial ||ffeas|| via one forward pass on all running nodes.
+            # Calling m.calc() here is safe: FDDP's first forward pass overwrites the
+            # data regardless of isFeasible, so no Jacobian state persists.
+            running_ffeas = 0.0
+            n_check = min(problem.T, len(xs_init) - 1)
+            for i in range(n_check):
+                m = problem.runningModels[i]
+                d = problem.runningDatas[i]
+                m.calc(d, xs_init[i], us_init[i])
+                running_ffeas += np.linalg.norm(
+                    np.array(d.xnext) - np.array(xs_init[i + 1])
+                )
+
+            if running_ffeas <= FFEAS_THRESHOLD:
+                # Feasible enough: use warm-start
+                use_warm_start = True
+                solver.setCandidate(xs_init, us_init, False)
+                if is_verbose_call:
+                    print(f"  Warm-start: YES (shifted prev, ffeas={running_ffeas:.2f})", flush=True)
+            else:
+                # Too infeasible: fall back to cold-start
+                if is_verbose_call:
+                    print(f"  Warm-start ffeas={running_ffeas:.2f} > {FFEAS_THRESHOLD} → cold-start", flush=True)
+
+        if not use_warm_start:
             # Cold-start: gravity comp controls, rollout to get near-feasible xs.
-            # Rollout is safe here (fresh problem, no cached contact state to corrupt).
+            # Rollout is safe here (gravity_comp has no stale contact forces).
             u_grav = self._compute_gravity_compensation(current_state)
             us_init = [u_grav.copy() for _ in range(T)]
             xs_init = list(problem.rollout(us_init))
@@ -356,9 +395,17 @@ class CrocoddylQuadrupedMPC(BaseMPC):
         xs = list(solver.xs)
         us = list(solver.us)
 
-        # Store controls for next warm-start (always reuse, rollout ensures feasibility)
-        self._prev_xs = xs
-        self._prev_us = us
+        # Only store xs/us for next warm-start when this solve did NOT diverge.
+        # Diverged xs (cost >> 1e4) are garbage: storing them makes the next
+        # warm-start's ||ffeas|| WORSE and cascades the divergence across many steps.
+        # When a diverged solve is detected, keep the previous _prev_xs/_prev_us
+        # (from the last good solve) so the ffeas check above has the best available
+        # starting point.
+        STORE_COST_THRESHOLD = 1e4  # cost above this → solve is too diverged to store
+        if solver.cost < STORE_COST_THRESHOLD:
+            self._prev_xs = xs
+            self._prev_us = us
+        # else: keep old _prev_xs/_prev_us intact
 
         # Advance the gait phase clock so the next solve starts from the correct
         # position in the gait cycle (fixes the "Groundhog Day" bug).

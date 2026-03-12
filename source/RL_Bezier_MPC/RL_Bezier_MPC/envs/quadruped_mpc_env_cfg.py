@@ -261,7 +261,7 @@ class QuadrupedMPCEnvCfg(DirectRLEnvCfg):
     # ==========================================================================
 
     # Body height limits (fraction of standing height)
-    min_body_height_ratio: float = 0.2  # Too low = fallen
+    min_body_height_ratio: float = 0.3  # Too low = fallen
     max_body_height_ratio: float = 1.5  # Too high = jumping
 
     # Grace period: only terminate if body height is too low for this many consecutive steps
