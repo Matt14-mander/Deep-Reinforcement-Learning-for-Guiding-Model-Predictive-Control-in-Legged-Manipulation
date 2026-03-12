@@ -474,12 +474,18 @@ class QuadrupedMPCEnv(DirectRLEnv):
                     # MPC 发散保护：代价爆炸且未收敛时，回退到上一次有效解
                     # 阈值 5e4：远高于正常收敛代价（数百量级），低于发散代价（百万量级）
                     _COST_THRESHOLD = 5e4
+                    guard_fired = False
+                    failed_cost_for_reward = None
+
                     if not solution.converged and solution.cost > _COST_THRESHOLD:
+                        guard_fired = True
+                        failed_cost_for_reward = solution.cost   # 替换前先保存失败 cost，用于 reward 惩罚
                         if self._last_good_solutions[env_idx] is not None:
-                            # 用上一次有效解代替本次失败结果
+                            # 用上一次有效解代替本次失败结果（物理安全），但 reward 仍用失败 cost
                             solution = self._last_good_solutions[env_idx]
                             if env_idx == 0:
-                                print(f"[MPC Guard] env {env_idx}: cost={self._last_mpc_costs[env_idx]:.0f} → fallback to last-good solution", flush=True)
+                                # 修复打印：显示实际失败 cost（>5e4），同时显示 fallback 解的 cost
+                                print(f"[MPC Guard] env {env_idx}: FAILED cost={failed_cost_for_reward:.0f} > {_COST_THRESHOLD:.0f} → fallback (fallback cost={solution.cost:.0f})", flush=True)
                         else:
                             # 无历史有效解：零前馈 + 站立姿态
                             joint_torques = np.zeros(self.cfg.num_joints)
@@ -487,7 +493,7 @@ class QuadrupedMPCEnv(DirectRLEnv):
                                 joint_positions = self._pinocchio_model.referenceConfigurations["standing"][7:19]
                             else:
                                 joint_positions = np.array([0.1, 0.8, -1.5, -0.1, 0.8, -1.5, 0.1, 0.8, -1.5, -0.1, 0.8, -1.5])
-                            self._last_mpc_costs[env_idx] = solution.cost
+                            self._last_mpc_costs[env_idx] = failed_cost_for_reward  # 用失败 cost 惩罚
                             self._last_mpc_converged[env_idx] = False
                             self._apply_control(env_idx, joint_positions, joint_torques)
                             continue  # 跳过后续正常提取，直接进入下一个 env_idx
@@ -508,8 +514,14 @@ class QuadrupedMPCEnv(DirectRLEnv):
                         else:
                             joint_positions = np.array([0.1, 0.8, -1.5, -0.1, 0.8, -1.5, 0.1, 0.8, -1.5, -0.1, 0.8, -1.5])
 
-                    self._last_mpc_costs[env_idx] = solution.cost
-                    self._last_mpc_converged[env_idx] = solution.converged
+                    # 修复：guard 触发时用失败 cost + converged=False 计算 reward，确保 RL 看到正确惩罚
+                    # （物理上仍执行 fallback 好解的扭矩，RL reward 信号则反映真实的发散情况）
+                    if guard_fired:
+                        self._last_mpc_costs[env_idx] = failed_cost_for_reward
+                        self._last_mpc_converged[env_idx] = False
+                    else:
+                        self._last_mpc_costs[env_idx] = solution.cost
+                        self._last_mpc_converged[env_idx] = solution.converged
                     
                 except Exception as e:
                     if env_idx == 0:

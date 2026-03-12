@@ -94,18 +94,38 @@ def create_ppo_config(env_cfg: QuadrupedMPCEnvCfg):
     Returns:
         Dictionary with PPO configuration.
     """
+    # Timing reference (measured on target hardware):
+    #   1 MPC solve (Crocoddyl FDDP, 25 nodes, CPU) ≈ 250ms
+    #   1 env.step() wall time ≈ num_envs × 250ms  (MPC runs serially in Python)
+    #   1 PPO iteration wall time ≈ num_steps_per_env × num_envs × 250ms
+    #
+    # num_steps_per_env selection:
+    #   - rl_policy_period=10: Bezier params update every 10 env.steps()
+    #   - Need at least 10× steps to get one full Bezier decision round
+    #   - 128 steps → 12.8 Bezier decisions per rollout (minimal for on-policy learning)
+    #   - 64 steps → 6.4 decisions (quick-test mode)
+    #
+    # Per-iteration timing at 128 steps:
+    #   num_envs=2  → 128 × 2 × 0.25s  ≈  64s  ≈ 1 min/iter
+    #   num_envs=4  → 128 × 4 × 0.25s  ≈ 128s  ≈ 2 min/iter
+    #   num_envs=8  → 128 × 8 × 0.25s  ≈ 256s  ≈ 4 min/iter
     return {
         "seed": args_cli.seed,
         "device": "cuda" if torch.cuda.is_available() else "cpu",
-        "num_steps_per_env": 24,  # Rollout length
+        # Rollout length per env per PPO iteration.
+        # Must be >> rl_policy_period (10) to capture multiple Bezier decisions.
+        # 128 = 12.8 Bezier updates per rollout (good balance of signal vs. wall time).
+        "num_steps_per_env": 128,
         "max_iterations": args_cli.max_iterations,
         "empirical_normalization": True,
-        # Observation groups (required by new RSL-RL)
+        # Observation groups (required by RSL-RL v2+)
         "obs_groups": {},
         # PPO algorithm parameters
         "policy": {
             "class_name": "ActorCritic",
-            "init_noise_std": 1.0,
+            # Start with low noise so the robot doesn't flail randomly;
+            # the MPC-only baseline already walks, so mild exploration is enough.
+            "init_noise_std": 0.5,
             "actor_hidden_dims": [256, 256, 128],
             "critic_hidden_dims": [256, 256, 128],
             "activation": "elu",
@@ -115,19 +135,19 @@ def create_ppo_config(env_cfg: QuadrupedMPCEnvCfg):
             "value_loss_coef": 1.0,
             "use_clipped_value_loss": True,
             "clip_param": 0.2,
-            "entropy_coef": 0.01,
+            "entropy_coef": 0.005,   # Low entropy coef: MPC already stable, avoid chaos
             "num_learning_epochs": 5,
             "num_mini_batches": 4,
-            "learning_rate": 3e-4,
-            "schedule": "fixed", # adaptive
+            "learning_rate": 1e-4,   # Conservative LR: MPC pipeline is fragile to large actions
+            "schedule": "adaptive",  # Adaptive LR via KL divergence
             "gamma": 0.99,
             "lam": 0.95,
             "desired_kl": 0.01,
             "max_grad_norm": 1.0,
         },
-        # Logging
-        "save_interval": 100,
-        "log_interval": 10,
+        # Logging — save frequently so quick-tests don't lose progress
+        "save_interval": 25,
+        "log_interval": 5,
         "experiment_name": "quadruped_mpc_bezier",
         "run_name": datetime.now().strftime("%Y-%m-%d_%H-%M-%S"),
     }
