@@ -181,6 +181,11 @@ class QuadrupedMPCEnv(DirectRLEnv):
         # Consecutive-step counter for height termination grace period
         self._too_low_counter = torch.zeros(self.num_envs, dtype=torch.long, device=self.device)
 
+        # Per-foot world-frame z heights, populated in _pre_physics_step via Pinocchio FK.
+        # Used in _get_observations() for proper per-foot contact detection.
+        # Order: [LF=FL, RF=FR, LH=RL, RH=RR]
+        self._foot_heights = np.zeros((self.num_envs, 4))
+
         # Action bounds for normalization
         bezier_low, bezier_high = self.trajectory_generator.get_param_bounds()
 
@@ -456,8 +461,14 @@ class QuadrupedMPCEnv(DirectRLEnv):
                 "step_frequency": gait_mods[env_idx, 2],
             }
 
-            # Get current foot positions (dummy for now)
+            # Get current foot positions via Pinocchio FK (used by MPC and observations)
             foot_positions = self._get_foot_positions_numpy(env_idx, robot_states[env_idx])
+
+            # Cache foot z-heights for per-foot contact detection in _get_observations()
+            _foot_name_order = ["LF", "RF", "LH", "RH"]
+            for _j, _fn in enumerate(_foot_name_order):
+                if _fn in foot_positions:
+                    self._foot_heights[env_idx, _j] = foot_positions[_fn][2]
 
             # Solve MPC
             if self.mpc_controllers[env_idx] is not None:
@@ -608,27 +619,40 @@ class QuadrupedMPCEnv(DirectRLEnv):
         robot_data = self.robot.data
 
         # Base state components
-        position = robot_data.root_pos_w  # (num_envs, 3)
+        position = robot_data.root_pos_w      # (num_envs, 3)
         orientation = robot_data.root_quat_w  # (num_envs, 4)
-        linear_vel = robot_data.root_lin_vel_w  # (num_envs, 3)
-        angular_vel = robot_data.root_ang_vel_w  # (num_envs, 3)
+        # Use BODY-FRAME velocity: more informative for locomotion control than world-frame,
+        # and consistent with what the MPC state uses (Pinocchio convention).
+        linear_vel = robot_data.root_lin_vel_b   # (num_envs, 3)  ← body frame
+        angular_vel = robot_data.root_ang_vel_b  # (num_envs, 3)  ← body frame
 
         # Joint state from articulation
         joint_pos = robot_data.joint_pos[:, :12]  # (num_envs, 12)
         joint_vel = robot_data.joint_vel[:, :12]  # (num_envs, 12)
 
-        # Foot contacts: estimate from foot height
-        # TODO: Add ContactSensorCfg for accurate contact detection
-        foot_contacts = (position[:, 2:3] < self.cfg.standing_height * 0.5).float()
-        foot_contacts = foot_contacts.expand(-1, 4)
+        # Foot contacts: use per-foot z positions cached from Pinocchio FK in _pre_physics_step.
+        # Contact threshold = 0.04 m (slightly above foot sphere radius 0.02 m to tolerate noise).
+        # Previous approach (body_z < 0.2m, same for all 4 feet) was completely wrong:
+        # it was 0 during normal walking (body z ≈ 0.38m > 0.2m) and 1 during falling.
+        _contact_threshold = 0.04  # meters above ground
+        foot_contacts = torch.tensor(
+            self._foot_heights < _contact_threshold,
+            device=self.device,
+            dtype=torch.float32,
+        )  # shape (num_envs, 4), order: [FL, FR, RL, RR]
 
-        # Target positions and phases
+        # Gait phase: use the global gait clock from the MPC controller.
+        # Previous approach (trajectory_phases / traj_len) was always 0 because
+        # trajectory_phases is never incremented — that feature was dead.
+        # gait_clock cycles through one full gait cycle, giving proper oscillating phase.
         phases = torch.zeros((self.num_envs, 1), device=self.device)
-
         for env_idx in range(self.num_envs):
-            phase = self.trajectory_phases[env_idx]
-            traj_len = len(self.current_com_trajectories[env_idx])
-            phases[env_idx] = phase / max(traj_len - 1, 1)
+            ctrl = self.mpc_controllers[env_idx]
+            if ctrl is not None:
+                cycle_dur = ctrl._get_cycle_duration(
+                    self.cfg.default_step_duration, self.cfg.default_support_duration
+                )
+                phases[env_idx] = (ctrl._gait_clock % cycle_dur) / cycle_dur
 
         # Concatenate observations
         obs = torch.cat([
@@ -725,6 +749,21 @@ class QuadrupedMPCEnv(DirectRLEnv):
                 + mpc_cost_penalty
                 + mpc_convergence_reward
             )
+
+        # Fall / flip penalty (vectorized): fires on the step that triggers termination.
+        # _get_rewards() is called before _get_dones(), so we use the counter from the
+        # PREVIOUS done-check (already reflects N-1 low steps) plus direct orientation check.
+        # This gives PPO a sharp negative signal for the "dying" state, much stronger than
+        # just the loss of future alive_bonus.
+        w_q = orientation[:, 0]; x_q = orientation[:, 1]
+        y_q = orientation[:, 2]; z_q = orientation[:, 3]
+        up_z = 1.0 - 2.0 * (x_q * x_q + y_q * y_q)
+        flipped = up_z < 0.5                                     # >60° tilt
+        nearly_fallen = (
+            self._too_low_counter >= max(1, self.cfg.min_body_height_consecutive_steps - 1)
+        )
+        terminal_mask = (flipped | nearly_fallen).float()
+        rewards += terminal_mask * self.cfg.reward_fall_penalty  # reward_fall_penalty = -10
 
         return rewards
 
@@ -875,6 +914,7 @@ class QuadrupedMPCEnv(DirectRLEnv):
             self._z_vel_filtered[env_idx] = 0.0
             self._last_good_solutions[env_idx] = None
             self._too_low_counter[env_idx] = 0
+            self._foot_heights[env_idx] = 0.0  # reset cached foot heights
 
             # Reset stored params
             self.prev_bezier_params[env_idx] = initial_params
