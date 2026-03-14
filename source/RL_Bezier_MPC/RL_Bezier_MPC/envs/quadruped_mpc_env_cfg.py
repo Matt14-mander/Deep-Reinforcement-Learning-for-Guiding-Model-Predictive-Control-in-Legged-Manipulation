@@ -146,6 +146,12 @@ class QuadrupedMPCEnvCfg(DirectRLEnvCfg):
     # MPC verbose mode (print solver info for first 5 solves, for debugging)
     mpc_verbose: bool = False
 
+    # Warm-start feasibility threshold: if shifted warm-start has average dynamics
+    # gap (||ffeas||) above this value, fall back to cold-start (50 iters).
+    # 5.0 is empirically reliable: ffeas ≤ 5 → RTI converges, ffeas > 5 → diverges.
+    # Set to 0.0 to always cold-start (very slow), or inf to never fall back.
+    mpc_ffeas_threshold: float = 5.0
+
     # ==========================================================================
     # Trajectory Configuration
     # ==========================================================================

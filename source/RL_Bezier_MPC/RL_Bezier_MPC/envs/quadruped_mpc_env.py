@@ -126,6 +126,7 @@ class QuadrupedMPCEnv(DirectRLEnv):
                     mu=cfg.friction_coefficient,
                     max_iterations=cfg.mpc_max_iterations,
                     verbose=(cfg.mpc_verbose and _ == 0),  # Only verbose for env 0
+                    ffeas_threshold=cfg.mpc_ffeas_threshold,
                 )
             else:
                 mpc = None  # Dummy mode

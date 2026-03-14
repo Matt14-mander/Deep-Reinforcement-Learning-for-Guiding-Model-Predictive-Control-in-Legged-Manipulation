@@ -86,6 +86,7 @@ class CrocoddylQuadrupedMPC(BaseMPC):
         max_iterations: int = 50,
         convergence_threshold: float = 1e-4,
         verbose: bool = False,
+        ffeas_threshold: float = 5.0,
     ):
         """Initialize MPC with all sub-components.
 
@@ -125,6 +126,7 @@ class CrocoddylQuadrupedMPC(BaseMPC):
         self.max_iterations = max_iterations
         self.convergence_threshold = convergence_threshold
         self.verbose = verbose
+        self.ffeas_threshold = ffeas_threshold
         self._solve_count = 0  # Track solve calls for selective verbose
 
         # Get frame IDs from names
@@ -307,16 +309,13 @@ class CrocoddylQuadrupedMPC(BaseMPC):
         #
         # RTI STRATEGY (Real-Time Iteration at 50 Hz):
         # Always try warm-start when prev_xs is available (shifted by 1 step).
-        # Use self.max_iterations (5) for warm-start — state barely changes at 50 Hz.
-        # Use COLD_START_ITERS (50) only when no prev_xs exists (after reset/init).
+        # Warm-start: shift previous solution by 1 step, use RTI iterations.
+        # Cold-start: gravity compensation + rollout, use COLD_START_ITERS=50.
         #
-        # IMPORTANT: The previous FFEAS_THRESHOLD=5.0 check has been REMOVED.
-        # Reason: observed warm-start ffeas is 96-163 (due to contact sequence changes
-        # and joint velocity updates from large torques). This always rejected warm-start,
-        # falling back to 50-iter cold-start → 170ms/step → 87s/iter (10× too slow).
-        # The guard (cost > 5e4) already protects against diverged warm-start solves;
-        # STORE_COST_THRESHOLD prevents garbage xs from being reused as future warm-starts.
-        # Together these are sufficient: no need for an explicit ffeas check.
+        # ffeas_threshold check: before committing to warm-start, compute the
+        # forward-dynamics feasibility of the shifted xs candidate. If the norm
+        # of dynamics gaps exceeds self.ffeas_threshold (default 5.0), fall back
+        # to cold-start — FDDP cannot reliably reduce large gaps in 10 RTI iters.
         #
         # NOTE on xs storage: only update _prev_xs when cost < STORE_COST_THRESHOLD (1e4).
         # Diverged solves produce garbage xs; storing them cascades the divergence.
@@ -328,11 +327,28 @@ class CrocoddylQuadrupedMPC(BaseMPC):
             us_init = self._shift_controls(self._prev_us)
             xs_init = self._adjust_length(xs_init, T + 1, current_state)
             us_init = self._adjust_length(us_init, T, np.zeros(self.actuation.nu))
-            use_warm_start = True
-            solver.setCandidate(xs_init, us_init, False)
-            if is_verbose_call:
-                print(f"  Warm-start: YES (shifted prev solution, RTI)", flush=True)
-        else:
+
+            # Compute warm-start feasibility: average dynamics gap over horizon.
+            # If too large, FDDP will diverge with only max_iterations RTI iters.
+            running_ffeas = 0.0
+            for i in range(T):
+                m = problem.runningModels[i]
+                d = problem.runningDatas[i]
+                m.calc(d, xs_init[i], us_init[i])
+                gap = m.state.diff(xs_init[i + 1], d.xnext)
+                running_ffeas += float(np.linalg.norm(gap))
+            running_ffeas /= T
+
+            if running_ffeas <= self.ffeas_threshold:
+                use_warm_start = True
+                solver.setCandidate(xs_init, us_init, False)
+                if is_verbose_call:
+                    print(f"  Warm-start: YES (ffeas={running_ffeas:.2f} ≤ {self.ffeas_threshold}, RTI)", flush=True)
+            else:
+                if is_verbose_call:
+                    print(f"  Warm-start rejected: ffeas={running_ffeas:.2f} > {self.ffeas_threshold} → cold-start", flush=True)
+
+        if not use_warm_start:
             # Cold-start: gravity comp controls, rollout to get near-feasible xs.
             # Rollout is safe here (gravity_comp has no stale contact forces).
             u_grav = self._compute_gravity_compensation(current_state)
