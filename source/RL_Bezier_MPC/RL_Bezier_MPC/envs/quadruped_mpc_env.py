@@ -186,6 +186,11 @@ class QuadrupedMPCEnv(DirectRLEnv):
         # Order: [LF=FL, RF=FR, LH=RL, RH=RR]
         self._foot_heights = np.zeros((self.num_envs, 4))
 
+        # Guard firing statistics (printed periodically to monitor MPC health during training)
+        self._guard_fire_count = 0   # guard triggers since last print
+        self._mpc_total_count = 0    # total MPC solves since last print
+        self._guard_print_interval = 256  # print every N total solves (≈ 2 PPO rollout steps)
+
         # Action bounds for normalization
         bezier_low, bezier_high = self.trajectory_generator.get_param_bounds()
 
@@ -482,34 +487,44 @@ class QuadrupedMPCEnv(DirectRLEnv):
                     )
                     self.last_mpc_solutions[env_idx] = solution
 
-                    # MPC 发散保护：代价爆炸且未收敛时，回退到上一次有效解
+                    # MPC 发散保护：代价爆炸且未收敛时，立即回退到站立姿态
                     # 阈值 5e4：远高于正常收敛代价（数百量级），低于发散代价（百万量级）
+                    #
+                    # RL 训练架构说明：
+                    #   以前的设计：用上次有效解作为 fallback → 问题：
+                    #     - guard 连续触发 40+ 步时，fallback 解已是 40 步前的旧状态 → 机器人状态
+                    #       已完全改变，旧扭矩加速漂移到错误状态
+                    #     - fallback 解本身 cost 可高达 49552（接近门槛），并非真正"好解"
+                    #   现在的设计：统一 fallback 到站立姿态（零前馈 + PD 控制向站姿）
+                    #     - 零前馈 → IsaacLab 的 PD 作动器会施加站立弹簧力，物理上安全
+                    #     - 总是新鲜的（基于当前状态计算），永远不会过时
+                    #     - RL 的 reward：failed_cost → mpc_cost_penalty 最大惩罚，正确引导学习
                     _COST_THRESHOLD = 5e4
                     guard_fired = False
                     failed_cost_for_reward = None
 
+                    self._mpc_total_count += 1
                     if not solution.converged and solution.cost > _COST_THRESHOLD:
                         guard_fired = True
-                        failed_cost_for_reward = solution.cost   # 替换前先保存失败 cost，用于 reward 惩罚
-                        if self._last_good_solutions[env_idx] is not None:
-                            # 用上一次有效解代替本次失败结果（物理安全），但 reward 仍用失败 cost
-                            solution = self._last_good_solutions[env_idx]
-                            if env_idx == 0:
-                                # 修复打印：显示实际失败 cost（>5e4），同时显示 fallback 解的 cost
-                                print(f"[MPC Guard] env {env_idx}: FAILED cost={failed_cost_for_reward:.0f} > {_COST_THRESHOLD:.0f} → fallback (fallback cost={solution.cost:.0f})", flush=True)
+                        failed_cost_for_reward = solution.cost
+                        self._guard_fire_count += 1
+                        # 统一 fallback：零前馈 + 站立关节位置（不再区分有无历史解）
+                        joint_torques = np.zeros(self.cfg.num_joints)
+                        if hasattr(self._pinocchio_model, 'referenceConfigurations') and "standing" in self._pinocchio_model.referenceConfigurations:
+                            joint_positions = self._pinocchio_model.referenceConfigurations["standing"][7:19]
                         else:
-                            # 无历史有效解：零前馈 + 站立姿态
-                            joint_torques = np.zeros(self.cfg.num_joints)
-                            if hasattr(self._pinocchio_model, 'referenceConfigurations') and "standing" in self._pinocchio_model.referenceConfigurations:
-                                joint_positions = self._pinocchio_model.referenceConfigurations["standing"][7:19]
-                            else:
-                                joint_positions = np.array([0.1, 0.8, -1.5, -0.1, 0.8, -1.5, 0.1, 0.8, -1.5, -0.1, 0.8, -1.5])
-                            self._last_mpc_costs[env_idx] = failed_cost_for_reward  # 用失败 cost 惩罚
-                            self._last_mpc_converged[env_idx] = False
-                            self._apply_control(env_idx, joint_positions, joint_torques)
-                            continue  # 跳过后续正常提取，直接进入下一个 env_idx
+                            joint_positions = np.array([0.1, 0.8, -1.5, -0.1, 0.8, -1.5, 0.1, 0.8, -1.5, -0.1, 0.8, -1.5])
+                        self._last_mpc_costs[env_idx] = failed_cost_for_reward  # RL 看到真实失败 cost
+                        self._last_mpc_converged[env_idx] = False
+                        self._apply_control(env_idx, joint_positions, joint_torques)
+                        # 周期性打印触发率（替代每步打印）
+                        if self._mpc_total_count % self._guard_print_interval == 0:
+                            rate = 100.0 * self._guard_fire_count / self._guard_print_interval
+                            print(f"[MPC Guard rate] {rate:.1f}% ({self._guard_fire_count}/{self._guard_print_interval} solves) last failed cost={failed_cost_for_reward:.0f}", flush=True)
+                            self._guard_fire_count = 0
+                        continue  # 跳过后续正常提取
                     else:
-                        # 本次解有效，更新 last_good
+                        # 本次解有效，更新 last_good（保留 buffer 供调试，但不再用于 fallback）
                         self._last_good_solutions[env_idx] = solution
 
                     # 1. 提取前馈扭矩
@@ -525,14 +540,8 @@ class QuadrupedMPCEnv(DirectRLEnv):
                         else:
                             joint_positions = np.array([0.1, 0.8, -1.5, -0.1, 0.8, -1.5, 0.1, 0.8, -1.5, -0.1, 0.8, -1.5])
 
-                    # 修复：guard 触发时用失败 cost + converged=False 计算 reward，确保 RL 看到正确惩罚
-                    # （物理上仍执行 fallback 好解的扭矩，RL reward 信号则反映真实的发散情况）
-                    if guard_fired:
-                        self._last_mpc_costs[env_idx] = failed_cost_for_reward
-                        self._last_mpc_converged[env_idx] = False
-                    else:
-                        self._last_mpc_costs[env_idx] = solution.cost
-                        self._last_mpc_converged[env_idx] = solution.converged
+                    self._last_mpc_costs[env_idx] = solution.cost
+                    self._last_mpc_converged[env_idx] = solution.converged
                     
                 except Exception as e:
                     if env_idx == 0:

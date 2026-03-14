@@ -148,8 +148,11 @@ class QuadrupedMPCEnvCfg(DirectRLEnvCfg):
     # 10 MPC steps @ 50Hz = 5 Hz policy rate (slower for quadruped)
     rl_policy_period: int = 10
 
-    # Maximum displacement for CoM Bezier control points
-    max_bezier_displacement: float = 1.5  # meters (less than quadrotor)
+    # Maximum displacement for CoM Bezier control points (XY per control point).
+    # Stage 1: 0.3m → max initial CoM velocity = 3 × 0.3 / 3s = 0.3 m/s (achievable trot speed)
+    # Stage 2: expand to 0.8m after policy converges (allows faster gait commands)
+    # OLD value 1.5m caused random RL actions to demand 1.5 m/s velocity → MPC cost explosion
+    max_bezier_displacement: float = 0.3  # meters
 
     # Trajectory blending steps when updating
     trajectory_blend_steps: int = 5
