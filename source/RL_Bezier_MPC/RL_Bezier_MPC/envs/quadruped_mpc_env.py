@@ -387,6 +387,22 @@ class QuadrupedMPCEnv(DirectRLEnv):
 
         # Parse action components
         bezier_params = actions_np[:, :self.cfg.num_bezier_actions]
+        # ----------------------------------------------------------------
+        # DEFAULT FORWARD WALKING BIAS (critical for RL learning)
+        # Without this: zero RL action → Bezier stays at current pos → MPC
+        # rewards "stand still" perfectly → RL converges to standing local optimum.
+        # With this: zero RL action → 0.2 m/s forward walk baseline.
+        # RL action then modulates around this forward-walking reference.
+        # ----------------------------------------------------------------
+        _hz = float(self.cfg.bezier_horizon)
+        _v_fwd = 0.2  # m/s base forward velocity
+        _fwd_bias = np.array([
+            0.0, 0.0, 0.0,
+            _v_fwd * _hz / 3, 0.0, 0.0,
+            _v_fwd * _hz * 2 / 3, 0.0, 0.0,
+            _v_fwd * _hz, 0.0, 0.0,
+        ], dtype=np.float32)
+        bezier_params = bezier_params + _fwd_bias[np.newaxis, :]
         if self.cfg.fix_gait_params:
             # Stage 1: gait params fixed to defaults (1.0 = no modulation)
             gait_mods = np.ones((self.num_envs, self.cfg.num_gait_mod_actions))

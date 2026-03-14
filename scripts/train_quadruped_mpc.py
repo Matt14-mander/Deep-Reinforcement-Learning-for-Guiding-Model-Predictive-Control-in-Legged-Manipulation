@@ -125,7 +125,7 @@ def create_ppo_config(env_cfg: QuadrupedMPCEnvCfg):
             "class_name": "ActorCritic",
             # Start with low noise so the robot doesn't flail randomly;
             # the MPC-only baseline already walks, so mild exploration is enough.
-            "init_noise_std": 0.5,
+            "init_noise_std": 0.15,
             "actor_hidden_dims": [256, 256, 128],
             "critic_hidden_dims": [256, 256, 128],
             "activation": "elu",
