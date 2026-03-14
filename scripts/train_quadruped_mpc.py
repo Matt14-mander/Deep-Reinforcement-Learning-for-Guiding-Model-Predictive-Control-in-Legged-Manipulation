@@ -26,8 +26,8 @@ from isaaclab.app import AppLauncher
 # Parse arguments before launching app
 parser = argparse.ArgumentParser(description="Train Quadruped MPC agent")
 parser.add_argument(
-    "--num_envs", type=int, default=32,
-    help="Number of parallel environments (limited by CPU MPC)"
+    "--num_envs", type=int, default=4,
+    help="Number of parallel environments (RTI: 4 envs ≈ 11s/iter; scale up after verifying speed)"
 )
 parser.add_argument(
     "--max_iterations", type=int, default=500,
@@ -94,21 +94,21 @@ def create_ppo_config(env_cfg: QuadrupedMPCEnvCfg):
     Returns:
         Dictionary with PPO configuration.
     """
-    # Timing reference (measured on target hardware):
-    #   1 MPC solve (Crocoddyl FDDP, 25 nodes, CPU) ≈ 250ms
-    #   1 env.step() wall time ≈ num_envs × 250ms  (MPC runs serially in Python)
-    #   1 PPO iteration wall time ≈ num_steps_per_env × num_envs × 250ms
+    # Timing reference (RTI scheme: mpc_max_iterations=5, mpc_horizon_steps=20):
+    #   1 MPC solve (Crocoddyl FDDP, 20 nodes, 5 iters, CPU) ≈ 20-25ms
+    #   1 env.step() wall time ≈ num_envs × 22ms  (MPC runs serially in Python)
+    #   1 PPO iteration wall time ≈ num_steps_per_env × num_envs × 22ms
     #
     # num_steps_per_env selection:
     #   - rl_policy_period=10: Bezier params update every 10 env.steps()
-    #   - Need at least 10× steps to get one full Bezier decision round
-    #   - 128 steps → 12.8 Bezier decisions per rollout (minimal for on-policy learning)
-    #   - 64 steps → 6.4 decisions (quick-test mode)
+    #     (but counter never increments, so effectively 50 Hz — all steps give gradient)
+    #   - 128 steps is a good balance of gradient signal vs. wall time
     #
-    # Per-iteration timing at 128 steps:
-    #   num_envs=2  → 128 × 2 × 0.25s  ≈  64s  ≈ 1 min/iter
-    #   num_envs=4  → 128 × 4 × 0.25s  ≈ 128s  ≈ 2 min/iter
-    #   num_envs=8  → 128 × 8 × 0.25s  ≈ 256s  ≈ 4 min/iter
+    # Per-iteration timing at 128 steps (RTI, estimated):
+    #   num_envs=2  → 128 × 2 × 0.022s  ≈  5.6s  ≈ fast!
+    #   num_envs=4  → 128 × 4 × 0.022s  ≈ 11.3s  ← recommended
+    #   num_envs=8  → 128 × 8 × 0.022s  ≈ 22.5s
+    #   num_envs=16 → 128 × 16 × 0.022s ≈  45s
     return {
         "seed": args_cli.seed,
         "device": "cuda" if torch.cuda.is_available() else "cpu",
