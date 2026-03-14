@@ -181,6 +181,9 @@ class QuadrupedMPCEnv(DirectRLEnv):
         # Consecutive-step counter for height termination grace period
         self._too_low_counter = torch.zeros(self.num_envs, dtype=torch.long, device=self.device)
 
+        self.guard_triggered = torch.zeros(self.num_envs, dtype=torch.bool, device=self.device)
+        self.consecutive_mpc_failures = torch.zeros(self.num_envs, dtype=torch.long, device=self.device)
+
         # Action bounds for normalization
         bezier_low, bezier_high = self.trajectory_generator.get_param_bounds()
 
@@ -464,15 +467,15 @@ class QuadrupedMPCEnv(DirectRLEnv):
                     )
                     self.last_mpc_solutions[env_idx] = solution
 
-                    # MPC 发散保护：代价爆炸且未收敛时，回退到上一次有效解
-                    # 阈值 5e4：远高于正常收敛代价（数百量级），低于发散代价（百万量级）
-                    _COST_THRESHOLD = 5e4
-                    if not solution.converged and solution.cost > _COST_THRESHOLD:
+                    # MPC 发散保护
+                    _COST_THRESHOLD = 50000.0
+                    if solution.cost > _COST_THRESHOLD or np.isnan(solution.cost):
+                        self.guard_triggered[env_idx] = True  # 记录本回合触发了保护
                         if self._last_good_solutions[env_idx] is not None:
-                            # 用上一次有效解代替本次失败结果
-                            solution = self._last_good_solutions[env_idx]
+                            # 注意：这里修复了打印 Bug，改为打印真实的 solution.cost
                             if env_idx == 0:
-                                print(f"[MPC Guard] env {env_idx}: cost={self._last_mpc_costs[env_idx]:.0f} → fallback to last-good solution", flush=True)
+                                print(f"[MPC Guard] env {env_idx}: FAILED cost={solution.cost:.0f} → fallback", flush=True)
+                            solution = self._last_good_solutions[env_idx]
                         else:
                             # 无历史有效解：零前馈 + 站立姿态
                             joint_torques = np.zeros(self.cfg.num_joints)
@@ -483,9 +486,10 @@ class QuadrupedMPCEnv(DirectRLEnv):
                             self._last_mpc_costs[env_idx] = solution.cost
                             self._last_mpc_converged[env_idx] = False
                             self._apply_control(env_idx, joint_positions, joint_torques)
-                            continue  # 跳过后续正常提取，直接进入下一个 env_idx
+                            continue
                     else:
-                        # 本次解有效，更新 last_good
+                        # 只有正常动作才解除警报
+                        self.guard_triggered[env_idx] = False
                         self._last_good_solutions[env_idx] = solution
 
                     # 1. 提取前馈扭矩
@@ -695,6 +699,8 @@ class QuadrupedMPCEnv(DirectRLEnv):
                 self.cfg.reward_mpc_convergence if self._last_mpc_converged[env_idx] else 0.0
             )
 
+            guard_penalty = -10.0 if self.guard_triggered[env_idx] else 0.0
+
             # Total reward
             rewards[env_idx] = (
                 com_reward
@@ -705,6 +711,7 @@ class QuadrupedMPCEnv(DirectRLEnv):
                 + target_bonus
                 + mpc_cost_penalty
                 + mpc_convergence_reward
+                + guard_penalty
             )
 
         return rewards
@@ -730,6 +737,13 @@ class QuadrupedMPCEnv(DirectRLEnv):
         too_low = self._too_low_counter >= self.cfg.min_body_height_consecutive_steps
         too_high = position[:, 2] > self.cfg.max_body_height
 
+        self.consecutive_mpc_failures = torch.where(
+            self.guard_triggered,
+            self.consecutive_mpc_failures + 1,
+            torch.zeros_like(self.consecutive_mpc_failures)
+        )
+        too_many_failures = self.consecutive_mpc_failures >= 5
+
         # Orientation check (flipped)
         w = orientation[:, 0]
         x = orientation[:, 1]
@@ -745,7 +759,7 @@ class QuadrupedMPCEnv(DirectRLEnv):
         out_of_bounds = distance > self.cfg.max_distance_from_start
 
         # Termination
-        terminated = too_low | too_high | flipped | out_of_bounds
+        terminated = too_low | too_high | flipped | out_of_bounds | too_many_failures
 
         # Truncation (timeout)
         time_out = self.episode_length_buf >= self.max_episode_length
@@ -856,6 +870,9 @@ class QuadrupedMPCEnv(DirectRLEnv):
             self._z_vel_filtered[env_idx] = 0.0
             self._last_good_solutions[env_idx] = None
             self._too_low_counter[env_idx] = 0
+
+            self.guard_triggered[env_idx] = False
+            self.consecutive_mpc_failures[env_idx] = 0
 
             # Reset stored params
             self.prev_bezier_params[env_idx] = initial_params
