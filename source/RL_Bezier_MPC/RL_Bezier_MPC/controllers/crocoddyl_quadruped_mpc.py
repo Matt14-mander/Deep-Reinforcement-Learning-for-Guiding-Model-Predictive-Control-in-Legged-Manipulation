@@ -86,7 +86,6 @@ class CrocoddylQuadrupedMPC(BaseMPC):
         max_iterations: int = 50,
         convergence_threshold: float = 1e-4,
         verbose: bool = False,
-        ffeas_threshold: float = 5.0,
     ):
         """Initialize MPC with all sub-components.
 
@@ -126,7 +125,6 @@ class CrocoddylQuadrupedMPC(BaseMPC):
         self.max_iterations = max_iterations
         self.convergence_threshold = convergence_threshold
         self.verbose = verbose
-        self.ffeas_threshold = ffeas_threshold
         self._solve_count = 0  # Track solve calls for selective verbose
 
         # Get frame IDs from names
@@ -307,58 +305,24 @@ class CrocoddylQuadrupedMPC(BaseMPC):
 
         # Warm-start: shift previous solution, OR cold-start with gravity comp + rollout.
         #
-        # RTI STRATEGY (Real-Time Iteration at 50 Hz):
-        # Always try warm-start when prev_xs is available (shifted by 1 step).
-        # Warm-start: shift previous solution by 1 step, use RTI iterations.
-        # Cold-start: gravity compensation + rollout, use COLD_START_ITERS=50.
-        #
-        # ffeas_threshold check: before committing to warm-start, compute the
-        # forward-dynamics feasibility of the shifted xs candidate. If the norm
-        # of dynamics gaps exceeds self.ffeas_threshold (default 5.0), fall back
-        # to cold-start — FDDP cannot reliably reduce large gaps in 10 RTI iters.
-        #
-        # NOTE on xs storage: only update _prev_xs when cost < STORE_COST_THRESHOLD (1e4).
-        # Diverged solves produce garbage xs; storing them cascades the divergence.
-
-        use_warm_start = False
+        # CRITICAL FINDING: calling problem.rollout(us_init) BEFORE setCandidate corrupts
+        # Crocoddyl's running model contact-Jacobian cache. When FDDP then calls calcDiff
+        # internally, it gets different dynamics → ffeas≈21 even though rollout gave 0.
+        # Therefore: use rollout ONLY for cold-start (fresh problem, no stale cache).
+        # For warm-start, use shift_trajectory + shift_controls (original approach),
+        # which keeps ffeas low for stand mode and acceptable for walk mode.
         if warm_start and self._prev_xs is not None and self._prev_us is not None:
-            # Build candidate warm-start trajectory (shift by 1 step)
+            # Shift previous solution by one step (xs stays near current state)
             xs_init = self._shift_trajectory(self._prev_xs, current_state)
             us_init = self._shift_controls(self._prev_us)
             xs_init = self._adjust_length(xs_init, T + 1, current_state)
             us_init = self._adjust_length(us_init, T, np.zeros(self.actuation.nu))
-
-            # Compute warm-start feasibility: average dynamics gap over horizon.
-            # If too large, FDDP will diverge with only max_iterations RTI iters.
-            #
-            # CRITICAL: Use m.createData() (fresh temp data) — do NOT use
-            # problem.runningDatas[i]. Crocoddyl contact models cache the
-            # Baumgarte reference foot position (p0) in the Data object on
-            # first activation. Calling m.calc(problem.runningDatas[i], xs_warm, ...)
-            # with the wrong warm-start state locks p0 at wrong values, corrupting
-            # the subsequent problem.rollout(us_grav) cold-start → rollout ffeas
-            # rises from ~1.5 to 7+ → cold-start also diverges.
-            running_ffeas = 0.0
-            for i in range(T):
-                m = problem.runningModels[i]
-                d_tmp = m.createData()  # fresh data: never corrupts problem.runningDatas
-                m.calc(d_tmp, xs_init[i], us_init[i])
-                gap = m.state.diff(xs_init[i + 1], d_tmp.xnext)
-                running_ffeas += float(np.linalg.norm(gap))
-            running_ffeas /= T
-
-            if running_ffeas <= self.ffeas_threshold:
-                use_warm_start = True
-                solver.setCandidate(xs_init, us_init, False)
-                if is_verbose_call:
-                    print(f"  Warm-start: YES (ffeas={running_ffeas:.2f} ≤ {self.ffeas_threshold}, RTI)", flush=True)
-            else:
-                if is_verbose_call:
-                    print(f"  Warm-start rejected: ffeas={running_ffeas:.2f} > {self.ffeas_threshold} → cold-start", flush=True)
-
-        if not use_warm_start:
+            solver.setCandidate(xs_init, us_init, False)
+            if is_verbose_call:
+                print(f"  Warm-start: YES (shifted prev solution)", flush=True)
+        else:
             # Cold-start: gravity comp controls, rollout to get near-feasible xs.
-            # Rollout is safe here (gravity_comp has no stale contact forces).
+            # Rollout is safe here (fresh problem, no cached contact state to corrupt).
             u_grav = self._compute_gravity_compensation(current_state)
             us_init = [u_grav.copy() for _ in range(T)]
             xs_init = list(problem.rollout(us_init))
@@ -368,25 +332,17 @@ class CrocoddylQuadrupedMPC(BaseMPC):
                 print(f"  u_grav: [{', '.join(f'{v:.2f}' for v in u_grav)}]", flush=True)
 
         # Solve.
-        # Adaptive iterations: RTI uses few iters for warm-start (state barely changes
-        # at 50 Hz), but cold-start needs full convergence from scratch.
-        # COLD_START_ITERS is fixed at 50 — same value that worked pre-RTI.
-        # self.max_iterations (cfg.mpc_max_iterations=5) is used for warm-start only.
-        COLD_START_ITERS = 50
-        n_iters = self.max_iterations if use_warm_start else COLD_START_ITERS
-
         # regInit=1e-9: provide a small non-zero initial regularization so
         # FDDP's backward pass stays well-conditioned on the contact Hessian.
         converged = solver.solve(
-            [], [],   # Initial guess (use candidate set above via setCandidate)
-            n_iters,
-            False,    # isFeasible=False: FDDP computes and handles gaps normally
-            1e-9,     # regInit: small initial regularization for numerical stability
+            [], [],  # Initial guess (use candidate set above via setCandidate)
+            self.max_iterations,
+            False,  # isFeasible=False: FDDP computes and handles gaps normally
+            1e-9,   # regInit: small initial regularization for numerical stability
         )
 
         if is_verbose_call:
-            mode = "warm" if use_warm_start else "cold"
-            print(f"  Result [{mode}-start, max={n_iters}]: converged={converged}, iters={solver.iter}, cost={solver.cost:.2f}", flush=True)
+            print(f"  Result: converged={converged}, iters={solver.iter}, cost={solver.cost:.2f}", flush=True)
             if len(solver.us) > 0:
                 u0 = solver.us[0]
                 print(f"  u[0]: [{', '.join(f'{v:.2f}' for v in u0)}]", flush=True)
@@ -400,17 +356,9 @@ class CrocoddylQuadrupedMPC(BaseMPC):
         xs = list(solver.xs)
         us = list(solver.us)
 
-        # Only store xs/us for next warm-start when this solve did NOT diverge.
-        # Diverged xs (cost >> 1e4) are garbage: storing them makes the next
-        # warm-start's ||ffeas|| WORSE and cascades the divergence across many steps.
-        # When a diverged solve is detected, keep the previous _prev_xs/_prev_us
-        # (from the last good solve) so the ffeas check above has the best available
-        # starting point.
-        STORE_COST_THRESHOLD = 1e4  # cost above this → solve is too diverged to store
-        if solver.cost < STORE_COST_THRESHOLD:
-            self._prev_xs = xs
-            self._prev_us = us
-        # else: keep old _prev_xs/_prev_us intact
+        # Store controls for next warm-start (always reuse, rollout ensures feasibility)
+        self._prev_xs = xs
+        self._prev_us = us
 
         # Advance the gait phase clock so the next solve starts from the correct
         # position in the gait cycle (fixes the "Groundhog Day" bug).

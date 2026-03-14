@@ -26,8 +26,8 @@ from isaaclab.app import AppLauncher
 # Parse arguments before launching app
 parser = argparse.ArgumentParser(description="Train Quadruped MPC agent")
 parser.add_argument(
-    "--num_envs", type=int, default=4,
-    help="Number of parallel environments (RTI: 4 envs ≈ 11s/iter; scale up after verifying speed)"
+    "--num_envs", type=int, default=32,
+    help="Number of parallel environments (limited by CPU MPC)"
 )
 parser.add_argument(
     "--max_iterations", type=int, default=500,
@@ -94,38 +94,18 @@ def create_ppo_config(env_cfg: QuadrupedMPCEnvCfg):
     Returns:
         Dictionary with PPO configuration.
     """
-    # Timing reference (RTI scheme: mpc_max_iterations=5, mpc_horizon_steps=20):
-    #   1 MPC solve (Crocoddyl FDDP, 20 nodes, 5 iters, CPU) ≈ 20-25ms
-    #   1 env.step() wall time ≈ num_envs × 22ms  (MPC runs serially in Python)
-    #   1 PPO iteration wall time ≈ num_steps_per_env × num_envs × 22ms
-    #
-    # num_steps_per_env selection:
-    #   - rl_policy_period=10: Bezier params update every 10 env.steps()
-    #     (but counter never increments, so effectively 50 Hz — all steps give gradient)
-    #   - 128 steps is a good balance of gradient signal vs. wall time
-    #
-    # Per-iteration timing at 128 steps (RTI, estimated):
-    #   num_envs=2  → 128 × 2 × 0.022s  ≈  5.6s  ≈ fast!
-    #   num_envs=4  → 128 × 4 × 0.022s  ≈ 11.3s  ← recommended
-    #   num_envs=8  → 128 × 8 × 0.022s  ≈ 22.5s
-    #   num_envs=16 → 128 × 16 × 0.022s ≈  45s
     return {
         "seed": args_cli.seed,
         "device": "cuda" if torch.cuda.is_available() else "cpu",
-        # Rollout length per env per PPO iteration.
-        # Must be >> rl_policy_period (10) to capture multiple Bezier decisions.
-        # 128 = 12.8 Bezier updates per rollout (good balance of signal vs. wall time).
-        "num_steps_per_env": 128,
+        "num_steps_per_env": 24,  # Rollout length
         "max_iterations": args_cli.max_iterations,
         "empirical_normalization": True,
-        # Observation groups (required by RSL-RL v2+)
+        # Observation groups (required by new RSL-RL)
         "obs_groups": {},
         # PPO algorithm parameters
         "policy": {
             "class_name": "ActorCritic",
-            # Start with low noise so the robot doesn't flail randomly;
-            # the MPC-only baseline already walks, so mild exploration is enough.
-            "init_noise_std": 0.15,
+            "init_noise_std": 1.0,
             "actor_hidden_dims": [256, 256, 128],
             "critic_hidden_dims": [256, 256, 128],
             "activation": "elu",
@@ -135,19 +115,19 @@ def create_ppo_config(env_cfg: QuadrupedMPCEnvCfg):
             "value_loss_coef": 1.0,
             "use_clipped_value_loss": True,
             "clip_param": 0.2,
-            "entropy_coef": 0.005,   # Low entropy coef: MPC already stable, avoid chaos
+            "entropy_coef": 0.01,
             "num_learning_epochs": 5,
             "num_mini_batches": 4,
-            "learning_rate": 1e-4,   # Conservative LR: MPC pipeline is fragile to large actions
-            "schedule": "adaptive",  # Adaptive LR via KL divergence
+            "learning_rate": 3e-4,
+            "schedule": "fixed", # adaptive
             "gamma": 0.99,
             "lam": 0.95,
             "desired_kl": 0.01,
             "max_grad_norm": 1.0,
         },
-        # Logging — save frequently so quick-tests don't lose progress
-        "save_interval": 25,
-        "log_interval": 5,
+        # Logging
+        "save_interval": 100,
+        "log_interval": 10,
         "experiment_name": "quadruped_mpc_bezier",
         "run_name": datetime.now().strftime("%Y-%m-%d_%H-%M-%S"),
     }
