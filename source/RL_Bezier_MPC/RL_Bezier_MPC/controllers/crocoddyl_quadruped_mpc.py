@@ -371,17 +371,25 @@ class CrocoddylQuadrupedMPC(BaseMPC):
                 print(f"  u_grav: [{', '.join(f'{v:.2f}' for v in u_grav)}]", flush=True)
 
         # Solve.
+        # Adaptive iterations: RTI uses few iters for warm-start (state barely changes
+        # at 50 Hz), but cold-start needs full convergence from scratch.
+        # COLD_START_ITERS is fixed at 50 — same value that worked pre-RTI.
+        # self.max_iterations (cfg.mpc_max_iterations=5) is used for warm-start only.
+        COLD_START_ITERS = 50
+        n_iters = self.max_iterations if use_warm_start else COLD_START_ITERS
+
         # regInit=1e-9: provide a small non-zero initial regularization so
         # FDDP's backward pass stays well-conditioned on the contact Hessian.
         converged = solver.solve(
-            [], [],  # Initial guess (use candidate set above via setCandidate)
-            self.max_iterations,
-            False,  # isFeasible=False: FDDP computes and handles gaps normally
-            1e-9,   # regInit: small initial regularization for numerical stability
+            [], [],   # Initial guess (use candidate set above via setCandidate)
+            n_iters,
+            False,    # isFeasible=False: FDDP computes and handles gaps normally
+            1e-9,     # regInit: small initial regularization for numerical stability
         )
 
         if is_verbose_call:
-            print(f"  Result: converged={converged}, iters={solver.iter}, cost={solver.cost:.2f}", flush=True)
+            mode = "warm" if use_warm_start else "cold"
+            print(f"  Result [{mode}-start, max={n_iters}]: converged={converged}, iters={solver.iter}, cost={solver.cost:.2f}", flush=True)
             if len(solver.us) > 0:
                 u0 = solver.us[0]
                 print(f"  u[0]: [{', '.join(f'{v:.2f}' for v in u0)}]", flush=True)
