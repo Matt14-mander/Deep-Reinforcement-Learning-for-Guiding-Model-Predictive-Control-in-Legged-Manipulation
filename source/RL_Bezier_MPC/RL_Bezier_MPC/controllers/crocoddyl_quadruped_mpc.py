@@ -330,12 +330,20 @@ class CrocoddylQuadrupedMPC(BaseMPC):
 
             # Compute warm-start feasibility: average dynamics gap over horizon.
             # If too large, FDDP will diverge with only max_iterations RTI iters.
+            #
+            # CRITICAL: Use m.createData() (fresh temp data) — do NOT use
+            # problem.runningDatas[i]. Crocoddyl contact models cache the
+            # Baumgarte reference foot position (p0) in the Data object on
+            # first activation. Calling m.calc(problem.runningDatas[i], xs_warm, ...)
+            # with the wrong warm-start state locks p0 at wrong values, corrupting
+            # the subsequent problem.rollout(us_grav) cold-start → rollout ffeas
+            # rises from ~1.5 to 7+ → cold-start also diverges.
             running_ffeas = 0.0
             for i in range(T):
                 m = problem.runningModels[i]
-                d = problem.runningDatas[i]
-                m.calc(d, xs_init[i], us_init[i])
-                gap = m.state.diff(xs_init[i + 1], d.xnext)
+                d_tmp = m.createData()  # fresh data: never corrupts problem.runningDatas
+                m.calc(d_tmp, xs_init[i], us_init[i])
+                gap = m.state.diff(xs_init[i + 1], d_tmp.xnext)
                 running_ffeas += float(np.linalg.norm(gap))
             running_ffeas /= T
 
