@@ -182,20 +182,17 @@ class QuadrupedMPCEnv(DirectRLEnv):
         # Consecutive-step counter for height termination grace period
         self._too_low_counter = torch.zeros(self.num_envs, dtype=torch.long, device=self.device)
 
-<<<<<<< HEAD
+        # Per-env guard flag and failure counter — used by _get_dones() and _get_rewards()
         self.guard_triggered = torch.zeros(self.num_envs, dtype=torch.bool, device=self.device)
         self.consecutive_mpc_failures = torch.zeros(self.num_envs, dtype=torch.long, device=self.device)
-=======
         # Per-foot world-frame z heights, populated in _pre_physics_step via Pinocchio FK.
         # Used in _get_observations() for proper per-foot contact detection.
         # Order: [LF=FL, RF=FR, LH=RL, RH=RR]
         self._foot_heights = np.zeros((self.num_envs, 4))
-
         # Guard firing statistics (printed periodically to monitor MPC health during training)
         self._guard_fire_count = 0   # guard triggers since last print
         self._mpc_total_count = 0    # total MPC solves since last print
         self._guard_print_interval = 256  # print every N total solves (≈ 2 PPO rollout steps)
->>>>>>> 0f1c8550f3b319bd8fd696a48f9f86a9b0330878
 
         # Action bounds for normalization
         bezier_low, bezier_high = self.trajectory_generator.get_param_bounds()
@@ -519,53 +516,20 @@ class QuadrupedMPCEnv(DirectRLEnv):
                     )
                     self.last_mpc_solutions[env_idx] = solution
 
-<<<<<<< HEAD
-                    # MPC 发散保护
-                    _COST_THRESHOLD = 50000.0
-                    if solution.cost > _COST_THRESHOLD or np.isnan(solution.cost):
-                        self.guard_triggered[env_idx] = True  # 记录本回合触发了保护
-                        if self._last_good_solutions[env_idx] is not None:
-                            # 注意：这里修复了打印 Bug，改为打印真实的 solution.cost
-                            if env_idx == 0:
-                                print(f"[MPC Guard] env {env_idx}: FAILED cost={solution.cost:.0f} → fallback", flush=True)
-                            solution = self._last_good_solutions[env_idx]
-                        else:
-                            # 无历史有效解：零前馈 + 站立姿态
-                            joint_torques = np.zeros(self.cfg.num_joints)
-                            if hasattr(self._pinocchio_model, 'referenceConfigurations') and "standing" in self._pinocchio_model.referenceConfigurations:
-                                joint_positions = self._pinocchio_model.referenceConfigurations["standing"][7:19]
-                            else:
-                                joint_positions = np.array([0.1, 0.8, -1.5, -0.1, 0.8, -1.5, 0.1, 0.8, -1.5, -0.1, 0.8, -1.5])
-                            self._last_mpc_costs[env_idx] = solution.cost
-                            self._last_mpc_converged[env_idx] = False
-                            self._apply_control(env_idx, joint_positions, joint_torques)
-                            continue
-                    else:
-                        # 只有正常动作才解除警报
-                        self.guard_triggered[env_idx] = False
-=======
                     # MPC 发散保护：代价爆炸且未收敛时，立即回退到站立姿态
                     # 阈值 5e4：远高于正常收敛代价（数百量级），低于发散代价（百万量级）
-                    #
-                    # RL 训练架构说明：
-                    #   以前的设计：用上次有效解作为 fallback → 问题：
-                    #     - guard 连续触发 40+ 步时，fallback 解已是 40 步前的旧状态 → 机器人状态
-                    #       已完全改变，旧扭矩加速漂移到错误状态
-                    #     - fallback 解本身 cost 可高达 49552（接近门槛），并非真正"好解"
-                    #   现在的设计：统一 fallback 到站立姿态（零前馈 + PD 控制向站姿）
-                    #     - 零前馈 → IsaacLab 的 PD 作动器会施加站立弹簧力，物理上安全
-                    #     - 总是新鲜的（基于当前状态计算），永远不会过时
-                    #     - RL 的 reward：failed_cost → mpc_cost_penalty 最大惩罚，正确引导学习
+                    # fallback 设计：统一回退到零前馈+站立姿态（不再使用历史解）
+                    # RL reward 信号：failed_cost 写入 _last_mpc_costs → mpc_cost_penalty 最大惩罚
                     _COST_THRESHOLD = 5e4
                     guard_fired = False
                     failed_cost_for_reward = None
-
                     self._mpc_total_count += 1
                     if not solution.converged and solution.cost > _COST_THRESHOLD:
                         guard_fired = True
                         failed_cost_for_reward = solution.cost
                         self._guard_fire_count += 1
-                        # 统一 fallback：零前馈 + 站立关节位置（不再区分有无历史解）
+                        self.guard_triggered[env_idx] = True  # 供 _get_dones()/_get_rewards() 使用
+                        # 统一 fallback：零前馈 + 站立关节位置
                         joint_torques = np.zeros(self.cfg.num_joints)
                         if hasattr(self._pinocchio_model, 'referenceConfigurations') and "standing" in self._pinocchio_model.referenceConfigurations:
                             joint_positions = self._pinocchio_model.referenceConfigurations["standing"][7:19]
@@ -574,15 +538,14 @@ class QuadrupedMPCEnv(DirectRLEnv):
                         self._last_mpc_costs[env_idx] = failed_cost_for_reward  # RL 看到真实失败 cost
                         self._last_mpc_converged[env_idx] = False
                         self._apply_control(env_idx, joint_positions, joint_torques)
-                        # 周期性打印触发率（替代每步打印）
+                        # 周期性打印触发率
                         if self._mpc_total_count % self._guard_print_interval == 0:
                             rate = 100.0 * self._guard_fire_count / self._guard_print_interval
                             print(f"[MPC Guard rate] {rate:.1f}% ({self._guard_fire_count}/{self._guard_print_interval} solves) last failed cost={failed_cost_for_reward:.0f}", flush=True)
                             self._guard_fire_count = 0
                         continue  # 跳过后续正常提取
                     else:
-                        # 本次解有效，更新 last_good（保留 buffer 供调试，但不再用于 fallback）
->>>>>>> 0f1c8550f3b319bd8fd696a48f9f86a9b0330878
+                        self.guard_triggered[env_idx] = False  # 正常解时清除 flag
                         self._last_good_solutions[env_idx] = solution
 
                     # 1. 提取前馈扭矩
