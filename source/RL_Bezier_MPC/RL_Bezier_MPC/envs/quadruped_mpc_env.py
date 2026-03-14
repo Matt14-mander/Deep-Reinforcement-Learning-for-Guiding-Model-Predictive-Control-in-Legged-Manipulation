@@ -181,6 +181,10 @@ class QuadrupedMPCEnv(DirectRLEnv):
         # Consecutive-step counter for height termination grace period
         self._too_low_counter = torch.zeros(self.num_envs, dtype=torch.long, device=self.device)
 
+        # Guard state tracking: prevent RL from exploiting fallback as a "safe haven"
+        self.guard_triggered = torch.zeros(self.num_envs, dtype=torch.bool, device=self.device)
+        self.consecutive_mpc_failures = torch.zeros(self.num_envs, dtype=torch.long, device=self.device)
+
         # Action bounds for normalization
         bezier_low, bezier_high = self.trajectory_generator.get_param_bounds()
 
@@ -476,19 +480,17 @@ class QuadrupedMPCEnv(DirectRLEnv):
                     )
                     self.last_mpc_solutions[env_idx] = solution
 
-                    # MPC 发散保护：代价爆炸且未收敛时，回退到上一次有效解
-                    # 阈值 5e4：远高于正常收敛代价（数百量级），低于发散代价（百万量级）
-                    _COST_THRESHOLD = 5e4
-                    _guard_fired = not solution.converged and solution.cost > _COST_THRESHOLD
-                    if _guard_fired:
-                        failed_cost_for_reward = solution.cost  # 保存失败代价，用于 RL 奖励惩罚
+                    # MPC divergence guard: catch exploding or NaN costs, fall back to last-good solution
+                    _COST_THRESHOLD = 50000.0
+                    if solution.cost > _COST_THRESHOLD or np.isnan(solution.cost):
+                        self.guard_triggered[env_idx] = True
+                        failed_cost_for_reward = solution.cost  # save before overwriting with fallback
                         if self._last_good_solutions[env_idx] is not None:
-                            # 用上一次有效解代替本次失败结果（提取控制量，但用失败代价惩罚 RL）
-                            solution = self._last_good_solutions[env_idx]
                             if env_idx == 0:
-                                print(f"[MPC Guard] env {env_idx}: cost={failed_cost_for_reward:.0f} → fallback to last-good solution", flush=True)
+                                print(f"[MPC Guard] env {env_idx}: FAILED cost={failed_cost_for_reward:.0f} → fallback", flush=True)
+                            solution = self._last_good_solutions[env_idx]
                         else:
-                            # 无历史有效解：零前馈 + 站立姿态
+                            # No history: zero torques + standing pose
                             joint_torques = np.zeros(self.cfg.num_joints)
                             if hasattr(self._pinocchio_model, 'referenceConfigurations') and "standing" in self._pinocchio_model.referenceConfigurations:
                                 joint_positions = self._pinocchio_model.referenceConfigurations["standing"][7:19]
@@ -497,26 +499,26 @@ class QuadrupedMPCEnv(DirectRLEnv):
                             self._last_mpc_costs[env_idx] = failed_cost_for_reward
                             self._last_mpc_converged[env_idx] = False
                             self._apply_control(env_idx, joint_positions, joint_torques)
-                            continue  # 跳过后续正常提取，直接进入下一个 env_idx
+                            continue
                     else:
-                        # 本次解有效，更新 last_good
+                        # Normal solution — clear guard flag and update last-good
+                        self.guard_triggered[env_idx] = False
                         self._last_good_solutions[env_idx] = solution
 
-                    # 1. 提取前馈扭矩
+                    # 1. Extract feedforward torques
                     joint_torques = solution.control
 
-                    # 2. 提取预测的目标位置 (重点！)
+                    # 2. Extract predicted joint positions
                     if hasattr(solution, 'predicted_states') and len(solution.predicted_states) > 1:
                         joint_positions = solution.predicted_states[1][7:19]
                     else:
-                        # 兜底：站立姿态
                         if hasattr(self._pinocchio_model, 'referenceConfigurations') and "standing" in self._pinocchio_model.referenceConfigurations:
                             joint_positions = self._pinocchio_model.referenceConfigurations["standing"][7:19]
                         else:
                             joint_positions = np.array([0.1, 0.8, -1.5, -0.1, 0.8, -1.5, 0.1, 0.8, -1.5, -0.1, 0.8, -1.5])
 
-                    # 代价记录：guard 触发时用失败代价（给 RL 正确惩罚），否则用实际代价
-                    if _guard_fired:
+                    # Cost tracking: use failed cost for RL penalty when guard fires
+                    if self.guard_triggered[env_idx]:
                         self._last_mpc_costs[env_idx] = failed_cost_for_reward
                         self._last_mpc_converged[env_idx] = False
                     else:
@@ -526,12 +528,13 @@ class QuadrupedMPCEnv(DirectRLEnv):
                 except Exception as e:
                     if env_idx == 0:
                         print(f"Warning: MPC solve failed for env {env_idx}: {e}")
+                    self.guard_triggered[env_idx] = True  # exception counts as guard fire
                     joint_torques = np.zeros(self.cfg.num_joints)
                     if hasattr(self._pinocchio_model, 'referenceConfigurations') and "standing" in self._pinocchio_model.referenceConfigurations:
                         joint_positions = self._pinocchio_model.referenceConfigurations["standing"][7:19]
                     else:
                         joint_positions = np.array([0.1, 0.8, -1.5, -0.1, 0.8, -1.5, 0.1, 0.8, -1.5, -0.1, 0.8, -1.5])
-                    
+
                     self.last_mpc_solutions[env_idx] = None
                     self._last_mpc_costs[env_idx] = 1e6
                     self._last_mpc_converged[env_idx] = False
@@ -714,6 +717,9 @@ class QuadrupedMPCEnv(DirectRLEnv):
                 self.cfg.reward_mpc_convergence if self._last_mpc_converged[env_idx] else 0.0
             )
 
+            # Guard penalty: large negative reward when MPC fallback fires
+            guard_penalty = -10.0 if self.guard_triggered[env_idx] else 0.0
+
             # Total reward
             rewards[env_idx] = (
                 com_reward
@@ -724,6 +730,7 @@ class QuadrupedMPCEnv(DirectRLEnv):
                 + target_bonus
                 + mpc_cost_penalty
                 + mpc_convergence_reward
+                + guard_penalty
             )
 
         return rewards
@@ -749,6 +756,14 @@ class QuadrupedMPCEnv(DirectRLEnv):
         too_low = self._too_low_counter >= self.cfg.min_body_height_consecutive_steps
         too_high = position[:, 2] > self.cfg.max_body_height
 
+        # Consecutive MPC failures: terminate after 5 consecutive guard fires (~1s of fallback)
+        self.consecutive_mpc_failures = torch.where(
+            self.guard_triggered,
+            self.consecutive_mpc_failures + 1,
+            torch.zeros_like(self.consecutive_mpc_failures)
+        )
+        too_many_failures = self.consecutive_mpc_failures >= 5
+
         # Orientation check (flipped)
         w = orientation[:, 0]
         x = orientation[:, 1]
@@ -764,7 +779,7 @@ class QuadrupedMPCEnv(DirectRLEnv):
         out_of_bounds = distance > self.cfg.max_distance_from_start
 
         # Termination
-        terminated = too_low | too_high | flipped | out_of_bounds
+        terminated = too_low | too_high | flipped | out_of_bounds | too_many_failures
 
         # Truncation (timeout)
         time_out = self.episode_length_buf >= self.max_episode_length
@@ -875,6 +890,10 @@ class QuadrupedMPCEnv(DirectRLEnv):
             self._z_vel_filtered[env_idx] = 0.0
             self._last_good_solutions[env_idx] = None
             self._too_low_counter[env_idx] = 0
+
+            # Reset guard state
+            self.guard_triggered[env_idx] = False
+            self.consecutive_mpc_failures[env_idx] = 0
 
             # Reset stored params
             self.prev_bezier_params[env_idx] = initial_params
