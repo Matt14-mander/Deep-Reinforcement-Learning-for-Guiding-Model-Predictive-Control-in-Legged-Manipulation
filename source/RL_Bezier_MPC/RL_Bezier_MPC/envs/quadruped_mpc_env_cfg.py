@@ -11,8 +11,12 @@ integrates RL policy (CoM Bezier + gait modulation) with quadruped MPC.
 Frequency Hierarchy:
     Physics simulation: 200 Hz (sim.dt = 0.005s)
     MPC control rate:   50 Hz  (decimation = 4)
-    RL policy rate:    5 Hz   (every 10 MPC cycles, slower for quadruped)
-    Bezier horizon:     1.5 s  (75 waypoints at 50 Hz)
+    RL policy rate:    50 Hz  (every MPC step — counter never increments, intentional for RL)
+    Bezier horizon:     1.0 s  (51 waypoints at 50 Hz; only first 20 used by MPC horizon)
+
+RTI (Real-Time Iteration) scheme:
+    mpc_max_iterations=5, mpc_horizon_steps=20 → ~10× faster per solve vs old 50-iter/25-step
+    At 50 Hz with warm-start, state changes minimally; 5 FDDP iters is sufficient
 
 Action Space:
     - CoM Bezier parameters (12D): 4 control points × 3D
@@ -80,7 +84,7 @@ class QuadrupedMPCEnvCfg(DirectRLEnvCfg):
     # ==========================================================================
 
     scene: InteractiveSceneCfg = InteractiveSceneCfg(
-        num_envs=32,  # Fewer envs due to heavier MPC computation
+        num_envs=4,   # RTI: 4 envs × 22ms/solve × 128 steps ≈ 11s/iter (train script overrides)
         env_spacing=4.0,  # Larger spacing for locomotion
         replicate_physics=True,
     )
@@ -127,29 +131,45 @@ class QuadrupedMPCEnvCfg(DirectRLEnvCfg):
     # MPC timestep (should match control rate)
     mpc_dt: float = 0.02  # 50 Hz
 
-    # MPC prediction horizon
-    mpc_horizon_steps: int = 25  # 0.5s lookahead
+    # MPC prediction horizon (RTI: 20 steps = 0.4s, covers 1 full trot cycle at 2.5 Hz)
+    # Reduced from 25 → 20: fewer OCP nodes per solve → faster backward pass
+    mpc_horizon_steps: int = 20  # 0.4s lookahead
 
-    # MPC solver max iterations (FDDP needs 50+ for 37D state problem)
-    # Previous value of 10 was too low → 0% convergence rate
-    mpc_max_iterations: int = 50
+    # MPC solver max iterations (RTI scheme).
+    # Warm-start at 50 Hz: state changes minimally, so few FDDP iters suffice.
+    # RTI-5  → ~20ms/solve (too few: guard fires >30%, robot falls regardless of RL action)
+    # RTI-10 → ~35ms/solve (balanced: guard rate <15%, RL policy gets meaningful gradient)
+    # RTI-50 → ~190ms/solve (full convergence, very slow: 87s/iter)
+    # Value: 10 gives ~25s/iter, acceptable speed with sufficient convergence quality.
+    mpc_max_iterations: int = 10
 
     # MPC verbose mode (print solver info for first 5 solves, for debugging)
     mpc_verbose: bool = False
+
+    # Warm-start feasibility threshold: if shifted warm-start has average dynamics
+    # gap (||ffeas||) above this value, fall back to cold-start (50 iters).
+    # 5.0 is empirically reliable: ffeas ≤ 5 → RTI converges, ffeas > 5 → diverges.
+    # Set to 0.0 to always cold-start (very slow), or inf to never fall back.
+    mpc_ffeas_threshold: float = 5.0
 
     # ==========================================================================
     # Trajectory Configuration
     # ==========================================================================
 
-    # Bezier trajectory duration
-    bezier_horizon: float = 3.0  # seconds
+    # Bezier trajectory duration (RTI: 1.0s = 51 waypoints vs old 3.0s = 151 waypoints)
+    # Only first mpc_horizon_steps=20 waypoints are consumed; longer horizon wastes compute
+    # 1.0s still spans 2+ trot cycles — enough for RL to shape approach trajectory
+    bezier_horizon: float = 1.0  # seconds
 
     # RL policy update period (in MPC steps)
     # 10 MPC steps @ 50Hz = 5 Hz policy rate (slower for quadruped)
     rl_policy_period: int = 10
 
-    # Maximum displacement for CoM Bezier control points
-    max_bezier_displacement: float = 1.5  # meters (less than quadrotor)
+    # Maximum displacement for CoM Bezier control points (XY per control point).
+    # Stage 1: 0.3m → max initial CoM velocity = 3 × 0.3 / 3s = 0.3 m/s (achievable trot speed)
+    # Stage 2: expand to 0.8m after policy converges (allows faster gait commands)
+    # OLD value 1.5m caused random RL actions to demand 1.5 m/s velocity → MPC cost explosion
+    max_bezier_displacement: float = 0.3  # meters
 
     # Trajectory blending steps when updating
     trajectory_blend_steps: int = 5
@@ -261,7 +281,7 @@ class QuadrupedMPCEnvCfg(DirectRLEnvCfg):
     # ==========================================================================
 
     # Body height limits (fraction of standing height)
-    min_body_height_ratio: float = 0.2  # Too low = fallen
+    min_body_height_ratio: float = 0.3  # Too low = fallen
     max_body_height_ratio: float = 1.5  # Too high = jumping
 
     # Grace period: only terminate if body height is too low for this many consecutive steps

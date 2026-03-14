@@ -126,6 +126,7 @@ class QuadrupedMPCEnv(DirectRLEnv):
                     mu=cfg.friction_coefficient,
                     max_iterations=cfg.mpc_max_iterations,
                     verbose=(cfg.mpc_verbose and _ == 0),  # Only verbose for env 0
+                    ffeas_threshold=cfg.mpc_ffeas_threshold,
                 )
             else:
                 mpc = None  # Dummy mode
@@ -181,8 +182,20 @@ class QuadrupedMPCEnv(DirectRLEnv):
         # Consecutive-step counter for height termination grace period
         self._too_low_counter = torch.zeros(self.num_envs, dtype=torch.long, device=self.device)
 
+<<<<<<< HEAD
         self.guard_triggered = torch.zeros(self.num_envs, dtype=torch.bool, device=self.device)
         self.consecutive_mpc_failures = torch.zeros(self.num_envs, dtype=torch.long, device=self.device)
+=======
+        # Per-foot world-frame z heights, populated in _pre_physics_step via Pinocchio FK.
+        # Used in _get_observations() for proper per-foot contact detection.
+        # Order: [LF=FL, RF=FR, LH=RL, RH=RR]
+        self._foot_heights = np.zeros((self.num_envs, 4))
+
+        # Guard firing statistics (printed periodically to monitor MPC health during training)
+        self._guard_fire_count = 0   # guard triggers since last print
+        self._mpc_total_count = 0    # total MPC solves since last print
+        self._guard_print_interval = 256  # print every N total solves (≈ 2 PPO rollout steps)
+>>>>>>> 0f1c8550f3b319bd8fd696a48f9f86a9b0330878
 
         # Action bounds for normalization
         bezier_low, bezier_high = self.trajectory_generator.get_param_bounds()
@@ -324,16 +337,23 @@ class QuadrupedMPCEnv(DirectRLEnv):
         """Set up the simulation scene with Go2 quadruped and ground plane."""
         from isaaclab_assets.robots.unitree import UNITREE_GO2_CFG
 
+        # High-friction ground material (SESSION 7 fix).
+        # Default IsaacLab ground has friction ≈ 0.5–1.0, which allows foot slip.
+        # Foot slip at 50 Hz MPC causes large lateral velocity errors in the robot state
+        # that are fed back into the OCP, destabilizing Crocoddyl's contact model and
+        # causing MPC cost to spike (→ divergence).  Setting static and dynamic friction
+        # to 1.5 eliminates foot slip during stance, keeping the OCP cost well-conditioned.
+        # restitution=0: ground absorbs foot-impact energy (prevents bouncing oscillations).
         physics_material = sim_utils.RigidBodyMaterialCfg(
-            static_friction=1.5,   
-            dynamic_friction=1.5,
-            restitution=0.0        
+            static_friction=1.5,    # was ~0.5-1.0 (default); now "sticky" to prevent slip
+            dynamic_friction=1.5,   # same for sliding contacts
+            restitution=0.0,        # no bounce on impact
         )
 
         # Spawn ground plane
         ground_cfg = sim_utils.GroundPlaneCfg(
             size=(100.0, 100.0),
-            physics_material=physics_material
+            physics_material=physics_material,
         )
         ground_cfg.func("/World/ground", ground_cfg)
 
@@ -373,6 +393,22 @@ class QuadrupedMPCEnv(DirectRLEnv):
 
         # Parse action components
         bezier_params = actions_np[:, :self.cfg.num_bezier_actions]
+        # ----------------------------------------------------------------
+        # DEFAULT FORWARD WALKING BIAS (critical for RL learning)
+        # Without this: zero RL action → Bezier stays at current pos → MPC
+        # rewards "stand still" perfectly → RL converges to standing local optimum.
+        # With this: zero RL action → 0.2 m/s forward walk baseline.
+        # RL action then modulates around this forward-walking reference.
+        # ----------------------------------------------------------------
+        _hz = float(self.cfg.bezier_horizon)
+        _v_fwd = 0.2  # m/s base forward velocity
+        _fwd_bias = np.array([
+            0.0, 0.0, 0.0,
+            _v_fwd * _hz / 3, 0.0, 0.0,
+            _v_fwd * _hz * 2 / 3, 0.0, 0.0,
+            _v_fwd * _hz, 0.0, 0.0,
+        ], dtype=np.float32)
+        bezier_params = bezier_params + _fwd_bias[np.newaxis, :]
         if self.cfg.fix_gait_params:
             # Stage 1: gait params fixed to defaults (1.0 = no modulation)
             gait_mods = np.ones((self.num_envs, self.cfg.num_gait_mod_actions))
@@ -452,8 +488,14 @@ class QuadrupedMPCEnv(DirectRLEnv):
                 "step_frequency": gait_mods[env_idx, 2],
             }
 
-            # Get current foot positions (dummy for now)
+            # Get current foot positions via Pinocchio FK (used by MPC and observations)
             foot_positions = self._get_foot_positions_numpy(env_idx, robot_states[env_idx])
+
+            # Cache foot z-heights for per-foot contact detection in _get_observations()
+            _foot_name_order = ["LF", "RF", "LH", "RH"]
+            for _j, _fn in enumerate(_foot_name_order):
+                if _fn in foot_positions:
+                    self._foot_heights[env_idx, _j] = foot_positions[_fn][2]
 
             # Solve MPC
             if self.mpc_controllers[env_idx] is not None:
@@ -467,6 +509,7 @@ class QuadrupedMPCEnv(DirectRLEnv):
                     )
                     self.last_mpc_solutions[env_idx] = solution
 
+<<<<<<< HEAD
                     # MPC 发散保护
                     _COST_THRESHOLD = 50000.0
                     if solution.cost > _COST_THRESHOLD or np.isnan(solution.cost):
@@ -490,6 +533,46 @@ class QuadrupedMPCEnv(DirectRLEnv):
                     else:
                         # 只有正常动作才解除警报
                         self.guard_triggered[env_idx] = False
+=======
+                    # MPC 发散保护：代价爆炸且未收敛时，立即回退到站立姿态
+                    # 阈值 5e4：远高于正常收敛代价（数百量级），低于发散代价（百万量级）
+                    #
+                    # RL 训练架构说明：
+                    #   以前的设计：用上次有效解作为 fallback → 问题：
+                    #     - guard 连续触发 40+ 步时，fallback 解已是 40 步前的旧状态 → 机器人状态
+                    #       已完全改变，旧扭矩加速漂移到错误状态
+                    #     - fallback 解本身 cost 可高达 49552（接近门槛），并非真正"好解"
+                    #   现在的设计：统一 fallback 到站立姿态（零前馈 + PD 控制向站姿）
+                    #     - 零前馈 → IsaacLab 的 PD 作动器会施加站立弹簧力，物理上安全
+                    #     - 总是新鲜的（基于当前状态计算），永远不会过时
+                    #     - RL 的 reward：failed_cost → mpc_cost_penalty 最大惩罚，正确引导学习
+                    _COST_THRESHOLD = 5e4
+                    guard_fired = False
+                    failed_cost_for_reward = None
+
+                    self._mpc_total_count += 1
+                    if not solution.converged and solution.cost > _COST_THRESHOLD:
+                        guard_fired = True
+                        failed_cost_for_reward = solution.cost
+                        self._guard_fire_count += 1
+                        # 统一 fallback：零前馈 + 站立关节位置（不再区分有无历史解）
+                        joint_torques = np.zeros(self.cfg.num_joints)
+                        if hasattr(self._pinocchio_model, 'referenceConfigurations') and "standing" in self._pinocchio_model.referenceConfigurations:
+                            joint_positions = self._pinocchio_model.referenceConfigurations["standing"][7:19]
+                        else:
+                            joint_positions = np.array([0.1, 0.8, -1.5, -0.1, 0.8, -1.5, 0.1, 0.8, -1.5, -0.1, 0.8, -1.5])
+                        self._last_mpc_costs[env_idx] = failed_cost_for_reward  # RL 看到真实失败 cost
+                        self._last_mpc_converged[env_idx] = False
+                        self._apply_control(env_idx, joint_positions, joint_torques)
+                        # 周期性打印触发率（替代每步打印）
+                        if self._mpc_total_count % self._guard_print_interval == 0:
+                            rate = 100.0 * self._guard_fire_count / self._guard_print_interval
+                            print(f"[MPC Guard rate] {rate:.1f}% ({self._guard_fire_count}/{self._guard_print_interval} solves) last failed cost={failed_cost_for_reward:.0f}", flush=True)
+                            self._guard_fire_count = 0
+                        continue  # 跳过后续正常提取
+                    else:
+                        # 本次解有效，更新 last_good（保留 buffer 供调试，但不再用于 fallback）
+>>>>>>> 0f1c8550f3b319bd8fd696a48f9f86a9b0330878
                         self._last_good_solutions[env_idx] = solution
 
                     # 1. 提取前馈扭矩
@@ -593,27 +676,40 @@ class QuadrupedMPCEnv(DirectRLEnv):
         robot_data = self.robot.data
 
         # Base state components
-        position = robot_data.root_pos_w  # (num_envs, 3)
+        position = robot_data.root_pos_w      # (num_envs, 3)
         orientation = robot_data.root_quat_w  # (num_envs, 4)
-        linear_vel = robot_data.root_lin_vel_w  # (num_envs, 3)
-        angular_vel = robot_data.root_ang_vel_w  # (num_envs, 3)
+        # Use BODY-FRAME velocity: more informative for locomotion control than world-frame,
+        # and consistent with what the MPC state uses (Pinocchio convention).
+        linear_vel = robot_data.root_lin_vel_b   # (num_envs, 3)  ← body frame
+        angular_vel = robot_data.root_ang_vel_b  # (num_envs, 3)  ← body frame
 
         # Joint state from articulation
         joint_pos = robot_data.joint_pos[:, :12]  # (num_envs, 12)
         joint_vel = robot_data.joint_vel[:, :12]  # (num_envs, 12)
 
-        # Foot contacts: estimate from foot height
-        # TODO: Add ContactSensorCfg for accurate contact detection
-        foot_contacts = (position[:, 2:3] < self.cfg.standing_height * 0.5).float()
-        foot_contacts = foot_contacts.expand(-1, 4)
+        # Foot contacts: use per-foot z positions cached from Pinocchio FK in _pre_physics_step.
+        # Contact threshold = 0.04 m (slightly above foot sphere radius 0.02 m to tolerate noise).
+        # Previous approach (body_z < 0.2m, same for all 4 feet) was completely wrong:
+        # it was 0 during normal walking (body z ≈ 0.38m > 0.2m) and 1 during falling.
+        _contact_threshold = 0.04  # meters above ground
+        foot_contacts = torch.tensor(
+            self._foot_heights < _contact_threshold,
+            device=self.device,
+            dtype=torch.float32,
+        )  # shape (num_envs, 4), order: [FL, FR, RL, RR]
 
-        # Target positions and phases
+        # Gait phase: use the global gait clock from the MPC controller.
+        # Previous approach (trajectory_phases / traj_len) was always 0 because
+        # trajectory_phases is never incremented — that feature was dead.
+        # gait_clock cycles through one full gait cycle, giving proper oscillating phase.
         phases = torch.zeros((self.num_envs, 1), device=self.device)
-
         for env_idx in range(self.num_envs):
-            phase = self.trajectory_phases[env_idx]
-            traj_len = len(self.current_com_trajectories[env_idx])
-            phases[env_idx] = phase / max(traj_len - 1, 1)
+            ctrl = self.mpc_controllers[env_idx]
+            if ctrl is not None:
+                cycle_dur = ctrl._get_cycle_duration(
+                    self.cfg.default_step_duration, self.cfg.default_support_duration
+                )
+                phases[env_idx] = (ctrl._gait_clock % cycle_dur) / cycle_dur
 
         # Concatenate observations
         obs = torch.cat([
@@ -713,6 +809,21 @@ class QuadrupedMPCEnv(DirectRLEnv):
                 + mpc_convergence_reward
                 + guard_penalty
             )
+
+        # Fall / flip penalty (vectorized): fires on the step that triggers termination.
+        # _get_rewards() is called before _get_dones(), so we use the counter from the
+        # PREVIOUS done-check (already reflects N-1 low steps) plus direct orientation check.
+        # This gives PPO a sharp negative signal for the "dying" state, much stronger than
+        # just the loss of future alive_bonus.
+        w_q = orientation[:, 0]; x_q = orientation[:, 1]
+        y_q = orientation[:, 2]; z_q = orientation[:, 3]
+        up_z = 1.0 - 2.0 * (x_q * x_q + y_q * y_q)
+        flipped = up_z < 0.5                                     # >60° tilt
+        nearly_fallen = (
+            self._too_low_counter >= max(1, self.cfg.min_body_height_consecutive_steps - 1)
+        )
+        terminal_mask = (flipped | nearly_fallen).float()
+        rewards += terminal_mask * self.cfg.reward_fall_penalty  # reward_fall_penalty = -10
 
         return rewards
 
@@ -870,6 +981,7 @@ class QuadrupedMPCEnv(DirectRLEnv):
             self._z_vel_filtered[env_idx] = 0.0
             self._last_good_solutions[env_idx] = None
             self._too_low_counter[env_idx] = 0
+            self._foot_heights[env_idx] = 0.0  # reset cached foot heights
 
             self.guard_triggered[env_idx] = False
             self.consecutive_mpc_failures[env_idx] = 0
