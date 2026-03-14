@@ -262,7 +262,11 @@ class QuadrupedMPCEnvCfg(DirectRLEnvCfg):
     reward_reached_target: float = 10.0
 
     # Penalties
-    reward_torque_penalty: float = -0.01
+    # NOTE: Torque penalty reduced from -0.01 to -0.001.
+    # At -0.01: normal walking (|τ|≈10 N·m, 12 joints) → Σ(τ²)≈1200 → penalty≈-12/step.
+    # This OVERWHELMS all positive rewards (max +2.1/step) → RL learns "minimize torque"
+    # not "walk forward". At -0.001: penalty≈-1.2/step, balanced with positive terms.
+    reward_torque_penalty: float = -0.001
     reward_joint_velocity_penalty: float = -0.01
     reward_foot_slip_penalty: float = -0.5
     reward_body_collision_penalty: float = -5.0

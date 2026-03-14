@@ -397,11 +397,14 @@ class QuadrupedMPCEnv(DirectRLEnv):
         # DEFAULT FORWARD WALKING BIAS (critical for RL learning)
         # Without this: zero RL action → Bezier stays at current pos → MPC
         # rewards "stand still" perfectly → RL converges to standing local optimum.
-        # With this: zero RL action → 0.2 m/s forward walk baseline.
+        # With this: zero RL action → 0.05 m/s forward walk baseline.
         # RL action then modulates around this forward-walking reference.
+        # NOTE: 0.05 m/s chosen carefully — standalone test uses P3_x=0.5m (0.5 m/s),
+        # so combined P3_x = 0.55m (0.55 m/s), which MPC handles reliably.
+        # 0.2 m/s was too large (combined 0.7 m/s → Solve #2 diverges → height collapse).
         # ----------------------------------------------------------------
         _hz = float(self.cfg.bezier_horizon)
-        _v_fwd = 0.2  # m/s base forward velocity
+        _v_fwd = 0.05  # m/s base forward velocity (reduced from 0.2 to prevent Solve #2 divergence)
         _fwd_bias = np.array([
             0.0, 0.0, 0.0,
             _v_fwd * _hz / 3, 0.0, 0.0,
@@ -425,11 +428,18 @@ class QuadrupedMPCEnv(DirectRLEnv):
             if self.mpc_step_counter[env_idx] % self.cfg.rl_policy_period == 0:
                 # Generate new CoM trajectory from Bezier parameters
                 current_pos = robot_states[env_idx, :3]
+                # HEIGHT REFERENCE FIX: always use standing_height for Z reference.
+                # Bug: using current_pos.Z means if robot falls to 0.22m, ALL subsequent
+                # trajectories target 0.22m → MPC tracks crouched posture forever.
+                # Fix: Z reference = standing_height so MPC always tries to recover height.
+                # The XY reference still tracks actual robot XY position (correct).
+                start_pos_for_traj = current_pos.copy()
+                start_pos_for_traj[2] = self.cfg.standing_height
                 new_trajectory = self.trajectory_generator.params_to_waypoints(
                     params=bezier_params[env_idx],
                     dt=self.cfg.mpc_dt,
                     horizon=self.cfg.bezier_horizon,
-                    start_position=current_pos,
+                    start_position=start_pos_for_traj,
                 )
 
                 # Blend with previous trajectory for smoothness
