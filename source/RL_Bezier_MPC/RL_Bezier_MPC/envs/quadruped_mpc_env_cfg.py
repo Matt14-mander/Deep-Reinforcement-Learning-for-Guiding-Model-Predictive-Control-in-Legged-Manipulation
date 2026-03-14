@@ -135,11 +135,13 @@ class QuadrupedMPCEnvCfg(DirectRLEnvCfg):
     # Reduced from 25 → 20: fewer OCP nodes per solve → faster backward pass
     mpc_horizon_steps: int = 20  # 0.4s lookahead
 
-    # MPC solver max iterations (RTI scheme: 5 iters at 50 Hz is sufficient with warm-start)
-    # At 50 Hz the state changes minimally between solves; 5 FDDP iters ≈ 10× faster per solve
-    # RTI-5 still uses guard threshold correctly (only fires when cost actually diverges)
-    # Old value of 50 was needed for cold-start convergence; RTI avoids that problem entirely
-    mpc_max_iterations: int = 5
+    # MPC solver max iterations (RTI scheme).
+    # Warm-start at 50 Hz: state changes minimally, so few FDDP iters suffice.
+    # RTI-5  → ~20ms/solve (too few: guard fires >30%, robot falls regardless of RL action)
+    # RTI-10 → ~35ms/solve (balanced: guard rate <15%, RL policy gets meaningful gradient)
+    # RTI-50 → ~190ms/solve (full convergence, very slow: 87s/iter)
+    # Value: 10 gives ~25s/iter, acceptable speed with sufficient convergence quality.
+    mpc_max_iterations: int = 10
 
     # MPC verbose mode (print solver info for first 5 solves, for debugging)
     mpc_verbose: bool = False
