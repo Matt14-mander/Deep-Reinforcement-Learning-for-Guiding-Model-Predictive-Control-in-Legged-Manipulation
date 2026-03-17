@@ -311,6 +311,7 @@ class CrocoddylQuadrupedMPC(BaseMPC):
         # Therefore: use rollout ONLY for cold-start (fresh problem, no stale cache).
         # For warm-start, use shift_trajectory + shift_controls (original approach),
         # which keeps ffeas low for stand mode and acceptable for walk mode.
+        use_warm_start = False
         if warm_start and self._prev_xs is not None and self._prev_us is not None:
             # Shift previous solution by one step (xs stays near current state)
             xs_init = self._shift_trajectory(self._prev_xs, current_state)
@@ -318,6 +319,7 @@ class CrocoddylQuadrupedMPC(BaseMPC):
             xs_init = self._adjust_length(xs_init, T + 1, current_state)
             us_init = self._adjust_length(us_init, T, np.zeros(self.actuation.nu))
             solver.setCandidate(xs_init, us_init, False)
+            use_warm_start = True
             if is_verbose_call:
                 print(f"  Warm-start: YES (shifted prev solution)", flush=True)
         else:
@@ -332,17 +334,22 @@ class CrocoddylQuadrupedMPC(BaseMPC):
                 print(f"  u_grav: [{', '.join(f'{v:.2f}' for v in u_grav)}]", flush=True)
 
         # Solve.
-        # regInit=1e-9: provide a small non-zero initial regularization so
-        # FDDP's backward pass stays well-conditioned on the contact Hessian.
+        # Adaptive iterations: warm-start (RTI) uses few iters since state barely
+        # changes at 50 Hz. Cold-start needs full convergence from a gravity-comp
+        # trajectory which can have initial ffeas=4-8 due to gait phase mismatch.
+        # 100 iters gives FDDP enough budget to recover from such infeasibilities.
+        COLD_START_ITERS = 100
+        n_iters = self.max_iterations if use_warm_start else COLD_START_ITERS
         converged = solver.solve(
             [], [],  # Initial guess (use candidate set above via setCandidate)
-            self.max_iterations,
+            n_iters,
             False,  # isFeasible=False: FDDP computes and handles gaps normally
             1e-9,   # regInit: small initial regularization for numerical stability
         )
 
         if is_verbose_call:
-            print(f"  Result: converged={converged}, iters={solver.iter}, cost={solver.cost:.2f}", flush=True)
+            mode = "warm" if use_warm_start else "cold"
+            print(f"  Result [{mode}-start, max={n_iters}]: converged={converged}, iters={solver.iter}, cost={solver.cost:.2f}", flush=True)
             if len(solver.us) > 0:
                 u0 = solver.us[0]
                 print(f"  u[0]: [{', '.join(f'{v:.2f}' for v in u0)}]", flush=True)
@@ -356,9 +363,13 @@ class CrocoddylQuadrupedMPC(BaseMPC):
         xs = list(solver.xs)
         us = list(solver.us)
 
-        # Store controls for next warm-start (always reuse, rollout ensures feasibility)
-        self._prev_xs = xs
-        self._prev_us = us
+        # Only store xs/us for next warm-start when this solve did NOT diverge.
+        # Diverged xs (cost >> 1e4) corrupt the next warm-start → cascade failure.
+        STORE_COST_THRESHOLD = 1e4
+        if solver.cost < STORE_COST_THRESHOLD:
+            self._prev_xs = xs
+            self._prev_us = us
+        # else: keep previous _prev_xs intact (last good solution)
 
         # Advance the gait phase clock so the next solve starts from the correct
         # position in the gait cycle (fixes the "Groundhog Day" bug).
