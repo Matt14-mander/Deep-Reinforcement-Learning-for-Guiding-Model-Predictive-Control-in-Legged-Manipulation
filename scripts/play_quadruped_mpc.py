@@ -17,6 +17,9 @@ Usage:
     # Load trained checkpoint + save trajectory plot
     python scripts/play_quadruped_mpc.py --checkpoint logs/quadruped_mpc/.../model_2999.pt --num_envs 1 --headless
 
+    # Record GIF animation
+    python scripts/play_quadruped_mpc.py --checkpoint model.pt --num_envs 1 --headless --record_gif
+
     # Livestream (real-time viewing via browser)
     python scripts/play_quadruped_mpc.py --checkpoint model.pt --num_envs 1 --headless --livestream 2
 """
@@ -64,6 +67,15 @@ parser.add_argument(
 parser.add_argument(
     "--plot_dir", type=str, default="plots",
     help="Directory to save trajectory plots",
+)
+parser.add_argument(
+    "--record_gif", action="store_true",
+    help="Record an animated GIF for each episode (saved to plot_dir)",
+)
+parser.add_argument(
+    "--gif_fps", type=int, default=10,
+    help="Frames per second for GIF output (default: 10). "
+         "Simulation runs at 50 Hz; every Nth step is captured where N=50/gif_fps.",
 )
 
 # AppLauncher arguments (adds --headless, --device, --livestream, etc.)
@@ -204,6 +216,145 @@ def plot_episode_trajectory(positions, orientations, target_pos, rewards,
     print(f"  Plot saved to: {save_path}")
 
 
+def render_gif_frame(positions_so_far, orientations_so_far, rewards_so_far,
+                     target_pos, step, max_steps, mpc_guard_count):
+    """Render a single animation frame as a numpy RGBA array.
+
+    Layout (800×400):
+      Left : Bird's-eye XY view – trajectory trail + current robot marker
+      Right: Two gauges – CoM height bar and pitch/roll dials
+
+    Args:
+        positions_so_far : (T, 3) array of positions up to current step.
+        orientations_so_far: (T, 4) quaternions (w, x, y, z).
+        rewards_so_far  : (T,) rewards up to current step.
+        target_pos      : (3,) target position.
+        step            : current step index.
+        max_steps       : episode max steps (for progress bar).
+        mpc_guard_count : number of MPC Guard failures so far.
+
+    Returns:
+        (H, W, 3) uint8 numpy array (RGB).
+    """
+    fig = plt.figure(figsize=(8, 4), dpi=100)
+    gs = fig.add_gridspec(2, 3, hspace=0.4, wspace=0.45)
+
+    pos = np.array(positions_so_far)
+    T = len(pos)
+    time_s = step * 0.02
+
+    # ── Left (tall): XY bird's-eye view ─────────────────────────────────────
+    ax_xy = fig.add_subplot(gs[:, :2])
+    trail_len = min(T, 100)
+    ax_xy.plot(pos[-trail_len:, 0], pos[-trail_len:, 1],
+               "b-", linewidth=1.2, alpha=0.6, label="trail")
+    ax_xy.plot(pos[0, 0], pos[0, 1], "go", markersize=8, label="start")
+    ax_xy.plot(target_pos[0], target_pos[1], "r*", markersize=12, label="target")
+    # Current robot position: large marker + heading arrow
+    cur_x, cur_y = pos[-1, 0], pos[-1, 1]
+    ax_xy.plot(cur_x, cur_y, "bs", markersize=10, label="robot")
+    if T >= 2:
+        dx = pos[-1, 0] - pos[-2, 0]
+        dy = pos[-1, 1] - pos[-2, 1]
+        norm = max(np.hypot(dx, dy), 1e-6)
+        ax_xy.annotate("", xy=(cur_x + dx / norm * 0.08, cur_y + dy / norm * 0.08),
+                        xytext=(cur_x, cur_y),
+                        arrowprops=dict(arrowstyle="->", color="navy", lw=1.8))
+
+    # Dynamic axes: keep robot centred
+    pad = 0.5
+    x_range = max(abs(pos[:, 0].max() - pos[:, 0].min()), 1.0) / 2 + pad
+    y_range = max(abs(pos[:, 1].max() - pos[:, 1].min()), 1.0) / 2 + pad
+    ax_xy.set_xlim(cur_x - x_range, cur_x + x_range)
+    ax_xy.set_ylim(cur_y - y_range, cur_y + y_range)
+    ax_xy.set_aspect("equal")
+    ax_xy.set_xlabel("X (m)", fontsize=8)
+    ax_xy.set_ylabel("Y (m)", fontsize=8)
+    ax_xy.set_title(
+        f"t={time_s:.2f}s  step={step}/{max_steps}  "
+        f"guard={mpc_guard_count}  Σr={np.sum(rewards_so_far):.1f}",
+        fontsize=8,
+    )
+    ax_xy.legend(loc="lower right", fontsize=7, framealpha=0.6)
+    ax_xy.grid(True, alpha=0.25)
+
+    # ── Top-right: CoM height ─────────────────────────────────────────────
+    ax_h = fig.add_subplot(gs[0, 2])
+    heights = pos[:, 2]
+    ax_h.plot(np.arange(T) * 0.02, heights, "b-", linewidth=1)
+    ax_h.axhline(0.28, color="g", linestyle="--", linewidth=0.8, label="nom")
+    ax_h.axhline(0.12, color="r", linestyle="--", linewidth=0.8, label="fall")
+    ax_h.set_ylim(0.0, 0.45)
+    ax_h.set_xlabel("t (s)", fontsize=7)
+    ax_h.set_ylabel("Z (m)", fontsize=7)
+    ax_h.set_title("Height", fontsize=8)
+    ax_h.tick_params(labelsize=6)
+    ax_h.legend(fontsize=6)
+    ax_h.grid(True, alpha=0.25)
+
+    # ── Bottom-right: Pitch/Roll ──────────────────────────────────────────
+    ax_rp = fig.add_subplot(gs[1, 2])
+    rolls, pitches = [], []
+    for q in orientations_so_far:
+        w, x, y, z = q
+        sinr = 2.0 * (w * x + y * z)
+        cosr = 1.0 - 2.0 * (x * x + y * y)
+        rolls.append(np.degrees(np.arctan2(sinr, cosr)))
+        sinp = np.clip(2.0 * (w * y - z * x), -1.0, 1.0)
+        pitches.append(np.degrees(np.arcsin(sinp)))
+    t_arr = np.arange(T) * 0.02
+    ax_rp.plot(t_arr, pitches, "g-", linewidth=1, label="pitch")
+    ax_rp.plot(t_arr, rolls, "r-", linewidth=1, label="roll")
+    ax_rp.axhline(0, color="k", linewidth=0.5)
+    ax_rp.set_ylim(-50, 50)
+    ax_rp.set_xlabel("t (s)", fontsize=7)
+    ax_rp.set_ylabel("deg", fontsize=7)
+    ax_rp.set_title("Pitch / Roll", fontsize=8)
+    ax_rp.tick_params(labelsize=6)
+    ax_rp.legend(fontsize=6)
+    ax_rp.grid(True, alpha=0.25)
+
+    # Convert figure to numpy RGB array
+    fig.canvas.draw()
+    buf = fig.canvas.tostring_rgb()
+    w_px, h_px = fig.canvas.get_width_height()
+    frame = np.frombuffer(buf, dtype=np.uint8).reshape(h_px, w_px, 3)
+    plt.close(fig)
+    return frame
+
+
+def save_gif(frames, save_path, fps=10):
+    """Save a list of numpy RGB frames as an animated GIF.
+
+    Args:
+        frames   : list of (H, W, 3) uint8 numpy arrays.
+        save_path: output .gif file path.
+        fps      : frames per second.
+    """
+    try:
+        from PIL import Image
+    except ImportError:
+        print("  [GIF] PIL not found. Install with: pip install Pillow")
+        return
+
+    if not frames:
+        print("  [GIF] No frames to save.")
+        return
+
+    duration_ms = int(1000 / fps)
+    pil_frames = [Image.fromarray(f) for f in frames]
+    pil_frames[0].save(
+        save_path,
+        save_all=True,
+        append_images=pil_frames[1:],
+        optimize=False,
+        duration=duration_ms,
+        loop=0,          # loop forever
+    )
+    size_kb = os.path.getsize(save_path) / 1024
+    print(f"  GIF saved: {save_path}  ({len(frames)} frames, {size_kb:.0f} KB)")
+
+
 def main():
     """Main play function."""
     print("=" * 60)
@@ -337,6 +488,12 @@ def main():
 
         max_steps = args_cli.max_steps
 
+        # GIF recording state
+        gif_frames = []
+        gif_guard_count = 0
+        # Capture every Nth step so GIF plays at gif_fps (sim runs at 50 Hz)
+        gif_capture_every = max(1, int(50 / args_cli.gif_fps))
+
         while not done and episode_length < max_steps:
             # Get actions
             if policy is not None and policy_fn is not None:
@@ -362,6 +519,25 @@ def main():
             positions_log.append(pos)
             orientations_log.append(quat)
             rewards_log.append(rewards[0].cpu().item())
+
+            # GIF frame capture
+            if args_cli.record_gif and (episode_length % gif_capture_every == 0):
+                # Track MPC Guard count from stdout is unreliable; approximate
+                # by detecting cost spikes in env's last_mpc_costs if available
+                try:
+                    guard_fires = int(getattr(env, "_guard_fires_total", gif_guard_count))
+                except Exception:
+                    guard_fires = gif_guard_count
+                frame = render_gif_frame(
+                    positions_log,
+                    orientations_log,
+                    rewards_log,
+                    target_pos=env.target_positions[0].cpu().numpy(),
+                    step=episode_length,
+                    max_steps=max_steps,
+                    mpc_guard_count=guard_fires,
+                )
+                gif_frames.append(frame)
 
             # Check if any environment is done
             dones = terminated | truncated
@@ -389,6 +565,14 @@ def main():
             episode, args_cli.plot_dir,
         )
 
+        # Save GIF if recording was enabled
+        if args_cli.record_gif and gif_frames:
+            os.makedirs(args_cli.plot_dir, exist_ok=True)
+            gif_path = os.path.join(
+                args_cli.plot_dir, f"episode_{episode + 1}.gif"
+            )
+            save_gif(gif_frames, gif_path, fps=args_cli.gif_fps)
+
     # Print summary
     print("\n" + "=" * 60)
     print("Summary")
@@ -397,6 +581,8 @@ def main():
     print(f"Average reward: {np.mean(episode_rewards_all):.2f} +/- {np.std(episode_rewards_all):.2f}")
     print(f"Average length: {np.mean(episode_lengths_all):.1f} steps")
     print(f"\nTrajectory plots saved to: {args_cli.plot_dir}/")
+    if args_cli.record_gif:
+        print(f"GIF animations saved to:   {args_cli.plot_dir}/*.gif")
 
     # Cleanup
     env.close()
