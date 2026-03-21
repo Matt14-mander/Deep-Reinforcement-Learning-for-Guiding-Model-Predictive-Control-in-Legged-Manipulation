@@ -223,8 +223,8 @@ class QuadrupedMPCEnvCfg(DirectRLEnvCfg):
     # Stage 2 (after stable walking): widen to y=±1.5, x=2~5
     # Stage 3 (advanced): full range with turning behavior
     target_pos_range: tuple = (
-        1.5, 3.0,   # x_min, x_max (close forward targets)
-        -0.5, 0.5,  # y_min, y_max (narrow lateral range)
+        0.8, 2.0,   # x_min, x_max (near targets so robot can actually reach them)
+        -0.3, 0.3,  # y_min, y_max (narrow lateral range, matches current forward gait)
         0.0, 0.0,   # z_min, z_max (ground level)
     )
 
@@ -250,19 +250,23 @@ class QuadrupedMPCEnvCfg(DirectRLEnvCfg):
 
     # Regularization
     reward_action_rate_penalty: float = -0.05
-    reward_alive: float = 0.1
+    reward_alive: float = 0.05  # Reduced from 0.1 to discourage "alive but stationary" behavior
 
     # MPC constraint-related rewards
     reward_mpc_cost_penalty: float = -0.001    # Penalize high MPC cost (constraint violations)
-    reward_mpc_convergence: float = 0.2        # Reward MPC solver convergence
+    reward_mpc_convergence: float = 0.3        # Reward MPC solver convergence (increased from 0.2)
+
+    # New rewards for better posture and navigation
+    reward_height_tracking: float = 0.3        # Reward maintaining nominal standing height (0.35m)
+    reward_lateral_penalty: float = -0.2       # Penalize Y-axis deviation from target direction
 
     # ==========================================================================
     # Termination Conditions
     # ==========================================================================
 
     # Body height limits (fraction of standing height)
-    min_body_height_ratio: float = 0.2  # Too low = fallen
-    max_body_height_ratio: float = 1.5  # Too high = jumping
+    min_body_height_ratio: float = 0.55  # 0.55 * 0.4m = 0.22m; forces upright posture (was 0.2 → 0.08m, too permissive)
+    max_body_height_ratio: float = 1.5   # Too high = jumping
 
     # Grace period: only terminate if body height is too low for this many consecutive steps
     # Prevents transient dips during normal trot swing from killing the episode

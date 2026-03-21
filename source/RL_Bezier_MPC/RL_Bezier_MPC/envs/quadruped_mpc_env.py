@@ -720,6 +720,16 @@ class QuadrupedMPCEnv(DirectRLEnv):
             # Guard penalty: large negative reward when MPC fallback fires
             guard_penalty = -10.0 if self.guard_triggered[env_idx] else 0.0
 
+            # Height tracking reward: encourage nominal standing height (0.35m)
+            target_height = 0.35  # Go2 nominal CoM height
+            height_error = abs(float(position[env_idx, 2].cpu()) - target_height)
+            height_reward = self.cfg.reward_height_tracking * np.exp(-height_error * 8.0)
+
+            # Lateral penalty: penalize Y-axis deviation from direct path to target
+            # Measures how far the robot has drifted sideways relative to target direction
+            lateral_error = abs(float(position[env_idx, 1].cpu()) - float(self.target_positions[env_idx, 1].cpu()))
+            lateral_penalty = self.cfg.reward_lateral_penalty * min(lateral_error, 2.0)
+
             # Total reward
             rewards[env_idx] = (
                 com_reward
@@ -731,6 +741,8 @@ class QuadrupedMPCEnv(DirectRLEnv):
                 + mpc_cost_penalty
                 + mpc_convergence_reward
                 + guard_penalty
+                + height_reward
+                + lateral_penalty
             )
 
         return rewards
