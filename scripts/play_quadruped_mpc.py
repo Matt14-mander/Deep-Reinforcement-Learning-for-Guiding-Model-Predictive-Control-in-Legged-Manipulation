@@ -579,23 +579,22 @@ def main():
             episode, args_cli.plot_dir,
         )
 
-        # Save GIF: batch-render all frames post-episode (single Figure reuse)
+        # Save trajectory data for offline GIF generation (avoids matplotlib/
+        # Omniverse rendering conflict that causes savefig to hang).
         if args_cli.record_gif:
             os.makedirs(args_cli.plot_dir, exist_ok=True)
-            gif_path = os.path.join(args_cli.plot_dir, f"episode_{episode + 1}.gif")
-            total_steps = len(positions_log)
-            capture_indices = list(range(0, total_steps, gif_capture_every))
-            print(f"  Rendering GIF: {len(capture_indices)} frames at "
-                  f"{args_cli.gif_fps} fps (batch mode) ...", flush=True)
-            gif_frames = render_gif_frames_batch(
-                positions_log, orientations_log, rewards_log,
+            npz_path = os.path.join(args_cli.plot_dir, f"episode_{episode + 1}_data.npz")
+            np.savez(
+                npz_path,
+                positions=np.array(positions_log),
+                orientations=np.array(orientations_log),
+                rewards=np.array(rewards_log),
                 target_pos=target_pos,
-                capture_indices=capture_indices,
                 max_steps=max_steps,
                 guard_count=gif_guard_count,
-                fps=args_cli.gif_fps,
+                gif_fps=args_cli.gif_fps,
             )
-            save_gif(gif_frames, gif_path, fps=args_cli.gif_fps)
+            print(f"  Data saved to: {npz_path}  (run make_gif.py to render GIF)")
 
     # Print summary
     print("\n" + "=" * 60)
@@ -606,7 +605,9 @@ def main():
     print(f"Average length: {np.mean(episode_lengths_all):.1f} steps")
     print(f"\nTrajectory plots saved to: {args_cli.plot_dir}/")
     if args_cli.record_gif:
-        print(f"GIF animations saved to:   {args_cli.plot_dir}/*.gif")
+        print(f"Trajectory data saved to:  {args_cli.plot_dir}/*_data.npz")
+        print(f"To render GIFs, run:")
+        print(f"  python scripts/make_gif.py --data_dir {args_cli.plot_dir}")
 
     # Cleanup
     env.close()
