@@ -380,12 +380,8 @@ def fig_gait_schedule(solver_data, save_dir=None):
         for phase in phases:
             if t_cur >= t_end:
                 break
-            dur = getattr(phase, "duration", 0.2)
-            contacts = getattr(phase, "active_contacts", [])
-            if isinstance(contacts, dict):
-                in_contact = foot in contacts and contacts[foot]
-            else:
-                in_contact = foot in contacts
+            dur = phase.duration
+            in_contact = phase.is_foot_in_contact(foot)
 
             if in_contact:
                 ax.barh(yi, min(dur, t_end - t_cur), left=t_cur, height=0.6,
