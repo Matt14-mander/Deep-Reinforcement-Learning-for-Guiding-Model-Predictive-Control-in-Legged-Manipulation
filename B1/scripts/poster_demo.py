@@ -69,6 +69,10 @@ import matplotlib.animation as animation
 from quadruped_mpc.trajectory import BezierTrajectoryGenerator
 from quadruped_mpc.gait import GaitScheduler, FootholdPlanner, OCPFactory
 from quadruped_mpc.utils.math_utils import heading_from_tangent
+from quadruped_mpc.utils.meshcat_viz import (
+    mc_sphere, mc_line, mc_cylinder, mc_delete,
+    draw_friction_cone, draw_grf_arrow, draw_contact_viz,
+)
 
 # ── constants ─────────────────────────────────────────────────────────────────
 FOOT_FRAME_NAMES = {"LF": "FL_foot", "RF": "FR_foot", "LH": "RL_foot", "RH": "RR_foot"}
@@ -223,64 +227,29 @@ def solve_full(gait_type, traj_type, distance=1.0, dt=0.02, verbose=True):
 # Meshcat visualization helpers
 # ═════════════════════════════════════════════════════════════════════════════
 
+def _rgb_to_hex(r, g, b):
+    return int(r * 255) << 16 | int(g * 255) << 8 | int(b * 255)
+
+
 def _meshcat_sphere(viz, name, pos, radius, color_rgba):
-    """Add a sphere to meshcat scene."""
+    """Add a sphere to meshcat scene (legacy wrapper)."""
     try:
-        import meshcat.geometry as mg
-        import meshcat.transformations as mt
-        sphere = mg.Sphere(radius)
-        mat = mg.MeshLambertMaterial(color=_rgb_to_hex(*color_rgba[:3]),
-                                      opacity=color_rgba[3] if len(color_rgba) > 3 else 1.0)
-        viz.viewer[name].set_object(sphere, mat)
-        T = np.eye(4)
-        T[:3, 3] = pos
-        viz.viewer[name].set_transform(T)
+        color_hex = f"#{int(color_rgba[0]*255):02x}{int(color_rgba[1]*255):02x}{int(color_rgba[2]*255):02x}"
+        opacity = color_rgba[3] if len(color_rgba) > 3 else 1.0
+        mc_sphere(viz.viewer, name, pos, radius, color_hex, opacity)
     except Exception:
         pass
 
 
 def _meshcat_line(viz, name, pts, color_hex="#ffffff", lw=3):
-    """Draw a polyline in meshcat."""
+    """Draw a polyline in meshcat (legacy wrapper)."""
     try:
-        import meshcat.geometry as mg
-        vertices = np.array(pts).T.astype(np.float32)   # (3, N)
-        line = mg.Line(mg.PointsGeometry(vertices),
-                       mg.LineBasicMaterial(color=color_hex, linewidth=lw))
-        viz.viewer[name].set_object(line)
+        # _meshcat_line receives hex as an integer in old code — normalise to string
+        if isinstance(color_hex, int):
+            color_hex = f"#{color_hex:06x}"
+        mc_line(viz.viewer, name, pts, color_hex, lw)
     except Exception:
         pass
-
-
-def _meshcat_arrow(viz, name, origin, direction, scale=1.0, color_hex="#ff0000"):
-    """Draw a force arrow (cylinder) in meshcat."""
-    try:
-        import meshcat.geometry as mg
-        import meshcat.transformations as mt
-
-        length = np.linalg.norm(direction) * scale
-        if length < 1e-4:
-            return
-        d = direction / np.linalg.norm(direction)
-
-        # Rotation: align cylinder (Z-axis) with d
-        z = np.array([0, 0, 1.0])
-        axis = np.cross(z, d)
-        angle = np.arccos(np.clip(np.dot(z, d), -1, 1))
-        T = np.eye(4)
-        T[:3, 3] = origin + direction * scale / 2
-        if np.linalg.norm(axis) > 1e-6:
-            T[:3, :3] = mt.rotation_matrix(angle, axis / np.linalg.norm(axis))[:3, :3]
-
-        cyl = mg.Cylinder(length, 0.012)
-        mat = mg.MeshLambertMaterial(color=color_hex, opacity=0.85)
-        viz.viewer[name].set_object(cyl, mat)
-        viz.viewer[name].set_transform(T)
-    except Exception:
-        pass
-
-
-def _rgb_to_hex(r, g, b):
-    return int(r * 255) << 16 | int(g * 255) << 8 | int(b * 255)
 
 
 # ═════════════════════════════════════════════════════════════════════════════
@@ -555,7 +524,7 @@ def play_meshcat(viz, rmodel, rdata, foot_ids, xs, forces, dt, fps=25, loops=3):
             except Exception:
                 pass
 
-            # GRF arrows
+            # Friction cone + GRF arrows (with cone-violation colouring)
             pinocchio.forwardKinematics(rmodel, rdata, q)
             pinocchio.updateFramePlacements(rmodel, rdata)
 
@@ -563,12 +532,17 @@ def play_meshcat(viz, rmodel, rdata, foot_ids, xs, forces, dt, fps=25, loops=3):
                 fid = foot_ids[foot]
                 foot_pos = rdata.oMf[fid].translation.copy()
                 grf = forces[foot][t] if t < len(forces[foot]) else np.zeros(3)
-                scale = 0.002   # N → m visual scale
-                _meshcat_arrow(
-                    viz, f"grf/{foot}",
-                    foot_pos, grf * scale,
-                    scale=1.0,
-                    color_hex=f"#{int(color[0]*255):02x}{int(color[1]*255):02x}{int(color[2]*255):02x}",
+                foot_hex = f"#{int(color[0]*255):02x}{int(color[1]*255):02x}{int(color[2]*255):02x}"
+                draw_contact_viz(
+                    viz.viewer, f"contact/{foot}",
+                    foot_pos=foot_pos,
+                    grf_world=grf,
+                    mu=0.7,
+                    grf_scale=0.002,
+                    cone_height=0.18,
+                    n_spokes=8,
+                    cone_color=foot_hex,
+                    cone_opacity=0.50,
                 )
 
             elapsed = time.time() - t0

@@ -92,6 +92,11 @@ except ImportError:
     HAS_MESHCAT = False
     print("Warning: meshcat-python not found — 3D view disabled.")
 
+from quadruped_mpc.utils.meshcat_viz import (
+    hex_to_int, mc_sphere, mc_line, mc_cylinder, mc_cone, mc_delete,
+    draw_friction_cone, draw_grf_arrow, draw_contact_viz,
+)
+
 import matplotlib
 import matplotlib.pyplot as plt
 import matplotlib.animation as mpl_animation
@@ -408,62 +413,17 @@ def concat_segments(segments, dt):
 
 
 # ═════════════════════════════════════════════════════════════════════════════
-# Meshcat helpers
+# Meshcat ground plane (local helper — not in shared module)
 # ═════════════════════════════════════════════════════════════════════════════
 
-def _hex_to_int(hex_str: str) -> int:
-    h = hex_str.lstrip("#")
-    return int(h, 16)
-
-
-def mc_sphere(viewer, path, pos, radius, color_hex, opacity=1.0):
-    mat = mg.MeshLambertMaterial(color=_hex_to_int(color_hex), opacity=opacity)
-    viewer[path].set_object(mg.Sphere(radius), mat)
-    T = np.eye(4); T[:3, 3] = pos
-    viewer[path].set_transform(T)
-
-
-def mc_line(viewer, path, pts, color_hex, lw=2):
-    """Draw a polyline through a list of (3,) points."""
-    pts_arr = np.array(pts, dtype=np.float32).T  # (3, N)
-    geom = mg.PointsGeometry(pts_arr)
-    mat  = mg.LineBasicMaterial(color=_hex_to_int(color_hex), linewidth=lw)
-    viewer[path].set_object(mg.Line(geom, mat))
-
-
 def mc_box(viewer, path, center, size, color_hex, opacity=0.5):
-    """Thin flat box = ground plane or marker."""
-    mat = mg.MeshLambertMaterial(color=_hex_to_int(color_hex), opacity=opacity)
-    viewer[path].set_object(mg.Box(size), mat)
-    T = np.eye(4); T[:3, 3] = center
-    viewer[path].set_transform(T)
-
-
-def mc_cylinder(viewer, path, origin, direction, length, radius, color_hex, opacity=0.9):
-    """Axis-aligned cylinder from origin in direction direction."""
-    length = max(length, 1e-4)
-    d = np.array(direction, dtype=float)
-    norm = np.linalg.norm(d)
-    if norm < 1e-8:
+    """Thin flat box — used for the ground plane."""
+    if not HAS_MESHCAT:
         return
-    d /= norm
-    z = np.array([0.0, 0.0, 1.0])
-    axis = np.cross(z, d)
-    angle = np.arccos(np.clip(np.dot(z, d), -1, 1))
-    T = np.eye(4)
-    T[:3, 3] = origin + d * length / 2
-    if np.linalg.norm(axis) > 1e-8:
-        T[:3, :3] = mt.rotation_matrix(angle, axis / np.linalg.norm(axis))[:3, :3]
-    mat = mg.MeshLambertMaterial(color=_hex_to_int(color_hex), opacity=opacity)
-    viewer[path].set_object(mg.Cylinder(length, radius), mat)
+    mat = mg.MeshLambertMaterial(color=hex_to_int(color_hex), opacity=opacity)
+    viewer[path].set_object(mg.Box(size), mat)
+    T = np.eye(4); T[:3, 3] = np.asarray(center, dtype=float)
     viewer[path].set_transform(T)
-
-
-def mc_delete(viewer, path):
-    try:
-        viewer[path].delete()
-    except Exception:
-        pass
 
 
 # ═════════════════════════════════════════════════════════════════════════════
@@ -581,22 +541,22 @@ def play_meshcat_live(viz, rmodel, rdata, foot_ids, segments,
             pinocchio.forwardKinematics(rmodel, rdata, q)
             pinocchio.updateFramePlacements(rmodel, rdata)
 
-            # ── GRF arrows ──────────────────────────────────────────────────
+            # ── Friction cone + GRF arrow (per foot) ────────────────────────
             for foot, fid in foot_ids.items():
                 foot_pos = rdata.oMf[fid].translation.copy()
                 grf = forces[foot][t] if t < len(forces[foot]) else np.zeros(3)
-                fz  = grf[2]
-                if fz > 1.0:
-                    # stance: draw upward cylinder
-                    mc_cylinder(viewer, f"dynamic/grf/{foot}",
-                                origin=foot_pos,
-                                direction=grf / np.linalg.norm(grf),
-                                length=np.linalg.norm(grf) * GRF_SCALE,
-                                radius=0.012,
-                                color_hex=FOOT_HEX[foot], opacity=0.85)
-                else:
-                    # swing: hide arrow
-                    mc_delete(viewer, f"dynamic/grf/{foot}")
+                # draw_contact_viz handles stance/swing detection internally
+                draw_contact_viz(
+                    viewer, f"dynamic/contact/{foot}",
+                    foot_pos=foot_pos,
+                    grf_world=grf,
+                    mu=0.7,
+                    grf_scale=GRF_SCALE,
+                    cone_height=0.18,
+                    n_spokes=8,
+                    cone_color=FOOT_HEX[foot],
+                    cone_opacity=0.50,
+                )
 
             # ── CoM trail ───────────────────────────────────────────────────
             com_now = xs[t, :3].copy()

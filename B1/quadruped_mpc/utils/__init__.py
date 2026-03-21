@@ -3,7 +3,20 @@
 #
 # SPDX-License-Identifier: BSD-3-Clause
 
-"""Mathematical utilities for quadruped MPC."""
+"""Mathematical utilities and Meshcat visualization helpers for quadruped MPC."""
+
+from .meshcat_viz import (
+    hex_to_int,
+    rgb_to_hex,
+    mc_sphere,
+    mc_line,
+    mc_cylinder,
+    mc_cone,
+    mc_delete,
+    draw_friction_cone,
+    draw_grf_arrow,
+    draw_contact_viz,
+)
 
 from .math_utils import (
     quat_to_rotation_matrix,
@@ -26,6 +39,18 @@ from .math_utils import (
 )
 
 __all__ = [
+    # meshcat_viz
+    "hex_to_int",
+    "rgb_to_hex",
+    "mc_sphere",
+    "mc_line",
+    "mc_cylinder",
+    "mc_cone",
+    "mc_delete",
+    "draw_friction_cone",
+    "draw_grf_arrow",
+    "draw_contact_viz",
+    # math_utils
     "quat_to_rotation_matrix",
     "rotation_matrix_to_quat",
     "quat_to_euler",
