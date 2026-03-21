@@ -488,11 +488,9 @@ def main():
 
         max_steps = args_cli.max_steps
 
-        # GIF recording state
-        gif_frames = []
-        gif_guard_count = 0
-        # Capture every Nth step so GIF plays at gif_fps (sim runs at 50 Hz)
+        # GIF recording: only track which steps to render (rendering deferred to after episode)
         gif_capture_every = max(1, int(50 / args_cli.gif_fps))
+        gif_guard_count = 0
 
         while not done and episode_length < max_steps:
             # Get actions
@@ -520,24 +518,12 @@ def main():
             orientations_log.append(quat)
             rewards_log.append(rewards[0].cpu().item())
 
-            # GIF frame capture
-            if args_cli.record_gif and (episode_length % gif_capture_every == 0):
-                # Track MPC Guard count from stdout is unreliable; approximate
-                # by detecting cost spikes in env's last_mpc_costs if available
+            # GIF: count guard fires for later annotation
+            if args_cli.record_gif:
                 try:
-                    guard_fires = int(getattr(env, "_guard_fires_total", gif_guard_count))
+                    gif_guard_count = int(getattr(env, "_guard_fires_total", gif_guard_count))
                 except Exception:
-                    guard_fires = gif_guard_count
-                frame = render_gif_frame(
-                    positions_log,
-                    orientations_log,
-                    rewards_log,
-                    target_pos=env.target_positions[0].cpu().numpy(),
-                    step=episode_length,
-                    max_steps=max_steps,
-                    mpc_guard_count=guard_fires,
-                )
-                gif_frames.append(frame)
+                    pass
 
             # Check if any environment is done
             dones = terminated | truncated
@@ -565,12 +551,26 @@ def main():
             episode, args_cli.plot_dir,
         )
 
-        # Save GIF if recording was enabled
-        if args_cli.record_gif and gif_frames:
+        # Save GIF: render all frames post-episode (keeps simulation loop fast)
+        if args_cli.record_gif:
             os.makedirs(args_cli.plot_dir, exist_ok=True)
-            gif_path = os.path.join(
-                args_cli.plot_dir, f"episode_{episode + 1}.gif"
-            )
+            gif_path = os.path.join(args_cli.plot_dir, f"episode_{episode + 1}.gif")
+            total_steps = len(positions_log)
+            capture_indices = list(range(0, total_steps, gif_capture_every))
+            print(f"  Rendering GIF: {len(capture_indices)} frames at {args_cli.gif_fps} fps ...",
+                  flush=True)
+            gif_frames = []
+            for idx in capture_indices:
+                frame = render_gif_frame(
+                    positions_log[:idx + 1],
+                    orientations_log[:idx + 1],
+                    rewards_log[:idx + 1],
+                    target_pos=target_pos,
+                    step=idx + 1,
+                    max_steps=max_steps,
+                    mpc_guard_count=gif_guard_count,
+                )
+                gif_frames.append(frame)
             save_gif(gif_frames, gif_path, fps=args_cli.gif_fps)
 
     # Print summary
