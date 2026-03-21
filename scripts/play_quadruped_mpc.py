@@ -78,6 +78,27 @@ parser.add_argument(
          "Simulation runs at 50 Hz; every Nth step is captured where N=50/gif_fps.",
 )
 
+# Evaluation / academic logging
+parser.add_argument(
+    "--eval_mode", action="store_true",
+    help="Enable extended data logging (joints, torques, velocities, actions, MPC stats) "
+         "for academic evaluation. Saves enriched NPZ files.",
+)
+parser.add_argument(
+    "--push_time", type=float, default=5.0,
+    help="Time (seconds) at which to apply lateral disturbance force (default: 5.0). "
+         "Only active when --eval_mode is set and --push_force > 0.",
+)
+parser.add_argument(
+    "--push_force", type=float, default=0.0,
+    help="Magnitude of lateral (Y-axis) disturbance force in Newtons (default: 0 = disabled). "
+         "Set to e.g. 60.0 for push-recovery experiment.",
+)
+parser.add_argument(
+    "--push_duration", type=float, default=0.2,
+    help="Duration of push disturbance in seconds (default: 0.2).",
+)
+
 # AppLauncher arguments (adds --headless, --device, --livestream, etc.)
 AppLauncher.add_app_launcher_args(parser)
 args_cli = parser.parse_args()
@@ -510,11 +531,28 @@ def main():
         orientations_log = []
         rewards_log = []
 
+        # Extended eval logging buffers (only populated when --eval_mode)
+        joint_pos_log  = []  # (T, 12)
+        joint_vel_log  = []  # (T, 12)
+        torque_log     = []  # (T, 12)
+        actions_log    = []  # (T, action_dim)
+        lin_vel_b_log  = []  # (T, 3)  body-frame linear velocity
+        ang_vel_b_log  = []  # (T, 3)  body-frame angular velocity
+        mpc_cost_log   = []  # (T,)
+        mpc_conv_log   = []  # (T,)  bool
+
         episode_reward = torch.zeros(args_cli.num_envs, device=device)
         episode_length = 0
         done = False
 
         max_steps = args_cli.max_steps
+
+        # Push disturbance timing (in step indices at 50 Hz)
+        push_active = args_cli.eval_mode and args_cli.push_force > 0.0
+        push_start_step = int(args_cli.push_time / 0.02)
+        push_end_step   = int((args_cli.push_time + args_cli.push_duration) / 0.02)
+        _zero_force  = torch.zeros(args_cli.num_envs, 1, 3, device=device)
+        _zero_torque = torch.zeros(args_cli.num_envs, 1, 3, device=device)
 
         # GIF recording: only track which steps to render (rendering deferred to after episode)
         gif_capture_every = max(1, int(50 / args_cli.gif_fps))
@@ -531,6 +569,21 @@ def main():
                     args_cli.num_envs, env_cfg.action_space, device=device,
                 ) * 2 - 1
 
+            # Push disturbance injection (before step so physics sees the force this tick)
+            if push_active:
+                if push_start_step <= episode_length < push_end_step:
+                    push_f = _zero_force.clone()
+                    push_f[:, 0, 1] = args_cli.push_force  # Y-axis lateral push
+                    try:
+                        env.robot.set_external_force_and_torque(push_f, _zero_torque, body_ids=[0])
+                    except Exception:
+                        pass  # API may differ across Isaac Lab versions
+                else:
+                    try:
+                        env.robot.set_external_force_and_torque(_zero_force, _zero_torque, body_ids=[0])
+                    except Exception:
+                        pass
+
             # Step environment
             obs, rewards, terminated, truncated, info = env.step(actions)
             obs_tensor = obs["policy"]
@@ -545,6 +598,24 @@ def main():
             positions_log.append(pos)
             orientations_log.append(quat)
             rewards_log.append(rewards[0].cpu().item())
+
+            # Extended eval logging
+            if args_cli.eval_mode:
+                joint_pos_log.append(robot_data.joint_pos[0, :12].cpu().numpy().copy())
+                joint_vel_log.append(robot_data.joint_vel[0, :12].cpu().numpy().copy())
+                # Feedforward torques buffered in env (written to robot just before physics)
+                torque_log.append(env._pending_joint_efforts[0].cpu().numpy().copy())
+                actions_log.append(actions[0].cpu().numpy().copy())
+                # Body-frame velocities (IsaacLab provides these directly)
+                try:
+                    lin_vel_b_log.append(robot_data.root_lin_vel_b[0].cpu().numpy().copy())
+                    ang_vel_b_log.append(robot_data.root_ang_vel_b[0].cpu().numpy().copy())
+                except AttributeError:
+                    # Fallback: use world-frame velocities
+                    lin_vel_b_log.append(robot_data.root_lin_vel_w[0].cpu().numpy().copy())
+                    ang_vel_b_log.append(robot_data.root_ang_vel_w[0].cpu().numpy().copy())
+                mpc_cost_log.append(float(env._last_mpc_costs[0]))
+                mpc_conv_log.append(bool(env._last_mpc_converged[0]))
 
             # GIF: count guard fires for later annotation
             if args_cli.record_gif:
@@ -595,6 +666,35 @@ def main():
                 gif_fps=args_cli.gif_fps,
             )
             print(f"  Data saved to: {npz_path}  (run make_gif.py to render GIF)")
+
+        # Extended eval data save (academic analysis)
+        if args_cli.eval_mode:
+            os.makedirs(args_cli.plot_dir, exist_ok=True)
+            eval_npz_path = os.path.join(args_cli.plot_dir, f"episode_{episode + 1}_eval.npz")
+            save_kwargs = dict(
+                positions=np.array(positions_log),
+                orientations=np.array(orientations_log),
+                rewards=np.array(rewards_log),
+                target_pos=target_pos,
+                max_steps=max_steps,
+                dt=np.float64(0.02),
+                # Extended channels
+                joint_pos=np.array(joint_pos_log),
+                joint_vel=np.array(joint_vel_log),
+                torques=np.array(torque_log),
+                actions=np.array(actions_log),
+                lin_vel_b=np.array(lin_vel_b_log),
+                ang_vel_b=np.array(ang_vel_b_log),
+                mpc_cost=np.array(mpc_cost_log),
+                mpc_converged=np.array(mpc_conv_log),
+                # Disturbance metadata
+                push_time=np.float64(args_cli.push_time),
+                push_force=np.float64(args_cli.push_force),
+                push_duration=np.float64(args_cli.push_duration),
+            )
+            np.savez(eval_npz_path, **save_kwargs)
+            channels = list(save_kwargs.keys())
+            print(f"  Eval data saved: {eval_npz_path}  ({len(channels)} channels: {channels})")
 
     # Print summary
     print("\n" + "=" * 60)
