@@ -216,115 +216,139 @@ def plot_episode_trajectory(positions, orientations, target_pos, rewards,
     print(f"  Plot saved to: {save_path}")
 
 
-def render_gif_frame(positions_so_far, orientations_so_far, rewards_so_far,
-                     target_pos, step, max_steps, mpc_guard_count):
-    """Render a single animation frame as a numpy RGBA array.
+def render_gif_frames_batch(positions_log, orientations_log, rewards_log,
+                            target_pos, capture_indices, max_steps,
+                            guard_count, fps):
+    """Render all GIF frames in one batch, reusing a single Figure object.
 
-    Layout (800×400):
-      Left : Bird's-eye XY view – trajectory trail + current robot marker
-      Right: Two gauges – CoM height bar and pitch/roll dials
+    Reusing the figure is ~5-10x faster than creating/destroying per frame
+    because matplotlib figure initialisation is expensive.
 
     Args:
-        positions_so_far : (T, 3) array of positions up to current step.
-        orientations_so_far: (T, 4) quaternions (w, x, y, z).
-        rewards_so_far  : (T,) rewards up to current step.
-        target_pos      : (3,) target position.
-        step            : current step index.
-        max_steps       : episode max steps (for progress bar).
-        mpc_guard_count : number of MPC Guard failures so far.
+        positions_log    : full list of (3,) positions for the episode.
+        orientations_log : full list of (4,) quaternions.
+        rewards_log      : full list of scalar rewards.
+        target_pos       : (3,) target position.
+        capture_indices  : list of step indices to render.
+        max_steps        : episode max steps.
+        guard_count      : total MPC Guard failures in episode.
+        fps              : GIF fps (used for title only).
 
     Returns:
-        (H, W, 3) uint8 numpy array (RGB).
+        list of (H, W, 3) uint8 numpy arrays.
     """
-    fig = plt.figure(figsize=(8, 4), dpi=100)
-    gs = fig.add_gridspec(2, 3, hspace=0.4, wspace=0.45)
+    import io
+    from PIL import Image as _Image
 
-    pos = np.array(positions_so_far)
-    T = len(pos)
-    time_s = step * 0.02
+    positions_arr = np.array(positions_log)
 
-    # ── Left (tall): XY bird's-eye view ─────────────────────────────────────
+    # Pre-compute full pitch/roll arrays (cheap; avoids per-frame recomputation)
+    rolls_full, pitches_full = [], []
+    for q in orientations_log:
+        w, x, y, z = q
+        sinr = 2.0 * (w * x + y * z)
+        cosr = 1.0 - 2.0 * (x * x + y * y)
+        rolls_full.append(np.degrees(np.arctan2(sinr, cosr)))
+        sinp = np.clip(2.0 * (w * y - z * x), -1.0, 1.0)
+        pitches_full.append(np.degrees(np.arcsin(sinp)))
+    rolls_full = np.array(rolls_full)
+    pitches_full = np.array(pitches_full)
+    t_full = np.arange(len(positions_log)) * 0.02
+
+    # Compute fixed XY axis limits from full trajectory (stable across frames)
+    all_x, all_y = positions_arr[:, 0], positions_arr[:, 1]
+    cx = (all_x.max() + all_x.min()) / 2
+    cy = (all_y.max() + all_y.min()) / 2
+    pad = 0.6
+    x_half = max((all_x.max() - all_x.min()) / 2, 0.5) + pad
+    y_half = max((all_y.max() - all_y.min()) / 2, 0.5) + pad
+    xy_lim = (cx - x_half, cx + x_half, cy - y_half, cy + y_half)
+
+    # ── Create figure ONCE, reuse for all frames ──────────────────────────
+    fig = plt.figure(figsize=(8, 4), dpi=80)
+    gs = fig.add_gridspec(2, 3, hspace=0.45, wspace=0.48)
     ax_xy = fig.add_subplot(gs[:, :2])
-    trail_len = min(T, 100)
-    ax_xy.plot(pos[-trail_len:, 0], pos[-trail_len:, 1],
-               "b-", linewidth=1.2, alpha=0.6, label="trail")
-    ax_xy.plot(pos[0, 0], pos[0, 1], "go", markersize=8, label="start")
-    ax_xy.plot(target_pos[0], target_pos[1], "r*", markersize=12, label="target")
-    # Current robot position: large marker + heading arrow
-    cur_x, cur_y = pos[-1, 0], pos[-1, 1]
-    ax_xy.plot(cur_x, cur_y, "bs", markersize=10, label="robot")
-    if T >= 2:
-        dx = pos[-1, 0] - pos[-2, 0]
-        dy = pos[-1, 1] - pos[-2, 1]
-        norm = max(np.hypot(dx, dy), 1e-6)
-        ax_xy.annotate("", xy=(cur_x + dx / norm * 0.08, cur_y + dy / norm * 0.08),
-                        xytext=(cur_x, cur_y),
-                        arrowprops=dict(arrowstyle="->", color="navy", lw=1.8))
+    ax_h  = fig.add_subplot(gs[0, 2])
+    ax_rp = fig.add_subplot(gs[1, 2])
 
-    # Dynamic axes: keep robot centred
-    pad = 0.5
-    x_range = max(abs(pos[:, 0].max() - pos[:, 0].min()), 1.0) / 2 + pad
-    y_range = max(abs(pos[:, 1].max() - pos[:, 1].min()), 1.0) / 2 + pad
-    ax_xy.set_xlim(cur_x - x_range, cur_x + x_range)
-    ax_xy.set_ylim(cur_y - y_range, cur_y + y_range)
+    # Static elements drawn once
+    ax_xy.plot(target_pos[0], target_pos[1], "r*", markersize=12, label="target",
+               zorder=5)
+    ax_xy.plot(positions_arr[0, 0], positions_arr[0, 1], "go", markersize=8,
+               label="start", zorder=5)
+    ax_xy.set_xlim(xy_lim[0], xy_lim[1])
+    ax_xy.set_ylim(xy_lim[2], xy_lim[3])
     ax_xy.set_aspect("equal")
     ax_xy.set_xlabel("X (m)", fontsize=8)
     ax_xy.set_ylabel("Y (m)", fontsize=8)
-    ax_xy.set_title(
-        f"t={time_s:.2f}s  step={step}/{max_steps}  "
-        f"guard={mpc_guard_count}  Σr={np.sum(rewards_so_far):.1f}",
-        fontsize=8,
-    )
-    ax_xy.legend(loc="lower right", fontsize=7, framealpha=0.6)
     ax_xy.grid(True, alpha=0.25)
 
-    # ── Top-right: CoM height ─────────────────────────────────────────────
-    ax_h = fig.add_subplot(gs[0, 2])
-    heights = pos[:, 2]
-    ax_h.plot(np.arange(T) * 0.02, heights, "b-", linewidth=1)
-    ax_h.axhline(0.28, color="g", linestyle="--", linewidth=0.8, label="nom")
-    ax_h.axhline(0.12, color="r", linestyle="--", linewidth=0.8, label="fall")
+    ax_h.axhline(0.28, color="g", linestyle="--", linewidth=0.8)
+    ax_h.axhline(0.12, color="r", linestyle="--", linewidth=0.8)
     ax_h.set_ylim(0.0, 0.45)
     ax_h.set_xlabel("t (s)", fontsize=7)
     ax_h.set_ylabel("Z (m)", fontsize=7)
     ax_h.set_title("Height", fontsize=8)
     ax_h.tick_params(labelsize=6)
-    ax_h.legend(fontsize=6)
     ax_h.grid(True, alpha=0.25)
 
-    # ── Bottom-right: Pitch/Roll ──────────────────────────────────────────
-    ax_rp = fig.add_subplot(gs[1, 2])
-    rolls, pitches = [], []
-    for q in orientations_so_far:
-        w, x, y, z = q
-        sinr = 2.0 * (w * x + y * z)
-        cosr = 1.0 - 2.0 * (x * x + y * y)
-        rolls.append(np.degrees(np.arctan2(sinr, cosr)))
-        sinp = np.clip(2.0 * (w * y - z * x), -1.0, 1.0)
-        pitches.append(np.degrees(np.arcsin(sinp)))
-    t_arr = np.arange(T) * 0.02
-    ax_rp.plot(t_arr, pitches, "g-", linewidth=1, label="pitch")
-    ax_rp.plot(t_arr, rolls, "r-", linewidth=1, label="roll")
     ax_rp.axhline(0, color="k", linewidth=0.5)
     ax_rp.set_ylim(-50, 50)
     ax_rp.set_xlabel("t (s)", fontsize=7)
     ax_rp.set_ylabel("deg", fontsize=7)
     ax_rp.set_title("Pitch / Roll", fontsize=8)
     ax_rp.tick_params(labelsize=6)
-    ax_rp.legend(fontsize=6)
     ax_rp.grid(True, alpha=0.25)
 
-    # Convert figure to numpy RGB array via BytesIO (avoids canvas.tostring_rgb
-    # which can hang in headless Isaac Sim environments).
-    import io
-    from PIL import Image as _Image
-    buf = io.BytesIO()
-    fig.savefig(buf, format="png", dpi=100, bbox_inches="tight")
+    frames = []
+    n = len(capture_indices)
+    for fi, idx in enumerate(capture_indices):
+        if fi % 10 == 0:
+            print(f"    frame {fi + 1}/{n} ...", flush=True)
+
+        T = idx + 1
+        pos = positions_arr[:T]
+        t_arr = t_full[:T]
+        trail_len = min(T, 80)
+
+        # Clear dynamic artists only
+        ax_xy.lines[:] = [ax_xy.lines[0], ax_xy.lines[1]]  # keep target + start
+        ax_h.lines.clear()
+        ax_rp.lines.clear()
+
+        # XY trail + robot marker
+        ax_xy.plot(pos[-trail_len:, 0], pos[-trail_len:, 1],
+                   "b-", linewidth=1.2, alpha=0.6)
+        ax_xy.plot(pos[-1, 0], pos[-1, 1], "bs", markersize=9, zorder=6)
+
+        time_s = T * 0.02
+        ax_xy.set_title(
+            f"t={time_s:.1f}s  step={T}/{max_steps}  "
+            f"guard={guard_count}  Σr={np.sum(rewards_log[:T]):.0f}",
+            fontsize=8,
+        )
+
+        # Height
+        ax_h.plot(t_arr, pos[:, 2], "b-", linewidth=1)
+        ax_h.axhline(0.28, color="g", linestyle="--", linewidth=0.8)
+        ax_h.axhline(0.12, color="r", linestyle="--", linewidth=0.8)
+
+        # Pitch / Roll
+        ax_rp.plot(t_arr, pitches_full[:T], "g-", linewidth=1, label="pitch")
+        ax_rp.plot(t_arr, rolls_full[:T],   "r-", linewidth=1, label="roll")
+        if fi == 0:
+            ax_rp.legend(fontsize=6, loc="upper right")
+
+        # Snapshot to PNG bytes → PIL → numpy
+        buf = io.BytesIO()
+        fig.savefig(buf, format="png", dpi=80, bbox_inches="tight")
+        buf.seek(0)
+        frame = np.array(_Image.open(buf).convert("RGB"))
+        buf.close()
+        frames.append(frame)
+
     plt.close(fig)
-    buf.seek(0)
-    frame = np.array(_Image.open(buf).convert("RGB"))
-    buf.close()
-    return frame
+    return frames
 
 
 def save_gif(frames, save_path, fps=10):
@@ -555,26 +579,22 @@ def main():
             episode, args_cli.plot_dir,
         )
 
-        # Save GIF: render all frames post-episode (keeps simulation loop fast)
+        # Save GIF: batch-render all frames post-episode (single Figure reuse)
         if args_cli.record_gif:
             os.makedirs(args_cli.plot_dir, exist_ok=True)
             gif_path = os.path.join(args_cli.plot_dir, f"episode_{episode + 1}.gif")
             total_steps = len(positions_log)
             capture_indices = list(range(0, total_steps, gif_capture_every))
-            print(f"  Rendering GIF: {len(capture_indices)} frames at {args_cli.gif_fps} fps ...",
-                  flush=True)
-            gif_frames = []
-            for idx in capture_indices:
-                frame = render_gif_frame(
-                    positions_log[:idx + 1],
-                    orientations_log[:idx + 1],
-                    rewards_log[:idx + 1],
-                    target_pos=target_pos,
-                    step=idx + 1,
-                    max_steps=max_steps,
-                    mpc_guard_count=gif_guard_count,
-                )
-                gif_frames.append(frame)
+            print(f"  Rendering GIF: {len(capture_indices)} frames at "
+                  f"{args_cli.gif_fps} fps (batch mode) ...", flush=True)
+            gif_frames = render_gif_frames_batch(
+                positions_log, orientations_log, rewards_log,
+                target_pos=target_pos,
+                capture_indices=capture_indices,
+                max_steps=max_steps,
+                guard_count=gif_guard_count,
+                fps=args_cli.gif_fps,
+            )
             save_gif(gif_frames, gif_path, fps=args_cli.gif_fps)
 
     # Print summary
