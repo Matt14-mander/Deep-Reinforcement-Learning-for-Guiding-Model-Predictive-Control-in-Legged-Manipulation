@@ -116,9 +116,13 @@ def render_frames_batch(positions, orientations, rewards, target_pos,
         trail = pos[-min(T, 80):]
 
         # Clear dynamic lines only (keep static markers at index 0,1)
-        ax_xy.lines[2:] = []
-        ax_h.lines.clear()
-        ax_rp.lines.clear()
+        # ax_xy has 2 static artists (target star + start circle); remove the rest
+        for artist in ax_xy.lines[2:]:
+            artist.remove()
+        for artist in list(ax_h.lines):
+            artist.remove()
+        for artist in list(ax_rp.lines):
+            artist.remove()
 
         # XY trail + robot
         ax_xy.plot(trail[:, 0], trail[:, 1], "b-", linewidth=1.2, alpha=0.6)
