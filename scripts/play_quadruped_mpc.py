@@ -314,12 +314,16 @@ def render_gif_frame(positions_so_far, orientations_so_far, rewards_so_far,
     ax_rp.legend(fontsize=6)
     ax_rp.grid(True, alpha=0.25)
 
-    # Convert figure to numpy RGB array
-    fig.canvas.draw()
-    buf = fig.canvas.tostring_rgb()
-    w_px, h_px = fig.canvas.get_width_height()
-    frame = np.frombuffer(buf, dtype=np.uint8).reshape(h_px, w_px, 3)
+    # Convert figure to numpy RGB array via BytesIO (avoids canvas.tostring_rgb
+    # which can hang in headless Isaac Sim environments).
+    import io
+    from PIL import Image as _Image
+    buf = io.BytesIO()
+    fig.savefig(buf, format="png", dpi=100, bbox_inches="tight")
     plt.close(fig)
+    buf.seek(0)
+    frame = np.array(_Image.open(buf).convert("RGB"))
+    buf.close()
     return frame
 
 
