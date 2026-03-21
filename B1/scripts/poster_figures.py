@@ -401,9 +401,9 @@ def fig_gait_schedule(solver_data, save_dir=None):
     ax.set_xlim(0, t_end)
     ax.set_title("Gait Contact Schedule (Trot: Diagonal Pair Alternation)", fontweight="bold")
 
-    stance_patch = mpatches.Patch(color="#27ae60", alpha=0.85, label="Stance (contact)")
-    swing_patch = mpatches.Patch(color="#ecf0f1", alpha=0.6,
-                                  edgecolor="#bdc3c7", label="Swing (airborne)")
+    stance_patch = mpatches.Patch(facecolor="#27ae60", alpha=0.85, label="Stance (contact)")
+    swing_patch = mpatches.Patch(facecolor="#ecf0f1", edgecolor="#bdc3c7",
+                                  alpha=0.6, label="Swing (airborne)")
     ax.legend(handles=[stance_patch, swing_patch], loc="upper right")
 
     # Mark gait cycle period
