@@ -149,7 +149,9 @@ class QuadrupedMPCEnvCfg(DirectRLEnvCfg):
     rl_policy_period: int = 10
 
     # Maximum displacement for CoM Bezier control points
-    max_bezier_displacement: float = 1.5  # meters (less than quadrotor)
+    # Reduced from 1.5m → 0.5m: with _v_fwd=0.3 m/s bias, neutral action gives P3_x=0.9m (0.3 m/s),
+    # and max-negative action gives P3_x=0.4m (0.13 m/s, still forward). Robot CANNOT go backward.
+    max_bezier_displacement: float = 0.5  # meters
 
     # Trajectory blending steps when updating
     trajectory_blend_steps: int = 5
@@ -238,7 +240,7 @@ class QuadrupedMPCEnvCfg(DirectRLEnvCfg):
     # Primary rewards
     reward_com_tracking: float = 1.0
     reward_body_orientation: float = 0.5
-    reward_velocity_tracking: float = 0.3
+    reward_velocity_tracking: float = 0.5  # Increased 0.3→0.5: forward motion must compete with orientation reward
     reward_reached_target: float = 10.0
 
     # Penalties
