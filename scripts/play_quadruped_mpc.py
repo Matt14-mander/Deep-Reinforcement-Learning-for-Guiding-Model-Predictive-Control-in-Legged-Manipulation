@@ -569,6 +569,25 @@ def main():
                     args_cli.num_envs, env_cfg.action_space, device=device,
                 ) * 2 - 1
 
+            # ── Snapshot state BEFORE env.step() ─────────────────────────────
+            # IsaacLab auto-resets done envs inside env.step(), so reading
+            # robot_data AFTER step returns the teleported reset position, which
+            # produces a sudden straight line in the trajectory plot.
+            # We capture the true CoM state here (pre-step = state s_t) and only
+            # read step-derived quantities (rewards, torques, MPC stats) afterwards.
+            _pre_robot = env.robot.data
+            _pre_pos  = _pre_robot.root_pos_w[0].cpu().numpy().copy()
+            _pre_quat = _pre_robot.root_quat_w[0].cpu().numpy().copy()
+            if args_cli.eval_mode:
+                _pre_jpos = _pre_robot.joint_pos[0, :12].cpu().numpy().copy()
+                _pre_jvel = _pre_robot.joint_vel[0, :12].cpu().numpy().copy()
+                try:
+                    _pre_lvb = _pre_robot.root_lin_vel_b[0].cpu().numpy().copy()
+                    _pre_avb = _pre_robot.root_ang_vel_b[0].cpu().numpy().copy()
+                except AttributeError:
+                    _pre_lvb = _pre_robot.root_lin_vel_w[0].cpu().numpy().copy()
+                    _pre_avb = _pre_robot.root_ang_vel_w[0].cpu().numpy().copy()
+
             # Push disturbance injection (before step so physics sees the force this tick)
             if push_active:
                 if push_start_step <= episode_length < push_end_step:
@@ -591,29 +610,22 @@ def main():
             episode_reward += rewards
             episode_length += 1
 
-            # Log trajectory data (env 0)
-            robot_data = env.robot.data
-            pos = robot_data.root_pos_w[0].cpu().numpy().copy()
-            quat = robot_data.root_quat_w[0].cpu().numpy().copy()
-            positions_log.append(pos)
-            orientations_log.append(quat)
+            # ── Log trajectory data using PRE-step positions (env 0) ──────────
+            positions_log.append(_pre_pos)
+            orientations_log.append(_pre_quat)
             rewards_log.append(rewards[0].cpu().item())
 
             # Extended eval logging
             if args_cli.eval_mode:
-                joint_pos_log.append(robot_data.joint_pos[0, :12].cpu().numpy().copy())
-                joint_vel_log.append(robot_data.joint_vel[0, :12].cpu().numpy().copy())
-                # Feedforward torques buffered in env (written to robot just before physics)
-                torque_log.append(env._pending_joint_efforts[0].cpu().numpy().copy())
+                # State channels: use pre-step snapshot (true robot state, no teleport)
+                joint_pos_log.append(_pre_jpos)
+                joint_vel_log.append(_pre_jvel)
+                lin_vel_b_log.append(_pre_lvb)
+                ang_vel_b_log.append(_pre_avb)
+                # Action taken this step
                 actions_log.append(actions[0].cpu().numpy().copy())
-                # Body-frame velocities (IsaacLab provides these directly)
-                try:
-                    lin_vel_b_log.append(robot_data.root_lin_vel_b[0].cpu().numpy().copy())
-                    ang_vel_b_log.append(robot_data.root_ang_vel_b[0].cpu().numpy().copy())
-                except AttributeError:
-                    # Fallback: use world-frame velocities
-                    lin_vel_b_log.append(robot_data.root_lin_vel_w[0].cpu().numpy().copy())
-                    ang_vel_b_log.append(robot_data.root_ang_vel_w[0].cpu().numpy().copy())
+                # Step-derived channels: read after step (computed inside _pre_physics_step)
+                torque_log.append(env._pending_joint_efforts[0].cpu().numpy().copy())
                 mpc_cost_log.append(float(env._last_mpc_costs[0]))
                 mpc_conv_log.append(bool(env._last_mpc_converged[0]))
 
