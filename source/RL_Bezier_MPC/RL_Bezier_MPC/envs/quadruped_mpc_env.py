@@ -384,16 +384,15 @@ class QuadrupedMPCEnv(DirectRLEnv):
             # Stage 2: gait params from RL policy
             gait_mods = actions_np[:, self.cfg.num_bezier_actions:]
 
-        # Forward bias: make default (neutral RL action) trajectory move forward at ~0.3 m/s.
-        # With max_bezier_displacement=0.5m and _v_fwd=0.3:
-        #   neutral action → P3_x = 0 + 0.9m → 0.30 m/s (default forward speed)
-        #   max-negative   → P3_x = -0.5 + 0.9 = 0.4m → 0.13 m/s (still forward, robot CAN'T go backward)
-        #   max-positive   → P3_x = +0.5 + 0.9 = 1.4m → 0.47 m/s (fast forward)
-        # Previous 0.05 m/s was too small — RL learned to cancel the bias and stand still.
-        # Previous attempt with 0.2 m/s diverged because max_displacement was 1.5m (P3_x could reach 2.1m).
-        # Now with max_displacement=0.5m, P3_x max=1.4m (0.47 m/s), safe for Go2 trot.
+        # Forward bias: curriculum step — gradually increase from 0.05 → 0.15 → 0.30 m/s.
+        # With max_bezier_displacement=0.5m and _v_fwd=0.15:
+        #   neutral action → P3_x = 0 + 0.45m → 0.15 m/s (gentle push, model_1900 can handle)
+        #   max-negative   → P3_x = -0.5+0.45 = -0.05m → ~0 m/s (safe floor, barely backward)
+        #   max-positive   → P3_x = +0.5+0.45 = 0.95m → 0.32 m/s (comfortable ceiling)
+        # 0.3 m/s caused too many MPC Guard failures (model_1900 tuned for near-stationary).
+        # Once reward > 150 and Guard failures < 1/iter, increase to _v_fwd=0.3.
         _hz = float(self.cfg.bezier_horizon)
-        _v_fwd = 0.3  # m/s — gives 0.3 m/s baseline forward speed with neutral RL action
+        _v_fwd = 0.15  # m/s — curriculum step 2 of 3 (was 0.05, target 0.30)
         _fwd_bias = np.array([
             0.0, 0.0, 0.0,
             _v_fwd * _hz / 3, 0.0, 0.0,
