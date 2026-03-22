@@ -223,8 +223,8 @@ class QuadrupedMPCEnvCfg(DirectRLEnvCfg):
     # Stage 2 (after stable walking): widen to y=±1.5, x=2~5
     # Stage 3 (advanced): full range with turning behavior
     target_pos_range: tuple = (
-        0.8, 2.0,   # x_min, x_max (near targets so robot can actually reach them)
-        -0.3, 0.3,  # y_min, y_max (narrow lateral range, matches current forward gait)
+        0.5, 1.5,   # x_min, x_max (closer so robot can reach during short episodes)
+        -0.2, 0.2,  # y_min, y_max (narrow lateral range, matches current forward gait)
         0.0, 0.0,   # z_min, z_max (ground level)
     )
 
@@ -242,17 +242,14 @@ class QuadrupedMPCEnvCfg(DirectRLEnvCfg):
     reward_reached_target: float = 10.0
 
     # Penalties
-    # NOTE on scale: joint_vel_penalty fires every step. At trot speed ±5 rad/s,
-    # Σ(jvel²)≈300 → -0.001×300 = -0.3/step (manageable). Old -0.01 gave -3/step
-    # which dominated all positive rewards and caused critic divergence.
     reward_torque_penalty: float = -0.001
-    reward_joint_velocity_penalty: float = -0.001   # reduced 10× (was -0.01)
+    reward_joint_velocity_penalty: float = 0.0      # DISABLED: swamps positive rewards at all speeds
     reward_foot_slip_penalty: float = -0.5
     reward_body_collision_penalty: float = -5.0
-    reward_fall_penalty: float = -2.0               # reduced 5× (was -10.0); -10/step during fall swamped all positives
+    reward_fall_penalty: float = 0.0                # DISABLED: fires every step during early training → -100/episode
 
     # Regularization
-    reward_action_rate_penalty: float = -0.05
+    reward_action_rate_penalty: float = 0.0         # DISABLED: _prev_bezier_params_last lookup overhead not worth it yet
     reward_alive: float = 0.05  # Reduced from 0.1 to discourage "alive but stationary" behavior
 
     # MPC constraint-related rewards
