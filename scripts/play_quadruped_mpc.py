@@ -477,27 +477,37 @@ def main():
             obs_mean = None
             obs_var = None
             # Check various possible normalizer key patterns
+            obs_std = None
             for mean_key in ["actor_obs_normalizer._mean", "obs_normalizer._mean",
                              "actor_obs_normalizer.running_mean"]:
                 if mean_key in state_dict:
                     obs_mean = state_dict[mean_key].to(device)
                     break
 
-            for var_key in ["actor_obs_normalizer._var", "obs_normalizer._var",
-                            "actor_obs_normalizer.running_var"]:
-                if var_key in state_dict:
-                    obs_var = state_dict[var_key].to(device)
+            # Prefer pre-computed _std; fall back to sqrt(_var) if not present
+            for std_key in ["actor_obs_normalizer._std", "obs_normalizer._std"]:
+                if std_key in state_dict:
+                    obs_std = state_dict[std_key].to(device)
                     break
+            if obs_std is None:
+                for var_key in ["actor_obs_normalizer._var", "obs_normalizer._var",
+                                "actor_obs_normalizer.running_var"]:
+                    if var_key in state_dict:
+                        obs_std = torch.sqrt(state_dict[var_key].to(device) + 1e-8)
+                        break
 
-            if obs_mean is not None and obs_var is not None:
-                obs_std = torch.sqrt(obs_var + 1e-8)
+            if obs_mean is not None and obs_std is not None:
                 print(f"Loaded observation normalizer (mean shape: {obs_mean.shape})")
+                # Clamp std to avoid division by near-zero (rare but possible for
+                # dims that barely varied during training)
+                obs_std_safe = torch.clamp(obs_std, min=1e-6)
 
                 def policy_fn(obs):
-                    normalized = (obs - obs_mean) / obs_std
+                    normalized = (obs - obs_mean) / obs_std_safe
                     return actor_net(normalized)
             else:
-                print("No observation normalizer found, using raw observations")
+                print("WARNING: No observation normalizer found — using raw observations.")
+                print("         Policy outputs may be unreliable without normalisation.")
                 def policy_fn(obs):
                     return actor_net(obs)
 

@@ -164,6 +164,9 @@ class QuadrupedMPCEnv(DirectRLEnv):
         # Previous gait modulation parameters
         self.prev_gait_mods = np.ones((self.num_envs, cfg.num_gait_mod_actions))
 
+        # Previous Bezier params from last step — used for action rate penalty
+        self._prev_bezier_params_last: dict[int, np.ndarray] = {}
+
         # Last MPC solution for debugging/visualization
         self.last_mpc_solutions: list[MPCSolution | None] = [None] * self.num_envs
 
@@ -428,6 +431,9 @@ class QuadrupedMPCEnv(DirectRLEnv):
                 # Store for next blending
                 self.prev_bezier_params[env_idx] = bezier_params[env_idx]
                 self.prev_gait_mods[env_idx] = gait_mods[env_idx]
+
+                # Store for action rate penalty (previous step's params)
+                self._prev_bezier_params_last[env_idx] = bezier_params[env_idx].copy()
 
             # Get current reference slice for MPC
             phase = self.trajectory_phases[env_idx]
@@ -694,11 +700,10 @@ class QuadrupedMPCEnv(DirectRLEnv):
             else:
                 velocity_reward = 0.0
 
-            # Control penalty
-            torque_penalty = 0.0
-            if self.last_mpc_solutions[env_idx] is not None:
-                torques = self.last_mpc_solutions[env_idx].control
-                torque_penalty = self.cfg.reward_torque_penalty * np.sum(torques ** 2)
+            # Control penalty: use actually-applied torques (Isaac buffer), NOT the
+            # MPC solution object which may contain diverged/NaN values when guard fires.
+            applied_torques = self._pending_joint_efforts[env_idx].cpu().numpy()
+            torque_penalty = self.cfg.reward_torque_penalty * float(np.sum(applied_torques ** 2))
 
             # Alive bonus
             alive_bonus = self.cfg.reward_alive
@@ -720,6 +725,17 @@ class QuadrupedMPCEnv(DirectRLEnv):
             # Guard penalty: large negative reward when MPC fallback fires
             guard_penalty = -10.0 if self.guard_triggered[env_idx] else 0.0
 
+            # Joint velocity penalty: discourage high-frequency oscillation
+            jvel = self.robot.data.joint_vel[env_idx, :12].cpu().numpy()
+            joint_vel_penalty = self.cfg.reward_joint_velocity_penalty * float(np.sum(jvel ** 2))
+
+            # Action rate penalty: discourage Bezier parameter jerk between steps
+            curr_params = self.prev_bezier_params[env_idx]
+            prev_params = self._prev_bezier_params_last.get(env_idx, curr_params)
+            action_rate_penalty = self.cfg.reward_action_rate_penalty * float(
+                np.sum((curr_params - prev_params) ** 2)
+            )
+
             # Height tracking reward: encourage nominal standing height (0.35m)
             target_height = 0.35  # Go2 nominal CoM height
             height_error = abs(float(position[env_idx, 2].cpu()) - target_height)
@@ -729,6 +745,20 @@ class QuadrupedMPCEnv(DirectRLEnv):
             # Measures how far the robot has drifted sideways relative to target direction
             lateral_error = abs(float(position[env_idx, 1].cpu()) - float(self.target_positions[env_idx, 1].cpu()))
             lateral_penalty = self.cfg.reward_lateral_penalty * min(lateral_error, 2.0)
+
+            # Fall penalty: fire when robot is in a clear failure state (flipped or on the ground)
+            # Uses instantaneous checks — no grace period (grace period only gates termination).
+            body_z = float(position[env_idx, 2].cpu())
+            quat_w = float(orientation[env_idx, 0].cpu())
+            quat_x = float(orientation[env_idx, 1].cpu())
+            quat_y = float(orientation[env_idx, 2].cpu())
+            up_world_z = 1.0 - 2.0 * (quat_x * quat_x + quat_y * quat_y)
+            is_falling = (
+                body_z < self.cfg.min_body_height
+                or body_z > self.cfg.max_body_height
+                or up_world_z < 0.5  # >60° from upright
+            )
+            fall_penalty = self.cfg.reward_fall_penalty if is_falling else 0.0
 
             # Total reward
             rewards[env_idx] = (
@@ -743,6 +773,9 @@ class QuadrupedMPCEnv(DirectRLEnv):
                 + guard_penalty
                 + height_reward
                 + lateral_penalty
+                + joint_vel_penalty
+                + action_rate_penalty
+                + fall_penalty
             )
 
         return rewards
@@ -910,6 +943,7 @@ class QuadrupedMPCEnv(DirectRLEnv):
             # Reset stored params
             self.prev_bezier_params[env_idx] = initial_params
             self.prev_gait_mods[env_idx] = np.ones(self.cfg.num_gait_mod_actions)
+            self._prev_bezier_params_last[env_idx] = initial_params.copy()
 
     def _generate_initial_bezier_params(
         self,

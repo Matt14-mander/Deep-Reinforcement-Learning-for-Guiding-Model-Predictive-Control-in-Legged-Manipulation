@@ -104,8 +104,8 @@ class QuadrupedMPCPPORunnerCfg(RslRlOnPolicyRunnerCfg):
         init_noise_std=0.8,  # Lower initial noise
         actor_obs_normalization=True,
         critic_obs_normalization=True,
-        actor_hidden_dims=[512, 256, 128],  # Larger networks for locomotion
-        critic_hidden_dims=[512, 256, 128],
+        actor_hidden_dims=[256, 256, 128],  # Actual trained architecture (verified from checkpoint)
+        critic_hidden_dims=[256, 256, 128],
         activation="elu",
     )
 
