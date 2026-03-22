@@ -242,11 +242,14 @@ class QuadrupedMPCEnvCfg(DirectRLEnvCfg):
     reward_reached_target: float = 10.0
 
     # Penalties
+    # NOTE on scale: joint_vel_penalty fires every step. At trot speed ±5 rad/s,
+    # Σ(jvel²)≈300 → -0.001×300 = -0.3/step (manageable). Old -0.01 gave -3/step
+    # which dominated all positive rewards and caused critic divergence.
     reward_torque_penalty: float = -0.001
-    reward_joint_velocity_penalty: float = -0.01
+    reward_joint_velocity_penalty: float = -0.001   # reduced 10× (was -0.01)
     reward_foot_slip_penalty: float = -0.5
     reward_body_collision_penalty: float = -5.0
-    reward_fall_penalty: float = -10.0
+    reward_fall_penalty: float = -2.0               # reduced 5× (was -10.0); -10/step during fall swamped all positives
 
     # Regularization
     reward_action_rate_penalty: float = -0.05
