@@ -570,6 +570,402 @@ def test_b1_gait(
 
 
 # =============================================================================
+# Velocity Comparison Utilities
+# =============================================================================
+
+def _quat_to_rotation_matrix(qxyzw: np.ndarray) -> np.ndarray:
+    """Convert Pinocchio quaternion (qx, qy, qz, qw) to 3×3 rotation matrix."""
+    qx, qy, qz, qw = qxyzw
+    return np.array([
+        [1 - 2*(qy*qy + qz*qz),  2*(qx*qy - qw*qz),      2*(qx*qz + qw*qy)],
+        [2*(qx*qy + qw*qz),       1 - 2*(qx*qx + qz*qz),  2*(qy*qz - qw*qx)],
+        [2*(qx*qz - qw*qy),       2*(qy*qz + qw*qx),       1 - 2*(qx*qx + qy*qy)],
+    ], dtype=np.float64)
+
+
+def extract_velocities_world(xs_sol: np.ndarray, nq: int = 19) -> dict:
+    """Extract body-frame velocities from Crocoddyl solution and rotate to world frame.
+
+    Pinocchio state layout (nq=19, nv=18):
+        q  = [x,y,z, qx,qy,qz,qw, joint×12]   indices 0:19
+        v  = [vx_b,vy_b,vz_b, wx_b,wy_b,wz_b, dq×12]  indices 19:37
+
+    All v[0:6] are expressed in the LOCAL (body) frame.
+    We rotate to world frame for comparison with the reference trajectory.
+
+    Returns dict with keys:
+        vx, vy, vz  — linear velocity in world frame (m/s)
+        wx, wy, wz  — angular velocity in world frame (rad/s)
+        roll, pitch — orientation angles (rad)
+    """
+    T = len(xs_sol)
+    vx = np.zeros(T); vy = np.zeros(T); vz = np.zeros(T)
+    wx = np.zeros(T); wy = np.zeros(T); wz = np.zeros(T)
+    roll = np.zeros(T); pitch = np.zeros(T)
+
+    for i, x in enumerate(xs_sol):
+        # Rotation matrix from body frame to world frame
+        R = _quat_to_rotation_matrix(x[3:7])          # (qx, qy, qz, qw)
+
+        # Linear velocity: body → world
+        v_w = R @ x[nq:nq + 3]
+        vx[i], vy[i], vz[i] = v_w
+
+        # Angular velocity: body → world
+        w_w = R @ x[nq + 3:nq + 6]
+        wx[i], wy[i], wz[i] = w_w
+
+        # Roll and pitch from quaternion
+        qx_i, qy_i, qz_i, qw_i = x[3], x[4], x[5], x[6]
+        roll[i]  = np.arctan2(2*(qw_i*qx_i + qy_i*qz_i),
+                               1 - 2*(qx_i**2 + qy_i**2))
+        sinp     = np.clip(2*(qw_i*qy_i - qz_i*qx_i), -1.0, 1.0)
+        pitch[i] = np.arcsin(sinp)
+
+    return dict(vx=vx, vy=vy, vz=vz, wx=wx, wy=wy, wz=wz,
+                roll=roll, pitch=pitch)
+
+
+def compute_desired_velocities(
+    com_trajectory: np.ndarray,
+    heading_trajectory: np.ndarray,
+    dt: float = 0.02,
+) -> dict:
+    """Compute desired velocity signals by differentiating the reference trajectories.
+
+    Returns dict with keys:
+        vx, vy  — world-frame linear velocity derivatives of CoM trajectory (m/s)
+        wz      — yaw rate derivative of heading trajectory (rad/s)
+    """
+    # np.gradient uses central differences; accurate at internal points
+    des_vx = np.gradient(com_trajectory[:, 0], dt)
+    des_vy = np.gradient(com_trajectory[:, 1], dt)
+    des_wz = np.gradient(heading_trajectory, dt)
+    return dict(vx=des_vx, vy=des_vy, wz=des_wz)
+
+
+def run_gait_for_comparison(
+    gait_type: str,
+    trajectory_type: str = "curve_left",
+    distance: float = 1.5,
+    duration: float = 3.0,
+    dt: float = 0.02,
+) -> Optional[dict]:
+    """Run full B1 MPC pipeline for one gait and return velocity data.
+
+    Returns dict with 'actual', 'desired', 'time', 'com_trajectory',
+    'heading_trajectory'; or None if solve failed.
+    """
+    print(f"\n{'─'*55}")
+    print(f"  Running gait: {gait_type.upper()}  |  traj: {trajectory_type}")
+    print(f"{'─'*55}")
+
+    try:
+        b1, rmodel, rdata, q0, v0, x0, foot_frame_ids = load_b1_robot()
+        pinocchio.centerOfMass(rmodel, rdata, q0)
+        com_start = rdata.com[0].copy()
+
+        gait_scheduler  = GaitScheduler()
+        foothold_planner = FootholdPlanner(
+            hip_offsets=B1RobotConfig.HIP_OFFSETS,
+            step_height=B1RobotConfig.GAIT_PARAMS["step_height"],
+        )
+
+        com_trajectory, _ = create_com_trajectory(
+            start_pos=com_start,
+            trajectory_type=trajectory_type,
+            distance=distance,
+            duration=duration,
+            dt=dt,
+        )
+
+        contact_sequence = gait_scheduler.generate(
+            gait_type=gait_type,
+            step_duration=B1RobotConfig.GAIT_PARAMS["step_duration"],
+            support_duration=B1RobotConfig.GAIT_PARAMS["support_duration"],
+            num_cycles=12,
+        )
+
+        initial_foot_positions = foothold_planner.get_footholds_at_time(
+            com_position=com_start, heading=0.0,
+        )
+        foothold_plans = foothold_planner.plan_footholds(
+            com_trajectory=com_trajectory,
+            contact_sequence=contact_sequence,
+            current_foot_positions=initial_foot_positions,
+            dt=dt,
+        )
+
+        # Heading trajectory
+        heading_trajectory = np.zeros(len(com_trajectory))
+        for i in range(len(com_trajectory)):
+            if i == 0:
+                tangent = (com_trajectory[1] - com_trajectory[0]) / dt
+            elif i >= len(com_trajectory) - 1:
+                tangent = (com_trajectory[-1] - com_trajectory[-2]) / dt
+            else:
+                tangent = (com_trajectory[i + 1] - com_trajectory[i - 1]) / (2 * dt)
+            heading_trajectory[i] = heading_from_tangent(tangent[:2])
+
+        problem, _ = build_ocp_with_our_pipeline(
+            rmodel=rmodel,
+            x0=x0,
+            com_trajectory=com_trajectory,
+            contact_sequence=contact_sequence,
+            foothold_plans=foothold_plans,
+            foot_frame_ids=foot_frame_ids,
+            dt=dt,
+            heading_trajectory=heading_trajectory,
+        )
+
+        solver = crocoddyl.SolverFDDP(problem)
+        solver.th_stop = 1e-4
+        solver.setCallbacks([crocoddyl.CallbackVerbose()])
+
+        xs_init = [x0] * (problem.T + 1)
+        us_init = problem.quasiStatic([x0] * problem.T)
+
+        t0 = time.time()
+        converged = solver.solve(xs_init, us_init, 100, False)
+        solve_time = time.time() - t0
+
+        print(f"  Converged={converged}  cost={solver.cost:.1f}  "
+              f"time={solve_time*1000:.0f}ms  nodes={problem.T}")
+
+        xs_sol = np.array(solver.xs)           # (T+1, 37)
+        nq = rmodel.nq                          # 19 for B1
+
+        # Time axis — use the shorter of OCP horizon and reference trajectory
+        T_sol  = len(xs_sol)
+        T_ref  = len(com_trajectory)
+        T_use  = min(T_sol, T_ref)
+        t_axis = np.arange(T_use) * dt
+
+        actual  = extract_velocities_world(xs_sol[:T_use], nq=nq)
+        desired = compute_desired_velocities(
+            com_trajectory[:T_use], heading_trajectory[:T_use], dt=dt
+        )
+
+        return dict(
+            gait=gait_type,
+            actual=actual,
+            desired=desired,
+            time=t_axis,
+            com_trajectory=com_trajectory,
+            heading_trajectory=heading_trajectory,
+            converged=converged,
+            cost=solver.cost,
+            solve_time=solve_time,
+        )
+
+    except Exception as exc:
+        print(f"  ERROR running {gait_type}: {exc}")
+        import traceback; traceback.print_exc()
+        return None
+
+
+def plot_velocity_comparison(
+    results: list,
+    trajectory_type: str = "curve_left",
+    save_path: Optional[str] = None,
+    show: bool = True,
+) -> str:
+    """Generate the 4-panel velocity/time comparison figure.
+
+    Panels:
+      1. CoM VEL X  (world frame) vs Desired VEL X
+      2. CoM VEL Y  (world frame) vs Desired VEL Y
+      3. CoM ANG Z  (yaw rate, world frame) vs Desired ANG Z
+      4. CoM ROLL & PITCH (body orientation angles)
+
+    Args:
+        results  : list of dicts from run_gait_for_comparison().
+        trajectory_type: used in figure title.
+        save_path: if given, save PNG to this path.
+        show     : if True, call plt.show().
+
+    Returns:
+        Path where figure was saved (or empty string).
+    """
+    import matplotlib
+    matplotlib.use("Agg" if not show else matplotlib.get_backend())
+    import matplotlib.pyplot as plt
+
+    # Colour/style per gait
+    GAIT_STYLES = {
+        "trot":  {"color": "#1f77b4", "ls": "-",  "lw": 2.0},
+        "walk":  {"color": "#ff7f0e", "ls": "--", "lw": 2.0},
+        "pace":  {"color": "#2ca02c", "ls": "-.", "lw": 2.0},
+        "bound": {"color": "#d62728", "ls": ":",  "lw": 2.0},
+    }
+    DES_STYLE = {"color": "black", "ls": "--", "lw": 1.4, "alpha": 0.75}
+
+    fig, axes = plt.subplots(2, 2, figsize=(14, 9))
+    fig.suptitle(
+        f"B1 Quadruped — Gait Comparison on Curved Trajectory  [{trajectory_type}]",
+        fontsize=14, fontweight="bold",
+    )
+
+    ax_vx  = axes[0, 0]   # Panel 1: VEL X
+    ax_vy  = axes[0, 1]   # Panel 2: VEL Y
+    ax_wz  = axes[1, 0]   # Panel 3: ANG Z (yaw rate)
+    ax_rp  = axes[1, 1]   # Panel 4: ROLL & PITCH
+
+    desired_plotted = False   # plot desired only once (shared reference)
+
+    for res in results:
+        if res is None:
+            continue
+        gait = res["gait"]
+        t    = res["time"]
+        act  = res["actual"]
+        des  = res["desired"]
+        sty  = GAIT_STYLES.get(gait, {"color": "gray", "ls": "-", "lw": 1.5})
+        lbl  = gait.capitalize()
+
+        # --- Panel 1: VEL X ---
+        ax_vx.plot(t, act["vx"], label=f"{lbl}",
+                   color=sty["color"], ls=sty["ls"], lw=sty["lw"])
+        if not desired_plotted:
+            ax_vx.plot(t, des["vx"], label="Desired",
+                       **DES_STYLE)
+
+        # --- Panel 2: VEL Y ---
+        ax_vy.plot(t, act["vy"], label=f"{lbl}",
+                   color=sty["color"], ls=sty["ls"], lw=sty["lw"])
+        if not desired_plotted:
+            ax_vy.plot(t, des["vy"], label="Desired",
+                       **DES_STYLE)
+
+        # --- Panel 3: ANG Z ---
+        ax_wz.plot(t, act["wz"], label=f"{lbl}",
+                   color=sty["color"], ls=sty["ls"], lw=sty["lw"])
+        if not desired_plotted:
+            ax_wz.plot(t, des["wz"], label="Desired",
+                       **DES_STYLE)
+
+        # --- Panel 4: ROLL & PITCH (actual only, no "desired" since target is 0) ---
+        ax_rp.plot(t, np.degrees(act["roll"]),
+                   label=f"{lbl} Roll",
+                   color=sty["color"], ls=sty["ls"], lw=sty["lw"])
+        ax_rp.plot(t, np.degrees(act["pitch"]),
+                   label=f"{lbl} Pitch",
+                   color=sty["color"], ls=":", lw=1.2, alpha=0.7)
+
+        desired_plotted = True  # subsequent gaits skip desired line
+
+    # Decorations — Panel 1
+    ax_vx.set_xlabel("Time (s)")
+    ax_vx.set_ylabel("Velocity (m/s)")
+    ax_vx.set_title("CoM VEL X  vs  Desired VEL X")
+    ax_vx.axhline(0, color="gray", lw=0.6, alpha=0.4)
+    ax_vx.legend(fontsize=9, loc="upper right")
+    ax_vx.grid(True, alpha=0.3)
+
+    # Decorations — Panel 2
+    ax_vy.set_xlabel("Time (s)")
+    ax_vy.set_ylabel("Velocity (m/s)")
+    ax_vy.set_title("CoM VEL Y  vs  Desired VEL Y")
+    ax_vy.axhline(0, color="gray", lw=0.6, alpha=0.4)
+    ax_vy.legend(fontsize=9, loc="upper right")
+    ax_vy.grid(True, alpha=0.3)
+
+    # Decorations — Panel 3
+    ax_wz.set_xlabel("Time (s)")
+    ax_wz.set_ylabel("Angular velocity (rad/s)")
+    ax_wz.set_title("CoM ANG Z (Yaw Rate)  vs  Desired ANG Z")
+    ax_wz.axhline(0, color="gray", lw=0.6, alpha=0.4)
+    ax_wz.legend(fontsize=9, loc="upper right")
+    ax_wz.grid(True, alpha=0.3)
+
+    # Decorations — Panel 4
+    ax_rp.set_xlabel("Time (s)")
+    ax_rp.set_ylabel("Angle (deg)")
+    ax_rp.set_title("CoM ROLL & PITCH  (solid=Roll, dotted=Pitch)")
+    ax_rp.axhline(0, color="gray", lw=0.6, alpha=0.4)
+    ax_rp.legend(fontsize=7, loc="upper right", ncol=2)
+    ax_rp.grid(True, alpha=0.3)
+
+    plt.tight_layout()
+
+    # Save
+    out_path = ""
+    if save_path is None:
+        # Auto-name based on trajectory type
+        save_path = f"b1_velocity_comparison_{trajectory_type}.png"
+    out_path = save_path
+    fig.savefig(out_path, dpi=150, bbox_inches="tight")
+    print(f"\n[plot_velocity_comparison] Saved → {os.path.abspath(out_path)}")
+
+    if show:
+        plt.show()
+    plt.close(fig)
+    return out_path
+
+
+def run_velocity_comparison(
+    trajectory_type: str = "curve_left",
+    gaits: Optional[list] = None,
+    distance: float = 1.5,
+    duration: float = 3.0,
+    dt: float = 0.02,
+    save_path: Optional[str] = None,
+    show: bool = False,
+):
+    """Run all gaits on the same curved trajectory and plot velocity comparison.
+
+    Args:
+        trajectory_type: "curve_left", "curve_right", "s_curve", or "straight".
+        gaits          : list of gait names to compare (default: trot, walk, pace).
+        distance       : total distance for the trajectory (m).
+        duration       : trajectory time horizon (s).
+        dt             : timestep (s).
+        save_path      : output PNG path (auto-named if None).
+        show           : display interactive plot window.
+    """
+    if gaits is None:
+        gaits = ["trot", "walk", "pace"]
+
+    print("\n" + "=" * 60)
+    print(f"  Velocity Comparison — {trajectory_type}")
+    print(f"  Gaits: {gaits}")
+    print("=" * 60)
+
+    results = []
+    for gait in gaits:
+        res = run_gait_for_comparison(
+            gait_type=gait,
+            trajectory_type=trajectory_type,
+            distance=distance,
+            duration=duration,
+            dt=dt,
+        )
+        results.append(res)
+
+    if all(r is None for r in results):
+        print("ERROR: all gait runs failed — no data to plot.")
+        return
+
+    out = plot_velocity_comparison(
+        results=results,
+        trajectory_type=trajectory_type,
+        save_path=save_path,
+        show=show,
+    )
+
+    # Print summary table
+    print("\n" + "=" * 60)
+    print(f"  {'Gait':<8} {'Converged':<12} {'Cost':>12} {'Time(ms)':>10}")
+    print("  " + "-" * 46)
+    for res in results:
+        if res is not None:
+            print(f"  {res['gait']:<8} {str(res['converged']):<12} "
+                  f"{res['cost']:>12.1f} {res['solve_time']*1000:>10.0f}")
+    print("=" * 60)
+    print(f"\nFigure saved to: {out}")
+
+
+# =============================================================================
 # Main
 # =============================================================================
 
@@ -585,6 +981,12 @@ Examples:
     python test_b1_gait.py --display --plot             # Both
     python test_b1_gait.py --gait trot --display        # Trotting with display
     python test_b1_gait.py --trajectory curve_left      # Curve walking test
+
+    # Velocity comparison across gaits (generates 4-panel figure):
+    python test_b1_gait.py --vel_compare
+    python test_b1_gait.py --vel_compare --trajectory curve_right
+    python test_b1_gait.py --vel_compare --gaits trot walk pace bound
+    python test_b1_gait.py --vel_compare --save_fig results/vel_compare.png
         """
     )
 
@@ -610,6 +1012,32 @@ Examples:
         "--plot", "-p", action="store_true",
         help="Show plots"
     )
+    # ---- Velocity comparison flags ----
+    parser.add_argument(
+        "--vel_compare", action="store_true",
+        help=(
+            "Run velocity comparison: solve all gaits on the same curved trajectory "
+            "and generate 4-panel velocity/time figure. "
+            "Uses --trajectory (default: curve_left) and --gaits."
+        ),
+    )
+    parser.add_argument(
+        "--gaits", type=str, nargs="+",
+        default=["trot", "walk", "pace"],
+        metavar="GAIT",
+        choices=["trot", "walk", "pace", "bound"],
+        help="Gaits to include in comparison (default: trot walk pace)",
+    )
+    parser.add_argument(
+        "--vel_traj", type=str, default="curve_left",
+        choices=["straight", "curve_left", "curve_right", "s_curve"],
+        help="Trajectory type for velocity comparison (default: curve_left)",
+    )
+    parser.add_argument(
+        "--save_fig", type=str, default=None,
+        metavar="PATH",
+        help="Save velocity comparison figure to this path (e.g. results/compare.png)",
+    )
 
     args = parser.parse_args()
 
@@ -617,13 +1045,26 @@ Examples:
     with_display = args.display or "CROCODDYL_DISPLAY" in os.environ
     with_plot = args.plot or "CROCODDYL_PLOT" in os.environ
 
-    test_b1_gait(
-        gait_type=args.gait,
-        trajectory_type=args.trajectory,
-        distance=args.distance,
-        with_display=with_display,
-        with_plot=with_plot,
-    )
+    if args.vel_compare:
+        # ---- Velocity comparison mode ----
+        traj = args.vel_traj
+        dist = args.distance if args.distance > 0 else 1.5
+        run_velocity_comparison(
+            trajectory_type=traj,
+            gaits=args.gaits,
+            distance=dist,
+            save_path=args.save_fig,
+            show=with_plot,
+        )
+    else:
+        # ---- Standard single-gait test ----
+        test_b1_gait(
+            gait_type=args.gait,
+            trajectory_type=args.trajectory,
+            distance=args.distance,
+            with_display=with_display,
+            with_plot=with_plot,
+        )
 
 
 if __name__ == "__main__":
