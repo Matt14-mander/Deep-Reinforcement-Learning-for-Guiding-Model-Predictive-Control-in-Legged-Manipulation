@@ -764,13 +764,34 @@ def run_gait_for_comparison(
         return None
 
 
+def _moving_average(signal: np.ndarray, window: int) -> np.ndarray:
+    """Causal moving-average smoothing (no look-ahead).
+
+    Pads the beginning with the first value to avoid boundary shrinkage.
+    Window size is automatically clamped to signal length.
+    """
+    window = min(window, len(signal))
+    if window <= 1:
+        return signal.copy()
+    kernel = np.ones(window) / window
+    # 'same' mode: pad start with edge value for causal feel
+    padded = np.concatenate([np.full(window - 1, signal[0]), signal])
+    return np.convolve(padded, kernel, mode="valid")[: len(signal)]
+
+
 def plot_velocity_comparison(
     results: list,
     trajectory_type: str = "curve_left",
     save_path: Optional[str] = None,
     show: bool = True,
+    smooth_window: int = 8,
 ) -> str:
     """Generate the 4-panel velocity/time comparison figure.
+
+    Each panel shows:
+      - Raw actual velocity: thin, semi-transparent line (gait oscillations visible)
+      - Smoothed actual velocity: thick solid line (overall tracking trend)
+      - Desired velocity: black dashed line (shared reference across all gaits)
 
     Panels:
       1. CoM VEL X  (world frame) vs Desired VEL X
@@ -779,10 +800,13 @@ def plot_velocity_comparison(
       4. CoM ROLL & PITCH (body orientation angles)
 
     Args:
-        results  : list of dicts from run_gait_for_comparison().
+        results      : list of dicts from run_gait_for_comparison().
         trajectory_type: used in figure title.
-        save_path: if given, save PNG to this path.
-        show     : if True, call plt.show().
+        save_path    : if given, save PNG to this path.
+        show         : if True, call plt.show().
+        smooth_window: moving-average window in timesteps (dt=0.02s per step).
+                       Default 8 → ~0.16s window, smooths out step-cycle noise
+                       while preserving low-frequency tracking errors.
 
     Returns:
         Path where figure was saved (or empty string).
@@ -798,12 +822,17 @@ def plot_velocity_comparison(
         "pace":  {"color": "#2ca02c", "ls": "-.", "lw": 2.0},
         "bound": {"color": "#d62728", "ls": ":",  "lw": 2.0},
     }
-    DES_STYLE = {"color": "black", "ls": "--", "lw": 1.4, "alpha": 0.75}
+    DES_STYLE  = {"color": "black", "ls": "--", "lw": 1.8, "alpha": 0.85,
+                  "zorder": 10}
+    RAW_ALPHA  = 0.22   # raw oscillating line: barely visible background
+    SMOOTH_LW  = 2.2    # smoothed trend line width
 
     fig, axes = plt.subplots(2, 2, figsize=(14, 9))
     fig.suptitle(
-        f"B1 Quadruped — Gait Comparison on Curved Trajectory  [{trajectory_type}]",
-        fontsize=14, fontweight="bold",
+        f"B1 Quadruped — Gait Comparison on Curved Trajectory  [{trajectory_type}]\n"
+        f"(thin = raw MPC solution, thick = {smooth_window}-step moving average, "
+        f"dashed = desired reference)",
+        fontsize=12, fontweight="bold",
     )
 
     ax_vx  = axes[0, 0]   # Panel 1: VEL X
@@ -821,36 +850,39 @@ def plot_velocity_comparison(
         act  = res["actual"]
         des  = res["desired"]
         sty  = GAIT_STYLES.get(gait, {"color": "gray", "ls": "-", "lw": 1.5})
+        col  = sty["color"]
         lbl  = gait.capitalize()
 
+        def _plot_channel(ax, raw, desired_sig, des_label="Desired"):
+            smooth = _moving_average(raw, smooth_window)
+            # Raw: very transparent background
+            ax.plot(t, raw, color=col, lw=0.7, alpha=RAW_ALPHA)
+            # Smoothed trend: solid, full opacity, labelled
+            ax.plot(t, smooth, color=col, ls=sty["ls"], lw=SMOOTH_LW,
+                    label=lbl)
+            if not desired_plotted:
+                ax.plot(t, desired_sig, label=des_label, **DES_STYLE)
+
         # --- Panel 1: VEL X ---
-        ax_vx.plot(t, act["vx"], label=f"{lbl}",
-                   color=sty["color"], ls=sty["ls"], lw=sty["lw"])
-        if not desired_plotted:
-            ax_vx.plot(t, des["vx"], label="Desired",
-                       **DES_STYLE)
+        _plot_channel(ax_vx, act["vx"], des["vx"])
 
         # --- Panel 2: VEL Y ---
-        ax_vy.plot(t, act["vy"], label=f"{lbl}",
-                   color=sty["color"], ls=sty["ls"], lw=sty["lw"])
-        if not desired_plotted:
-            ax_vy.plot(t, des["vy"], label="Desired",
-                       **DES_STYLE)
+        _plot_channel(ax_vy, act["vy"], des["vy"])
 
         # --- Panel 3: ANG Z ---
-        ax_wz.plot(t, act["wz"], label=f"{lbl}",
-                   color=sty["color"], ls=sty["ls"], lw=sty["lw"])
-        if not desired_plotted:
-            ax_wz.plot(t, des["wz"], label="Desired",
-                       **DES_STYLE)
+        _plot_channel(ax_wz, act["wz"], des["wz"])
 
-        # --- Panel 4: ROLL & PITCH (actual only, no "desired" since target is 0) ---
-        ax_rp.plot(t, np.degrees(act["roll"]),
-                   label=f"{lbl} Roll",
-                   color=sty["color"], ls=sty["ls"], lw=sty["lw"])
-        ax_rp.plot(t, np.degrees(act["pitch"]),
-                   label=f"{lbl} Pitch",
-                   color=sty["color"], ls=":", lw=1.2, alpha=0.7)
+        # --- Panel 4: ROLL & PITCH (no "desired" — target is 0 for both) ---
+        roll_deg  = np.degrees(act["roll"])
+        pitch_deg = np.degrees(act["pitch"])
+        s_roll    = _moving_average(roll_deg,  smooth_window)
+        s_pitch   = _moving_average(pitch_deg, smooth_window)
+        ax_rp.plot(t, roll_deg,  color=col, lw=0.7, alpha=RAW_ALPHA)
+        ax_rp.plot(t, pitch_deg, color=col, lw=0.7, alpha=RAW_ALPHA)
+        ax_rp.plot(t, s_roll,  color=col, ls=sty["ls"],  lw=SMOOTH_LW,
+                   label=f"{lbl} Roll")
+        ax_rp.plot(t, s_pitch, color=col, ls=":", lw=1.4, alpha=0.8,
+                   label=f"{lbl} Pitch")
 
         desired_plotted = True  # subsequent gaits skip desired line
 
