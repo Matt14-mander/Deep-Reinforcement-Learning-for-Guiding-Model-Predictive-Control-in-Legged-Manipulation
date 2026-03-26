@@ -1,0 +1,39 @@
+<?xml version="1.0"?>
+<!--
+  go2_mpc_controller.launch
+  启动 Go2 RL+MPC ROS 控制节点
+
+  使用方式:
+    roslaunch rl_bezier_mpc go2_mpc_controller.launch \
+        checkpoint:=/path/to/model_1098.pt \
+        urdf:=/path/to/go2.urdf
+
+  参数说明:
+    checkpoint  — .pt 检查点路径（必填）
+    urdf        — Go2 URDF 路径（必填）
+    robot_name  — Gazebo 中的模型名称（默认 go2）
+    target_x    — 目标 x 坐标，单位 m（默认 1.5）
+    target_y    — 目标 y 坐标，单位 m（默认 0.0）
+    max_torque  — 关节力矩上限 N·m（默认 23.5）
+-->
+<launch>
+  <arg name="checkpoint"  default="" />
+  <arg name="urdf"        default="" />
+  <arg name="robot_name"  default="go2" />
+  <arg name="target_x"    default="1.5" />
+  <arg name="target_y"    default="0.0" />
+  <arg name="max_torque"  default="23.5" />
+
+  <node name="quadruped_mpc_controller"
+        pkg="rl_bezier_mpc"
+        type="mpc_ros_controller.py"
+        output="screen"
+        respawn="false">
+    <param name="checkpoint"  value="$(arg checkpoint)" />
+    <param name="urdf"        value="$(arg urdf)" />
+    <param name="robot_name"  value="$(arg robot_name)" />
+    <param name="target_x"    value="$(arg target_x)" />
+    <param name="target_y"    value="$(arg target_y)" />
+    <param name="max_torque"  value="$(arg max_torque)" />
+  </node>
+</launch>
