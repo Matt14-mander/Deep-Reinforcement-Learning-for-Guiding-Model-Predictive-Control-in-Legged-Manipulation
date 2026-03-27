@@ -450,7 +450,7 @@ def test_b1_gait(
     us = problem.quasiStatic([x0] * problem.T)
 
     t_start = time.time()
-    converged = solver.solve(xs, us, 100, False)
+    converged = solver.solve(xs, us, 300, False)  # 100→300: full-traj OCP has 150+ nodes
     t_solve = time.time() - t_start
 
     print(f"\n  Converged: {converged}")
@@ -761,7 +761,7 @@ def run_gait_for_comparison(
         us_init = problem.quasiStatic([x0] * problem.T)
 
         t0 = time.time()
-        converged = solver.solve(xs_init, us_init, 100, False)
+        converged = solver.solve(xs_init, us_init, 300, False)
         solve_time = time.time() - t0
 
         print(f"  Converged={converged}  cost={solver.cost:.1f}  "
