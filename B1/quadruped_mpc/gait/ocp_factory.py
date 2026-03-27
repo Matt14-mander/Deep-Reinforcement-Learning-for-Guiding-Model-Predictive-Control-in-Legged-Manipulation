@@ -73,8 +73,11 @@ class OCPFactory:
         "foot_track": 1e6,
         "state_reg": 1e1,
         "ctrl_reg": 1e0,           # Increased: reduce aggressive torques in turns
-        "friction_cone": 1e3,      # Increased from 1e1: must dominate to prevent
-                                    # downward GRF, especially on hind feet during curves
+        "friction_cone": 1e4,      # 1e3→1e4: ratio vs tracking is now 1:100 (was 1:1000).
+                                    # At 1:1000 the constraint was freely violated → GRF
+                                    # arrows went far outside the cone in the display.
+                                    # At 1:100 the solver respects the friction limit while
+                                    # still being able to track the trajectory.
         "state_bounds": 1e3,
         "orientation_track": 1e3,  # Reduced from 1e4: avoid conflict with friction cone
                                     # during curve walking (yaw tracking less critical
@@ -259,11 +262,15 @@ class OCPFactory:
             # Create friction cone
             # FrictionCone expects a 3x3 rotation matrix (not a normal vector).
             # np.eye(3) means the cone normal is aligned with world z-axis (upward).
+            # nf=8 gives a better circular approximation in display (was 4, looked like
+            # a diamond/square pyramid which is visually unreasonable).
+            # inner=False → outer approximation (wider than true cone, easier to satisfy);
+            # the weight 1e4 now provides enough pressure to prevent large violations.
             cone = crocoddyl.FrictionCone(
                 np.eye(3),     # rotation matrix (identity = z-up normal)
                 self.mu,       # friction coefficient
-                4,             # number of cone faces
-                False,         # inner approximation
+                8,             # number of cone faces (8 → smoother visual + better approx)
+                False,         # outer approximation
             )
 
             friction_residual = crocoddyl.ResidualModelContactFrictionCone(
