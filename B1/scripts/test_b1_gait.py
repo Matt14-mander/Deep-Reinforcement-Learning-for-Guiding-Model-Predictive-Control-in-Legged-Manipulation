@@ -279,216 +279,6 @@ def build_ocp_with_our_pipeline(
 
 
 # =============================================================================
-# Meshcat Camera & Video Recording Utilities
-# =============================================================================
-
-def _build_lookat_transform(
-    cam_pos: np.ndarray,
-    target:  np.ndarray,
-    world_up: np.ndarray = np.array([0.0, 0.0, 1.0]),
-) -> np.ndarray:
-    """Build a 4×4 camera transform that places the camera at *cam_pos*
-    looking toward *target*.
-
-    Meshcat (three.js) camera convention:
-      - Camera looks along its LOCAL -Z axis
-      - Camera's LOCAL +Y is "up"
-    So we build the rotation matrix as [x_cam | y_cam | z_cam] where
-    z_cam = normalize(cam_pos - target)  (camera -Z points into the scene)
-
-    Args:
-        cam_pos  : Camera position in world frame, shape (3,).
-        target   : Look-at point in world frame, shape (3,).
-        world_up : Reference up vector (default world +Z).
-
-    Returns:
-        4×4 homogeneous transform (float64).
-    """
-    cam_pos  = np.asarray(cam_pos,  dtype=float)
-    target   = np.asarray(target,   dtype=float)
-    world_up = np.asarray(world_up, dtype=float)
-
-    z_cam = cam_pos - target
-    norm = np.linalg.norm(z_cam)
-    if norm < 1e-10:
-        z_cam = np.array([0.0, 0.0, 1.0])
-    else:
-        z_cam /= norm
-
-    x_cam = np.cross(world_up, z_cam)
-    x_norm = np.linalg.norm(x_cam)
-    if x_norm < 1e-6:
-        # Camera pointing straight up/down — use world X as fallback
-        x_cam = np.array([1.0, 0.0, 0.0])
-    else:
-        x_cam /= x_norm
-
-    y_cam = np.cross(z_cam, x_cam)   # guaranteed unit vector
-
-    T = np.eye(4)
-    T[:3, 0] = x_cam
-    T[:3, 1] = y_cam
-    T[:3, 2] = z_cam
-    T[:3, 3] = cam_pos
-    return T
-
-
-def setup_meshcat_camera(
-    display,
-    cam_pos: Optional[np.ndarray]   = None,
-    cam_target: Optional[np.ndarray] = None,
-    trajectory_midpoint: float       = 0.75,
-):
-    """Position the Meshcat camera for a side+above view of the B1 robot.
-
-    Default camera angle: 4 m to the robot's left (Y), 2 m above (Z),
-    centred on the mid-point of the trajectory.  Elevation ≈ 27°, all
-    four legs clearly visible from the side.
-
-    Args:
-        display            : crocoddyl.MeshcatDisplay (or MeshcatVisualizer).
-        cam_pos            : Override camera position [x, y, z] in metres.
-        cam_target         : Override look-at target [x, y, z] in metres.
-        trajectory_midpoint: X position of the trajectory mid-point (m).
-                             Used only when cam_pos / cam_target are None.
-    """
-    if cam_pos is None:
-        # Side-above view: look from the left (+Y) and above (+Z)
-        cam_pos = np.array([trajectory_midpoint, 4.0, 2.0])
-    if cam_target is None:
-        # Aim at robot CoM height (B1 standing_height ≈ 0.45 m)
-        cam_target = np.array([trajectory_midpoint, 0.0, 0.45])
-
-    T = _build_lookat_transform(cam_pos, cam_target)
-
-    # Try the simple high-level API first (meshcat ≥ 0.3.2)
-    viewer = display.viewer
-    try:
-        viewer.set_cam_pos(cam_pos.tolist())
-        viewer.set_cam_target(cam_target.tolist())
-        print(f"  Camera set via set_cam_pos/set_cam_target")
-        return
-    except AttributeError:
-        pass
-
-    # Fall back to low-level transform on the camera path
-    try:
-        viewer["/Cameras/default"].set_transform(T)
-        print(f"  Camera set via /Cameras/default transform")
-    except Exception as e:
-        print(f"  Warning: could not set camera: {e}")
-
-
-def record_video_from_xs(
-    display,
-    xs_sol: np.ndarray,
-    rmodel,
-    dt: float        = 0.02,
-    fps: int         = 25,
-    output_path: str = "gait_video.mp4",
-    render_wait: float = 0.04,
-) -> bool:
-    """Capture Meshcat frames from a solved state trajectory and save as video.
-
-    Each state ``x = xs_sol[i]`` is fed to the visualizer to update the
-    robot pose; a screenshot is taken via ``viewer.get_image()`` (requires
-    a browser tab to be connected).  Frames are assembled into an MP4 (with
-    imageio + ffmpeg) or a GIF (with Pillow as fallback).
-
-    Args:
-        display     : crocoddyl.MeshcatDisplay instance.
-        xs_sol      : State trajectory, shape (T+1, nq+nv).
-        rmodel      : Pinocchio robot model (for nq).
-        dt          : OCP timestep (seconds).
-        fps         : Target video frame rate.
-        output_path : Output file path (.mp4 or .gif).
-        render_wait : Seconds to wait after each display() call before
-                      capturing — increase if frames look frozen.
-
-    Returns:
-        True if video was saved successfully, False otherwise.
-    """
-    nq = rmodel.nq
-    sim_fps  = 1.0 / dt             # 50 Hz for dt=0.02
-    skip     = max(1, int(round(sim_fps / fps)))   # e.g. 2 → 25 fps
-    indices  = range(0, len(xs_sol), skip)
-    n_frames = len(list(indices))
-
-    print(f"\n  Recording {n_frames} frames  "
-          f"(every {skip} of {len(xs_sol)} OCP steps → {fps} fps) ...")
-    print(f"  Output: {os.path.abspath(output_path)}")
-    print(f"  ⚠  Make sure a browser tab is open at the Meshcat URL!")
-
-    viewer = display.viewer
-    frames = []
-
-    for k, i in enumerate(range(0, len(xs_sol), skip)):
-        q = xs_sol[i, :nq]
-        display.display(q)          # update robot configuration
-        time.sleep(render_wait)     # let WebGL render
-
-        try:
-            pil_img = viewer.get_image()    # PIL Image
-            frames.append(np.array(pil_img.convert("RGB")))
-        except Exception as exc:
-            if k == 0:
-                print(f"\n  ERROR: viewer.get_image() failed: {exc}")
-                print("  Hint: open the Meshcat URL in a browser first, then retry.")
-                return False
-            break   # browser disconnected mid-way
-
-        if (k + 1) % 20 == 0 or k == n_frames - 1:
-            print(f"    frame {k + 1}/{n_frames}")
-
-    if not frames:
-        print("  No frames captured — video not saved.")
-        return False
-
-    print(f"  Captured {len(frames)} frames.  Saving video...")
-
-    # ── try imageio + ffmpeg (MP4) ──────────────────────────────────────────
-    ext = os.path.splitext(output_path)[1].lower()
-    if ext == ".gif" or not ext:
-        output_path = os.path.splitext(output_path)[0] + ".gif"
-        ext = ".gif"
-
-    saved = False
-    if ext == ".mp4":
-        try:
-            import imageio.v2 as iio
-            writer = iio.get_writer(output_path, fps=fps, codec="libx264",
-                                    quality=7, macro_block_size=16)
-            for f in frames:
-                writer.append_data(f)
-            writer.close()
-            saved = True
-        except Exception as e:
-            print(f"  imageio MP4 failed ({e}), falling back to GIF …")
-            output_path = output_path.replace(".mp4", ".gif")
-            ext = ".gif"
-
-    if ext == ".gif" and not saved:
-        try:
-            from PIL import Image as PILImage
-            pil_frames = [PILImage.fromarray(f) for f in frames]
-            pil_frames[0].save(
-                output_path,
-                save_all=True,
-                append_images=pil_frames[1:],
-                duration=int(1000 / fps),
-                loop=0,
-                optimize=False,
-            )
-            saved = True
-        except Exception as e:
-            print(f"  GIF save failed: {e}")
-
-    if saved:
-        print(f"  ✓ Saved → {os.path.abspath(output_path)}")
-    return saved
-
-
-# =============================================================================
 # Main Test Function
 # =============================================================================
 
@@ -498,8 +288,6 @@ def test_b1_gait(
     distance: float = 2.0,
     with_display: bool = False,
     with_plot: bool = False,
-    with_record: bool = False,
-    video_output: str = "",
 ):
     """Test our gait pipeline with B1 robot.
 
@@ -507,11 +295,8 @@ def test_b1_gait(
         gait_type: Type of gait ("trot", "walk", "pace", "bound").
         trajectory_type: Type of trajectory ("straight", "curve_left", etc.).
         distance: Forward distance in meters.
-        with_display: If True, show 3D visualization in Meshcat.
-        with_plot: If True, show matplotlib plots.
-        with_record: If True, capture Meshcat frames and save video.
-                     Requires a browser tab open at the Meshcat URL.
-        video_output: Output path for recorded video (auto-named if empty).
+        with_display: If True, show 3D visualization.
+        with_plot: If True, show plots.
     """
     print("=" * 70)
     print(f"B1 Gait Test: {gait_type.upper()} - {trajectory_type}")
@@ -671,65 +456,48 @@ def test_b1_gait(
     print(f"  States shape: {xs_sol.shape}")
     print(f"  Controls shape: {us_sol.shape}")
 
-    # Display / Record
-    if with_display or with_record:
-        print("\nStarting Meshcat visualization...")
-
-        # Always use Meshcat for recording (Gepetto doesn't support get_image)
-        if with_record:
+    # Display
+    if with_display:
+        print("\nStarting visualization...")
+        try:
+            import gepetto
+            gepetto.corbaserver.Client()
+            cameraTF = [2.0, 2.68, 0.84, 0.2, 0.62, 0.72, 0.22]
+            display = crocoddyl.GepettoDisplay(b1, 4, 4, cameraTF)
+            print("  Using Gepetto viewer")
+        except Exception:
             display = crocoddyl.MeshcatDisplay(b1)
-            print("  Using Meshcat viewer (required for video recording)")
-        else:
-            try:
-                import gepetto
-                gepetto.corbaserver.Client()
-                cameraTF = [2.0, 2.68, 0.84, 0.2, 0.62, 0.72, 0.22]
-                display = crocoddyl.GepettoDisplay(b1, 4, 4, cameraTF)
-                print("  Using Gepetto viewer")
-            except Exception:
-                display = crocoddyl.MeshcatDisplay(b1)
-                print("  Using Meshcat viewer")
+            print("  Using Meshcat viewer")
 
         display.rate = -1
         display.freq = 1
 
-        # ── Set camera to side+above view ──────────────────────────────────
+        # Set initial camera: side+above view looking at trajectory midpoint
         if hasattr(display, "viewer"):
-            traj_mid = (com_start[0] + com_trajectory[-1, 0]) / 2.0
-            print(f"\n  Setting camera: side+above view "
-                  f"(trajectory midpoint X={traj_mid:.2f} m)")
-            setup_meshcat_camera(display, trajectory_midpoint=traj_mid)
-            print(f"  Meshcat URL: {display.viewer.url()}")
-
-        # ── Video recording ────────────────────────────────────────────────
-        if with_record:
-            if not video_output:
-                video_output = f"b1_{gait_type}_{trajectory_type}.mp4"
-            print(f"\n  Recording video to: {video_output}")
-            print("  → Open the Meshcat URL in Chrome/Firefox now, then press Enter.")
             try:
-                input("     [Enter to start recording] ")
-            except EOFError:
-                pass  # non-interactive environment
+                traj_mid_x = (com_start[0] + com_trajectory[-1, 0]) / 2.0
+                _cp = np.array([traj_mid_x, 4.0, 2.0])   # side 4m, height 2m
+                _ct = np.array([traj_mid_x, 0.0, 0.45])  # aim at CoM height
+                _z  = _cp - _ct;  _z /= np.linalg.norm(_z)
+                _up = np.array([0., 0., 1.])
+                _x  = np.cross(_up, _z);  _x /= np.linalg.norm(_x)
+                _y  = np.cross(_z, _x)
+                _T  = np.eye(4)
+                _T[:3, 0] = _x;  _T[:3, 1] = _y
+                _T[:3, 2] = _z;  _T[:3, 3] = _cp
+                display.viewer["/Cameras/default"].set_transform(_T)
+                print(f"  Camera: side+above at [{_cp[0]:.1f}, {_cp[1]:.1f}, {_cp[2]:.1f}]"
+                      f"  →  [{_ct[0]:.1f}, {_ct[1]:.1f}, {_ct[2]:.1f}]")
+            except Exception as _e:
+                print(f"  (Camera set skipped: {_e})")
 
-            record_video_from_xs(
-                display   = display,
-                xs_sol    = xs_sol,
-                rmodel    = rmodel,
-                dt        = dt,
-                fps       = 25,
-                output_path = video_output,
-            )
-
-        # ── Live playback (with_display mode) ─────────────────────────────
-        if with_display:
-            print("\n  Press Ctrl+C to stop playback...")
-            try:
-                while True:
-                    display.displayFromSolver(solver)
-                    time.sleep(1.0)
-            except KeyboardInterrupt:
-                print("\n  Stopped.")
+        print("\n  Press Ctrl+C to stop playback...")
+        try:
+            while True:
+                display.displayFromSolver(solver)
+                time.sleep(1.0)
+        except KeyboardInterrupt:
+            print("\n  Stopped.")
 
     # Plot
     if with_plot:
@@ -1265,15 +1033,9 @@ Examples:
     python test_b1_gait.py --gait trot --display        # Trotting with display
     python test_b1_gait.py --trajectory curve_left      # Curve walking test
 
-    # Video recording (Meshcat side+above camera, output MP4/GIF):
-    python test_b1_gait.py --gait trot --record_video
-    python test_b1_gait.py --gait walk --trajectory curve_left --record_video
-    python test_b1_gait.py --gait pace --record_video --video_out pace_video.mp4
-    python test_b1_gait.py --gait bound --record_video --video_out bound.gif
-
     # Velocity comparison across gaits (generates 4-panel figure):
     python test_b1_gait.py --vel_compare
-    python test_b1_gait.py --vel_compare --vel_traj curve_right
+    python test_b1_gait.py --vel_compare --trajectory curve_right
     python test_b1_gait.py --vel_compare --gaits trot walk pace bound
     python test_b1_gait.py --vel_compare --save_fig results/vel_compare.png
         """
@@ -1291,7 +1053,7 @@ Examples:
     )
     parser.add_argument(
         "--distance", type=float, default=-5,
-        help="Forward distance in meters (default: 1.5 for record, 2.0 otherwise)"
+        help="Forward distance in meters (default: 0.5)"
     )
     parser.add_argument(
         "--display", "-d", action="store_true",
@@ -1301,31 +1063,13 @@ Examples:
         "--plot", "-p", action="store_true",
         help="Show plots"
     )
-    # ---- Video recording flags ----
-    parser.add_argument(
-        "--record_video", "-r", action="store_true",
-        help=(
-            "Record Meshcat visualization as video. "
-            "Opens Meshcat in browser, sets side+above camera, captures frames via "
-            "viewer.get_image(), saves as MP4 (imageio+ffmpeg) or GIF (Pillow fallback). "
-            "A browser tab must be open at the Meshcat URL before capture starts."
-        ),
-    )
-    parser.add_argument(
-        "--video_out", type=str, default="",
-        metavar="PATH",
-        help=(
-            "Output video path for --record_video "
-            "(default: b1_<gait>_<trajectory>.mp4). "
-            "Extension determines format: .mp4 needs ffmpeg, .gif uses Pillow."
-        ),
-    )
     # ---- Velocity comparison flags ----
     parser.add_argument(
         "--vel_compare", action="store_true",
         help=(
             "Run velocity comparison: solve all gaits on the same curved trajectory "
-            "and generate 4-panel velocity/time figure."
+            "and generate 4-panel velocity/time figure. "
+            "Uses --trajectory (default: curve_left) and --gaits."
         ),
     )
     parser.add_argument(
@@ -1333,12 +1077,12 @@ Examples:
         default=["trot", "walk", "pace"],
         metavar="GAIT",
         choices=["trot", "walk", "pace", "bound"],
-        help="Gaits to include in --vel_compare (default: trot walk pace)",
+        help="Gaits to include in comparison (default: trot walk pace)",
     )
     parser.add_argument(
         "--vel_traj", type=str, default="curve_left",
         choices=["straight", "curve_left", "curve_right", "s_curve"],
-        help="Trajectory type for --vel_compare (default: curve_left)",
+        help="Trajectory type for velocity comparison (default: curve_left)",
     )
     parser.add_argument(
         "--save_fig", type=str, default=None,
@@ -1350,29 +1094,27 @@ Examples:
 
     # Also check environment variables (like change_b1_model.py)
     with_display = args.display or "CROCODDYL_DISPLAY" in os.environ
-    with_plot    = args.plot    or "CROCODDYL_PLOT"    in os.environ
+    with_plot = args.plot or "CROCODDYL_PLOT" in os.environ
 
     if args.vel_compare:
         # ---- Velocity comparison mode ----
+        traj = args.vel_traj
         dist = args.distance if args.distance > 0 else 1.5
         run_velocity_comparison(
-            trajectory_type=args.vel_traj,
+            trajectory_type=traj,
             gaits=args.gaits,
             distance=dist,
             save_path=args.save_fig,
             show=with_plot,
         )
     else:
-        # ---- Standard single-gait test (with optional video recording) ----
-        dist = args.distance if args.distance > 0 else 1.5
+        # ---- Standard single-gait test ----
         test_b1_gait(
-            gait_type      = args.gait,
-            trajectory_type= args.trajectory,
-            distance       = dist,
-            with_display   = with_display,
-            with_plot      = with_plot,
-            with_record    = args.record_video,
-            video_output   = args.video_out,
+            gait_type=args.gait,
+            trajectory_type=args.trajectory,
+            distance=args.distance,
+            with_display=with_display,
+            with_plot=with_plot,
         )
 
 
