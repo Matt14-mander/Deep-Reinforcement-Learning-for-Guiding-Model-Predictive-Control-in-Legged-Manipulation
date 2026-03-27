@@ -333,13 +333,23 @@ def test_b1_gait(
     print(f"  Start: [{com_trajectory[0, 0]:.3f}, {com_trajectory[0, 1]:.3f}, {com_trajectory[0, 2]:.3f}]")
     print(f"  End: [{com_trajectory[-1, 0]:.3f}, {com_trajectory[-1, 1]:.3f}, {com_trajectory[-1, 2]:.3f}]")
 
-    # Generate contact sequence
+    # Generate contact sequence — cap num_cycles to trajectory duration so the
+    # contact sequence doesn't overflow the CoM trajectory.  When num_cycles > needed,
+    # the extra OCP nodes all target com_trajectory[-1] and all footholds pile up at
+    # the same endpoint → robot appears to have legs "bunched together" in the display.
+    step_dur    = B1RobotConfig.GAIT_PARAMS["step_duration"]
+    support_dur = B1RobotConfig.GAIT_PARAMS["support_duration"]
+    n_groups    = len(GaitScheduler.GAIT_PATTERNS[gait_type]["swing_groups"])
+    cycle_dur   = n_groups * (step_dur + support_dur)  # seconds per full gait cycle
+    num_cycles  = max(2, int(duration / cycle_dur) + 1)  # +1: first half-cycle is shorter
+
     print(f"\nGenerating {gait_type} contact sequence...")
+    print(f"  cycle_dur={cycle_dur:.2f}s  →  num_cycles={num_cycles}")
     contact_sequence = gait_scheduler.generate(
         gait_type=gait_type,
-        step_duration=B1RobotConfig.GAIT_PARAMS["step_duration"],
-        support_duration=B1RobotConfig.GAIT_PARAMS["support_duration"],
-        num_cycles=12,
+        step_duration=step_dur,
+        support_duration=support_dur,
+        num_cycles=num_cycles,
     )
 
     print(f"  Number of phases: {len(contact_sequence)}")
@@ -698,11 +708,17 @@ def run_gait_for_comparison(
             dt=dt,
         )
 
+        _step_dur    = B1RobotConfig.GAIT_PARAMS["step_duration"]
+        _support_dur = B1RobotConfig.GAIT_PARAMS["support_duration"]
+        _n_groups    = len(GaitScheduler.GAIT_PATTERNS[gait_type]["swing_groups"])
+        _cycle_dur   = _n_groups * (_step_dur + _support_dur)
+        _num_cycles  = max(2, int(duration / _cycle_dur) + 1)
+
         contact_sequence = gait_scheduler.generate(
             gait_type=gait_type,
-            step_duration=B1RobotConfig.GAIT_PARAMS["step_duration"],
-            support_duration=B1RobotConfig.GAIT_PARAMS["support_duration"],
-            num_cycles=12,
+            step_duration=_step_dur,
+            support_duration=_support_dur,
+            num_cycles=_num_cycles,
         )
 
         initial_foot_positions = foothold_planner.get_footholds_at_time(
