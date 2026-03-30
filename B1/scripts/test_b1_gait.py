@@ -318,16 +318,8 @@ def test_b1_gait(
     )
 
     # Create CoM trajectory
-    # Clamp distance: negative sentinel (-5) or very large values reduce OCP tractability.
-    # Original working version used distance=0.5m, duration=2.0s, ~80 OCP nodes.
-    # Beyond ~1.0m the 150-node full-trajectory OCP stops converging and the display
-    # shows a "floating" CoM that isn't driven by foot contacts.
-    if distance <= 0:
-        distance = 0.8  # default for display: short enough for FDDP to converge
-    distance = min(distance, 1.0)  # cap at 1.0m for display quality
-
     print("\nGenerating CoM trajectory...")
-    duration = 2.0  # shorter horizon → fewer OCP nodes → better convergence for display
+    duration = 3.0
     dt = 0.02
     com_trajectory, bezier_params = create_com_trajectory(
         start_pos=com_start,
@@ -1133,12 +1125,10 @@ Examples:
         )
     else:
         # ---- Standard single-gait test ----
-        # Negative distance (-5) is a sentinel meaning "use function default"
-        dist = args.distance if args.distance > 0 else 2.0
         test_b1_gait(
             gait_type=args.gait,
             trajectory_type=args.trajectory,
-            distance=dist,
+            distance=args.distance,
             with_display=with_display,
             with_plot=with_plot,
         )
