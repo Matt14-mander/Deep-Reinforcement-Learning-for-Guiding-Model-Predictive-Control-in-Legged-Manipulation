@@ -162,7 +162,9 @@ class OCPFactory:
         # Structure: [base_pos(3), base_quat(4), joints(nq-7)]
         state_weights_q = np.array(
             [0.0] * 3  # base position - free
-            + [500.0] * 3  # base orientation (we use 3D since Crocoddyl uses tangent)
+            + [500.0, 500.0, 10.0]  # base orientation: roll/pitch strong, yaw weak
+            # yaw=10 so bodyOrientation (1e3) dominates stateReg (10×10=100) on curved paths
+            # yaw=500 would be 5000 >> bodyOrientation → forced back to yaw=0 (U-turn bug)
             + [0.01] * (self.nv - 6)  # joints
         )
 
@@ -455,8 +457,13 @@ class OCPFactory:
             com_cost = crocoddyl.CostModelResidual(self.state, com_residual)
             cost_model.addCost("comTrack", com_cost, self.weights["com_track"] * 10)
 
-        # State regularization (heavier for terminal)
-        state_activation = crocoddyl.ActivationModelWeightedQuad(self.state_weights)
+        # State regularization (heavier for terminal).
+        # Zero out base orientation weights: bodyOrientation cost handles yaw separately.
+        # If we keep orientation_weight=500 here × state_reg×10 = 5000, it overwhelms
+        # bodyOrientation (1e3) and yanks the final state back to x0 yaw=0 → U-turn on curves.
+        terminal_state_weights = self.state_weights.copy()
+        terminal_state_weights[3:6] = 0.0  # zero base orientation (roll/pitch/yaw)
+        state_activation = crocoddyl.ActivationModelWeightedQuad(terminal_state_weights)
         state_residual = crocoddyl.ResidualModelState(self.state, self.x0, self.nu)
         state_cost = crocoddyl.CostModelResidual(
             self.state, state_activation, state_residual
