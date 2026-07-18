@@ -28,6 +28,7 @@ from . import controllers
 from . import trajectory
 from . import utils
 from . import gait  # Quadruped gait management (no IsaacLab dependency)
+from . import mpc_cluster  # Parallel MPC solving (no IsaacLab dependency)
 
 # Try to import IsaacLab-dependent modules
 # These will fail if IsaacLab/Isaac Sim is not available

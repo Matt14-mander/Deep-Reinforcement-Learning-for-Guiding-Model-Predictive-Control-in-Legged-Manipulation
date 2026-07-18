@@ -138,6 +138,29 @@ class QuadrupedMPCEnvCfg(DirectRLEnvCfg):
     mpc_verbose: bool = False
 
     # ==========================================================================
+    # MPC Cluster (parallel solving via EigenIPC, Linux training only)
+    # See docs/mpc_cluster_design.md. When False, the original in-process
+    # serial path is used (Windows debugging / A-B baseline).
+    # ==========================================================================
+
+    use_mpc_cluster: bool = False
+
+    # Worker process count. Rule of thumb: physical cores - 2.
+    cluster_num_workers: int = 8
+
+    # Shared-memory namespace; empty = auto "rlbmpc_<pid>" (prevents collisions
+    # between concurrent training runs on one machine).
+    cluster_namespace: str = ""
+
+    # Auto-start the cluster launcher via subprocess. Set False to run
+    # `python -m RL_Bezier_MPC.mpc_cluster.launcher ...` manually (debugging).
+    cluster_autostart: bool = True
+
+    # Barrier timeout per solve cycle (ms). Generous default: first cycle
+    # includes worker-side model building.
+    cluster_timeout_ms: int = 60000
+
+    # ==========================================================================
     # Trajectory Configuration
     # ==========================================================================
 

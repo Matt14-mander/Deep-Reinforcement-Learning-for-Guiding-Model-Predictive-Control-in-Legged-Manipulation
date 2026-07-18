@@ -26,6 +26,8 @@ MPC (50 Hz), and physics (200 Hz) through appropriate buffering.
 
 from typing import Dict, Optional, Tuple
 
+import time
+
 import numpy as np
 import torch
 
@@ -109,10 +111,15 @@ class QuadrupedMPCEnv(DirectRLEnv):
                 print(f"Warning: Could not load Pinocchio model: {e}")
                 print("MPC will run in dummy mode.")
 
-        # Initialize MPC controllers (one per environment for parallel solving)
+        # MPC cluster mode: solving happens in external worker processes via
+        # shared memory (docs/mpc_cluster_design.md); no in-process controllers.
+        self.mpc_cluster = None
+        _use_cluster = bool(getattr(cfg, "use_mpc_cluster", False)) and self._pinocchio_model is not None
+
+        # Initialize MPC controllers (one per environment, serial path only)
         self.mpc_controllers = []
         for _ in range(self.num_envs):
-            if self._pinocchio_model is not None:
+            if self._pinocchio_model is not None and not _use_cluster:
                 mpc = CrocoddylQuadrupedMPC(
                     rmodel=self._pinocchio_model,
                     foot_frame_names=cfg.foot_frame_names,
@@ -128,8 +135,28 @@ class QuadrupedMPCEnv(DirectRLEnv):
                     verbose=(cfg.mpc_verbose and _ == 0),  # Only verbose for env 0
                 )
             else:
-                mpc = None  # Dummy mode
+                mpc = None  # Dummy mode / cluster mode
             self.mpc_controllers.append(mpc)
+
+        if _use_cluster:
+            from ..mpc_cluster import MPCClusterClient, mpc_cfg_to_dict
+
+            self.mpc_cluster = MPCClusterClient(
+                num_envs=self.num_envs,
+                mpc_cfg=mpc_cfg_to_dict(cfg),
+                num_workers=cfg.cluster_num_workers,
+                namespace=(cfg.cluster_namespace or None),
+                autostart=cfg.cluster_autostart,
+                timeout_ms=cfg.cluster_timeout_ms,
+            )
+            # Array-based last-good storage for the cluster guard path
+            # (solution objects never cross the IPC boundary).
+            self._last_good_ctrl = np.zeros((self.num_envs, 24))
+            self._last_good_valid = np.zeros(self.num_envs, dtype=bool)
+
+        # P0 timing instrumentation: wall time of the MPC block per control step
+        self._mpc_timing_accum_ms = 0.0
+        self._mpc_timing_count = 0
 
         # Build joint reordering maps between Isaac Lab and Pinocchio
         # Isaac Lab (USD) and Pinocchio (URDF) may have different joint orderings
@@ -404,71 +431,21 @@ class QuadrupedMPCEnv(DirectRLEnv):
         # Get current robot states
         robot_states = self._get_robot_states_numpy()
 
-        # Process each environment
+        _t_mpc_start = time.perf_counter()
+
+        # Cluster mode: batch inputs, parallel solve in worker processes,
+        # batch apply. Serial path below is kept for debugging and A/B baseline.
+        if self.mpc_cluster is not None:
+            self._pre_physics_step_cluster(robot_states, bezier_params, gait_mods)
+            self._record_mpc_timing(_t_mpc_start)
+            return
+
+        # Process each environment (serial in-process path)
         for env_idx in range(self.num_envs):
-            # Check if time to update trajectory
-            if self.mpc_step_counter[env_idx] % self.cfg.rl_policy_period == 0:
-                # Generate new CoM trajectory from Bezier parameters
-                current_pos = robot_states[env_idx, :3]
-                new_trajectory = self.trajectory_generator.params_to_waypoints(
-                    params=bezier_params[env_idx],
-                    dt=self.cfg.mpc_dt,
-                    horizon=self.cfg.bezier_horizon,
-                    start_position=current_pos,
-                )
-
-                # Blend with previous trajectory for smoothness
-                if self.trajectory_phases[env_idx] > 0:
-                    old_traj = self.current_com_trajectories[env_idx]
-                    old_phase = self.trajectory_phases[env_idx]
-                    old_traj_shifted = np.roll(old_traj, -old_phase, axis=0)
-                    self.current_com_trajectories[env_idx] = blend_trajectories(
-                        old_trajectory=old_traj_shifted,
-                        new_trajectory=new_trajectory,
-                        blend_steps=self.cfg.trajectory_blend_steps,
-                    )
-                else:
-                    self.current_com_trajectories[env_idx] = new_trajectory
-
-                # Reset phase counter
-                self.trajectory_phases[env_idx] = 0
-
-                # Store for next blending
-                self.prev_bezier_params[env_idx] = bezier_params[env_idx]
-                self.prev_gait_mods[env_idx] = gait_mods[env_idx]
-
-                # Store for action rate penalty (previous step's params)
-                self._prev_bezier_params_last[env_idx] = bezier_params[env_idx].copy()
-
-            # Get current reference slice for MPC
-            phase = self.trajectory_phases[env_idx]
-            end_phase = min(
-                phase + self.cfg.mpc_horizon_steps,
-                len(self.current_com_trajectories[env_idx])
+            com_reference, foot_positions = self._prepare_env_mpc_inputs(
+                env_idx, robot_states, bezier_params, gait_mods
             )
-            com_reference = self.current_com_trajectories[env_idx, phase:end_phase]
 
-            # Pad if necessary
-            # Pad if necessary
-            if len(com_reference) < self.cfg.mpc_horizon_steps:
-                pad_length = self.cfg.mpc_horizon_steps - len(com_reference)
-                if len(com_reference) > 1:
-                    # 计算最后两点偏移量；保持 Z 不变 + 匀减速，防止"恒速撞墙"
-                    step_delta = (com_reference[-1] - com_reference[-2]).copy()
-                    step_delta[2] = 0.0  # 禁止外推 Z 轴（防止 MPC 被告知无限上升/下降）
-                    last_point = com_reference[-1]
-                    # 匀减速外推：scale 从 1→0，平滑停止而非恒速冲墙
-                    padding_points = np.array([
-                        last_point + step_delta * max(0.0, 1.0 - (i + 1) / pad_length)
-                        for i in range(pad_length)
-                    ])
-                elif len(com_reference) == 1:
-                    padding_points = np.repeat(com_reference, pad_length, axis=0)
-                else:
-                    padding_points = np.zeros((pad_length, 3))
-                
-                com_reference = np.concatenate([com_reference, padding_points], axis=0)
-                
             # Parse gait modulation parameters
             gait_params = {
                 "step_length": gait_mods[env_idx, 0],
@@ -476,8 +453,6 @@ class QuadrupedMPCEnv(DirectRLEnv):
                 "step_frequency": gait_mods[env_idx, 2],
             }
 
-            # Get current foot positions (dummy for now)
-            foot_positions = self._get_foot_positions_numpy(env_idx, robot_states[env_idx])
 
             # Solve MPC
             if self.mpc_controllers[env_idx] is not None:
@@ -559,6 +534,174 @@ class QuadrupedMPCEnv(DirectRLEnv):
 
             # === 务必确认同时应用了位置和扭矩！===
             self._apply_control(env_idx, joint_positions, joint_torques)
+
+
+        self._record_mpc_timing(_t_mpc_start)
+
+    def _prepare_env_mpc_inputs(self, env_idx, robot_states, bezier_params, gait_mods):
+        """Per-env MPC input preparation (trajectory regen/blend/slice/pad + feet).
+
+        Shared verbatim by the serial path and the cluster path so both solve
+        exactly the same problem.
+
+        Returns:
+            (com_reference (H, 3), foot_positions (4, 3))
+        """
+        # Check if time to update trajectory
+        if self.mpc_step_counter[env_idx] % self.cfg.rl_policy_period == 0:
+            # Generate new CoM trajectory from Bezier parameters
+            current_pos = robot_states[env_idx, :3]
+            new_trajectory = self.trajectory_generator.params_to_waypoints(
+                params=bezier_params[env_idx],
+                dt=self.cfg.mpc_dt,
+                horizon=self.cfg.bezier_horizon,
+                start_position=current_pos,
+            )
+
+            # Blend with previous trajectory for smoothness
+            if self.trajectory_phases[env_idx] > 0:
+                old_traj = self.current_com_trajectories[env_idx]
+                old_phase = self.trajectory_phases[env_idx]
+                old_traj_shifted = np.roll(old_traj, -old_phase, axis=0)
+                self.current_com_trajectories[env_idx] = blend_trajectories(
+                    old_trajectory=old_traj_shifted,
+                    new_trajectory=new_trajectory,
+                    blend_steps=self.cfg.trajectory_blend_steps,
+                )
+            else:
+                self.current_com_trajectories[env_idx] = new_trajectory
+
+            # Reset phase counter
+            self.trajectory_phases[env_idx] = 0
+
+            # Store for next blending
+            self.prev_bezier_params[env_idx] = bezier_params[env_idx]
+            self.prev_gait_mods[env_idx] = gait_mods[env_idx]
+
+            # Store for action rate penalty (previous step's params)
+            self._prev_bezier_params_last[env_idx] = bezier_params[env_idx].copy()
+
+        # Get current reference slice for MPC
+        phase = self.trajectory_phases[env_idx]
+        end_phase = min(
+            phase + self.cfg.mpc_horizon_steps,
+            len(self.current_com_trajectories[env_idx])
+        )
+        com_reference = self.current_com_trajectories[env_idx, phase:end_phase]
+
+        # Pad if necessary
+        # Pad if necessary
+        if len(com_reference) < self.cfg.mpc_horizon_steps:
+            pad_length = self.cfg.mpc_horizon_steps - len(com_reference)
+            if len(com_reference) > 1:
+                # 计算最后两点偏移量；保持 Z 不变 + 匀减速，防止"恒速撞墙"
+                step_delta = (com_reference[-1] - com_reference[-2]).copy()
+                step_delta[2] = 0.0  # 禁止外推 Z 轴（防止 MPC 被告知无限上升/下降）
+                last_point = com_reference[-1]
+                # 匀减速外推：scale 从 1→0，平滑停止而非恒速冲墙
+                padding_points = np.array([
+                    last_point + step_delta * max(0.0, 1.0 - (i + 1) / pad_length)
+                    for i in range(pad_length)
+                ])
+            elif len(com_reference) == 1:
+                padding_points = np.repeat(com_reference, pad_length, axis=0)
+            else:
+                padding_points = np.zeros((pad_length, 3))
+
+            com_reference = np.concatenate([com_reference, padding_points], axis=0)
+
+        # Get current foot positions (dummy for now)
+        foot_positions = self._get_foot_positions_numpy(env_idx, robot_states[env_idx])
+        return com_reference, foot_positions
+
+    def _pre_physics_step_cluster(self, robot_states, bezier_params, gait_mods):
+        """Batch MPC step through the external solver cluster.
+
+        Mirrors the serial-path semantics exactly: same per-env input prep,
+        same divergence guard including the failed-cost-for-reward rule
+        (memory bug #17), same fallback chain (last-good -> zero torque +
+        standing pose). Solution objects never cross the IPC boundary, so the
+        last-good store is array-based.
+        """
+        from ..mpc_cluster.defs import FOOT_ORDER, STANDING_JOINTS, STATUS_OK
+
+        E = self.num_envs
+        H = self.cfg.mpc_horizon_steps
+        com_refs = np.zeros((E, H, 3))
+        foot_pos = np.zeros((E, 12))
+        for env_idx in range(E):
+            com_reference, foot_positions = self._prepare_env_mpc_inputs(
+                env_idx, robot_states, bezier_params, gait_mods
+            )
+            com_refs[env_idx] = com_reference
+            # foot_positions is a dict {name: (3,)}; serialize in wire order
+            foot_pos[env_idx] = np.concatenate(
+                [np.asarray(foot_positions[name]) for name in FOOT_ORDER]
+            )
+
+        out = self.mpc_cluster.solve_all(
+            states=robot_states,
+            com_ref=com_refs,
+            foot_pos=foot_pos,
+            gait=gait_mods,
+        )
+
+        _COST_THRESHOLD = 50000.0
+        if hasattr(self._pinocchio_model, "referenceConfigurations") and \
+                "standing" in self._pinocchio_model.referenceConfigurations:
+            standing = np.asarray(
+                self._pinocchio_model.referenceConfigurations["standing"][7:19]
+            )
+        else:
+            standing = STANDING_JOINTS
+
+        for env_idx in range(E):
+            cost = float(out["cost"][env_idx])
+            failed = (
+                out["status"][env_idx] != STATUS_OK
+                or np.isnan(cost)
+                or cost > _COST_THRESHOLD
+            )
+            if failed:
+                self.guard_triggered[env_idx] = True
+                # Reward must see the FAILED cost, not the fallback's (bug #17)
+                self._last_mpc_costs[env_idx] = 1e6 if np.isnan(cost) else cost
+                self._last_mpc_converged[env_idx] = False
+                if self._last_good_valid[env_idx]:
+                    if env_idx == 0:
+                        print(f"[MPC Guard] env 0: FAILED cost={cost:.0f} "
+                              "-> fallback", flush=True)
+                    joint_torques = self._last_good_ctrl[env_idx, :12].copy()
+                    joint_positions = self._last_good_ctrl[env_idx, 12:].copy()
+                else:
+                    joint_torques = np.zeros(self.cfg.num_joints)
+                    joint_positions = standing
+            else:
+                self.guard_triggered[env_idx] = False
+                joint_torques = out["torques"][env_idx]
+                joint_positions = out["qpos"][env_idx]
+                self._last_good_ctrl[env_idx, :12] = joint_torques
+                self._last_good_ctrl[env_idx, 12:] = joint_positions
+                self._last_good_valid[env_idx] = True
+                self._last_mpc_costs[env_idx] = cost
+                self._last_mpc_converged[env_idx] = bool(out["converged"][env_idx])
+
+            self.last_mpc_solutions[env_idx] = None
+            self._apply_control(env_idx, joint_positions, joint_torques)
+
+    def _record_mpc_timing(self, t_start: float):
+        """P0 baseline metric: wall-clock ms of the MPC block per control step."""
+        self._mpc_timing_accum_ms += (time.perf_counter() - t_start) * 1e3
+        self._mpc_timing_count += 1
+        if self._mpc_timing_count % 500 == 0:
+            avg = self._mpc_timing_accum_ms / 500
+            mode = "cluster" if self.mpc_cluster is not None else "serial"
+            extra = ""
+            if self.mpc_cluster is not None and hasattr(self.mpc_cluster, "last_solve_wall_ms"):
+                extra = f", barrier {self.mpc_cluster.last_solve_wall_ms:.1f} ms last"
+            print(f"[MPC Timing] {mode}: avg {avg:.1f} ms/step over last 500 steps "
+                  f"(budget {self.cfg.mpc_dt * 1e3:.0f} ms{extra})", flush=True)
+            self._mpc_timing_accum_ms = 0.0
 
     def _apply_action(self):
         """Apply both accumulated joint position targets and feedforward efforts."""
@@ -941,6 +1084,12 @@ class QuadrupedMPCEnv(DirectRLEnv):
             self._last_good_solutions[env_idx] = None
             self._too_low_counter[env_idx] = 0
 
+            # Cluster mode: forward reset to the worker owning this env
+            # (controller state lives in the worker) and invalidate last-good arrays
+            if self.mpc_cluster is not None:
+                self.mpc_cluster.mark_reset([env_idx])
+                self._last_good_valid[env_idx] = False
+
             # Reset guard state
             self.guard_triggered[env_idx] = False
             self.consecutive_mpc_failures[env_idx] = 0
@@ -1157,5 +1306,7 @@ class QuadrupedMPCEnv(DirectRLEnv):
 
     def close(self):
         """Clean up resources."""
+        if self.mpc_cluster is not None:
+            self.mpc_cluster.shutdown()
         self.mpc_controllers.clear()
         super().close()
