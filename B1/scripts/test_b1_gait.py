@@ -466,6 +466,62 @@ def test_b1_gait(
     print(f"  States shape: {xs_sol.shape}")
     print(f"  Controls shape: {us_sol.shape}")
 
+    # Diagnostic: actual base XY position + yaw vs. reference/desired.
+    # The reference-only plot below (ax1 in the fallback plot) only ever draws
+    # com_trajectory, which is identical regardless of how the OCP weights the
+    # terminal orientation cost — it can never reveal a terminal-orientation bug
+    # (e.g. terminal state_reg overwhelming bodyOrientation and snapping the final
+    # yaw back toward x0's yaw=0 on curved trajectories). This block plots the
+    # actual solved base pose (xs_sol) instead, which does show it.
+    if with_plot:
+        import matplotlib.pyplot as plt
+
+        actual_xy = xs_sol[:, 0:2]
+        actual_yaw = np.zeros(len(xs_sol))
+        for i in range(len(xs_sol)):
+            quat_xyzw = xs_sol[i, 3:7]
+            R = pinocchio.Quaternion(
+                quat_xyzw[3], quat_xyzw[0], quat_xyzw[1], quat_xyzw[2]
+            ).toRotationMatrix()
+            actual_yaw[i] = np.arctan2(R[1, 0], R[0, 0])
+
+        t_ref = np.linspace(0, duration, len(heading_trajectory))
+        t_actual = np.linspace(0, duration, len(xs_sol))
+
+        fig_diag, (ax_xy, ax_yaw) = plt.subplots(1, 2, figsize=(14, 6))
+
+        ax_xy.plot(com_trajectory[:, 0], com_trajectory[:, 1], "k--", linewidth=1.5, label="Reference (Bezier)")
+        ax_xy.plot(actual_xy[:, 0], actual_xy[:, 1], "b-", linewidth=2, label="Actual (OCP solution)")
+        ax_xy.scatter(*actual_xy[0], c="g", s=100, marker="o", label="Start", zorder=5)
+        ax_xy.scatter(*actual_xy[-1], c="r", s=100, marker="*", label="End", zorder=5)
+        # Heading arrows at sampled points make a terminal "snap-back" visible at a glance
+        for idx in np.linspace(0, len(actual_xy) - 1, 12, dtype=int):
+            ax_xy.arrow(
+                actual_xy[idx, 0], actual_xy[idx, 1],
+                0.08 * np.cos(actual_yaw[idx]), 0.08 * np.sin(actual_yaw[idx]),
+                head_width=0.03, color="orange", alpha=0.8,
+            )
+        ax_xy.set_xlabel("X (m)")
+        ax_xy.set_ylabel("Y (m)")
+        ax_xy.set_title(f"Actual vs. Reference CoM Trajectory\n[{gait_type} - {trajectory_type}]")
+        ax_xy.legend()
+        ax_xy.grid(True, alpha=0.3)
+        ax_xy.set_aspect("equal")
+
+        ax_yaw.plot(t_ref, np.unwrap(heading_trajectory), "k--", linewidth=1.5, label="Desired heading (tangent)")
+        ax_yaw.plot(t_actual, np.unwrap(actual_yaw), "b-", linewidth=2, label="Actual yaw (OCP solution)")
+        ax_yaw.set_xlabel("Time (s)")
+        ax_yaw.set_ylabel("Yaw (rad)")
+        ax_yaw.set_title("Desired vs. Actual Base Yaw\n(watch for a snap-back near the end)")
+        ax_yaw.legend()
+        ax_yaw.grid(True, alpha=0.3)
+
+        plt.tight_layout()
+        diag_path = f"terminal_orientation_diag_{gait_type}_{trajectory_type}.png"
+        plt.savefig(diag_path, dpi=150)
+        print(f"  Saved terminal-orientation diagnostic plot to: {diag_path}")
+        plt.show(block=False)
+
     # Display
     if with_display:
         print("\nStarting visualization...")
