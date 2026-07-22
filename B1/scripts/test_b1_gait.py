@@ -504,7 +504,7 @@ def test_b1_gait(
         ax_xy.set_xlabel("X (m)")
         ax_xy.set_ylabel("Y (m)")
         ax_xy.set_title(f"Actual vs. Reference CoM Trajectory\n[{gait_type} - {trajectory_type}]")
-        ax_xy.legend()
+        ax_xy.legend(loc="upper center", bbox_to_anchor=(0.5, -0.15), ncol=2, fontsize=9)
         ax_xy.grid(True, alpha=0.3)
         ax_xy.set_aspect("equal")
 
@@ -513,12 +513,12 @@ def test_b1_gait(
         ax_yaw.set_xlabel("Time (s)")
         ax_yaw.set_ylabel("Yaw (rad)")
         ax_yaw.set_title("Desired vs. Actual Base Yaw\n(watch for a snap-back near the end)")
-        ax_yaw.legend()
+        ax_yaw.legend(loc="upper center", bbox_to_anchor=(0.5, -0.15), ncol=2, fontsize=9)
         ax_yaw.grid(True, alpha=0.3)
 
-        plt.tight_layout()
+        plt.tight_layout(rect=[0, 0.08, 1, 1])
         diag_path = f"terminal_orientation_diag_{gait_type}_{trajectory_type}.png"
-        plt.savefig(diag_path, dpi=150)
+        plt.savefig(diag_path, dpi=150, bbox_inches="tight")
         print(f"  Saved terminal-orientation diagnostic plot to: {diag_path}")
         plt.show(block=False)
 
