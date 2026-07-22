@@ -488,10 +488,15 @@ def test_b1_gait(
         t_ref = np.linspace(0, duration, len(heading_trajectory))
         t_actual = np.linspace(0, duration, len(xs_sol))
 
-        # Explicit string `num` so this figure gets its own canvas — otherwise it
-        # would auto-number to Figure 1, and the later crocoddyl call
-        # `plotSolution([solver], figIndex=1, ...)` would draw its velocity-curve
-        # subplots into that SAME figure 1, stacking on top of/covering ax_xy/ax_yaw.
+        # Close any figures left open from a previous run in this same process/
+        # interactive session (e.g. repeated %run in IPython/Jupyter). Matplotlib
+        # figures persist by number/label across runs, so without this, a new
+        # plt.subplots() call with the same num reuses the OLD figure and its old
+        # axes/content instead of starting clean — this is what actually caused
+        # the "two plots overlapping" symptom, not a name clash with crocoddyl's
+        # figIndex=1 (a distinct string num already avoids that).
+        plt.close("all")
+
         fig_diag, (ax_xy, ax_yaw) = plt.subplots(1, 2, figsize=(14, 6), num="terminal_orientation_diag")
 
         ax_xy.plot(com_trajectory[:, 0], com_trajectory[:, 1], "k--", linewidth=1.5, label="Reference (Bezier)")
@@ -524,7 +529,10 @@ def test_b1_gait(
         diag_path = f"terminal_orientation_diag_{gait_type}_{trajectory_type}.png"
         plt.savefig(diag_path, dpi=150, bbox_inches="tight")
         print(f"  Saved terminal-orientation diagnostic plot to: {diag_path}")
-        plt.show(block=False)
+        # Close (not just show(block=False)) so this figure can't be reused/drawn
+        # into by a later run or by the crocoddyl plotSolution/plotConvergence
+        # calls below — the saved PNG is the artifact you actually need.
+        plt.close(fig_diag)
 
     # Display
     if with_display:
