@@ -488,7 +488,11 @@ def test_b1_gait(
         t_ref = np.linspace(0, duration, len(heading_trajectory))
         t_actual = np.linspace(0, duration, len(xs_sol))
 
-        fig_diag, (ax_xy, ax_yaw) = plt.subplots(1, 2, figsize=(14, 6))
+        # Explicit string `num` so this figure gets its own canvas — otherwise it
+        # would auto-number to Figure 1, and the later crocoddyl call
+        # `plotSolution([solver], figIndex=1, ...)` would draw its velocity-curve
+        # subplots into that SAME figure 1, stacking on top of/covering ax_xy/ax_yaw.
+        fig_diag, (ax_xy, ax_yaw) = plt.subplots(1, 2, figsize=(14, 6), num="terminal_orientation_diag")
 
         ax_xy.plot(com_trajectory[:, 0], com_trajectory[:, 1], "k--", linewidth=1.5, label="Reference (Bezier)")
         ax_xy.plot(actual_xy[:, 0], actual_xy[:, 1], "b-", linewidth=2, label="Actual (OCP solution)")
