@@ -61,6 +61,10 @@ parser.add_argument(
     "--robot_urdf", type=str, default="",
     help="Absolute path to the Go2 URDF used by MPC workers",
 )
+parser.add_argument(
+    "--stage2", action="store_true",
+    help="Train 15D Bezier + gait/swing modulation policy (default: Stage 1)",
+)
 
 # AppLauncher arguments
 AppLauncher.add_app_launcher_args(parser)
@@ -115,13 +119,15 @@ def create_ppo_config(env_cfg: QuadrupedMPCEnvCfg):
         "device": "cuda" if torch.cuda.is_available() else "cpu",
         "num_steps_per_env": 24,  # Rollout length
         "max_iterations": args_cli.max_iterations,
-        "empirical_normalization": True,
+        "empirical_normalization": None,
         # Observation groups (required by new RSL-RL)
-        "obs_groups": {},
+        "obs_groups": {"policy": ["policy"], "critic": ["policy"]},
         # PPO algorithm parameters
         "policy": {
             "class_name": "ActorCritic",
             "init_noise_std": 1.0,
+            "actor_obs_normalization": True,
+            "critic_obs_normalization": True,
             "actor_hidden_dims": [256, 256, 128],
             "critic_hidden_dims": [256, 256, 128],
             "activation": "elu",
@@ -218,6 +224,7 @@ def main():
 
     # Create environment configuration
     env_cfg = QuadrupedMPCEnvCfg()
+    env_cfg.set_training_stage(2 if args_cli.stage2 else 1)
     env_cfg.scene.num_envs = args_cli.num_envs
     env_cfg.seed = args_cli.seed
     env_cfg.gait_type = args_cli.gait
@@ -234,6 +241,7 @@ def main():
 
     print(f"Number of environments: {env_cfg.scene.num_envs}")
     print(f"Gait type: {env_cfg.gait_type}")
+    print(f"Training stage: {'Stage 2' if args_cli.stage2 else 'Stage 1'}")
     print(f"MPC cluster: {env_cfg.use_mpc_cluster}")
     if env_cfg.use_mpc_cluster:
         print(f"MPC Python: {env_cfg.cluster_python_executable}")

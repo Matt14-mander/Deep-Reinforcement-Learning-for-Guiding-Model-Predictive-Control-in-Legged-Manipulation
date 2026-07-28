@@ -15,6 +15,7 @@ This module provides:
 from .contact_sequence import ContactPhase, ContactSequence
 from .foothold_planner import FootholdPlan, FootholdPlanner
 from .gait_scheduler import GaitScheduler
+from .stage2_modulation import advance_reference_clocks, filter_gait_modulation, scale_foothold_step
 from .ocp_factory import OCPFactory
 
 __all__ = [
@@ -22,6 +23,9 @@ __all__ = [
     "ContactSequence",
     "GaitScheduler",
     "FootholdPlanner",
+    "filter_gait_modulation",
+    "scale_foothold_step",
+    "advance_reference_clocks",
     "FootholdPlan",
     "OCPFactory",
 ]

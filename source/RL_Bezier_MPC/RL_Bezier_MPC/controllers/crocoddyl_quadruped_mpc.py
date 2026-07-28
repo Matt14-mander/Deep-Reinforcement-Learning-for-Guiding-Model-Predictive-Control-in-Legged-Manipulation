@@ -209,13 +209,16 @@ class CrocoddylQuadrupedMPC(BaseMPC):
         # Parse gait parameters (clamp to safe ranges)
         step_frequency_mod = 1.0
         step_height_mod = 1.0
+        step_length_mod = 1.0
         if gait_params is not None:
             step_frequency_mod = gait_params.get("step_frequency", 1.0)
             step_height_mod = gait_params.get("step_height", 1.0)
+            step_length_mod = gait_params.get("step_length", 1.0)
 
         # Safety clamp: frequency must be positive to avoid negative durations
         step_frequency_mod = max(0.3, min(abs(step_frequency_mod), 3.0))
         step_height_mod = max(0.1, min(abs(step_height_mod), 3.0))
+        step_length_mod = max(0.25, min(abs(step_length_mod), 2.5))
 
         # Compute current foot positions from FK if not provided
         if current_foot_positions is None:
@@ -263,6 +266,7 @@ class CrocoddylQuadrupedMPC(BaseMPC):
             current_foot_positions=current_foot_positions,
             dt=self.dt,
             step_height=step_height,
+            step_length_scale=step_length_mod,
         )
 
         # Build OCP (cap at horizon_steps to prevent node overflow from long contact sequences)

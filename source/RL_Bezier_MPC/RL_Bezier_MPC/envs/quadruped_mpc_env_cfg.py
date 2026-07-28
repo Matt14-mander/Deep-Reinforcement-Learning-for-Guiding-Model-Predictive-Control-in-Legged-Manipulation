@@ -176,6 +176,12 @@ class QuadrupedMPCEnvCfg(DirectRLEnvCfg):
     # RL policy update period (in MPC steps)
     # 10 MPC steps @ 50Hz = 5 Hz policy rate (slower for quadruped)
     rl_policy_period: int = 10
+    stage1_rl_policy_period: int = 10
+
+    # DirectRLEnv requests one policy action per environment step. Stage 2
+    # therefore consumes every action and relies on gait smoothing/rate limits;
+    # a true 5 Hz policy requires a later multi-MPC-step environment refactor.
+    stage2_rl_policy_period: int = 1
 
     # Maximum displacement for CoM Bezier control points
     # Reduced from 1.5m → 0.5m: with _v_fwd=0.3 m/s bias, neutral action gives P3_x=0.9m (0.3 m/s),
@@ -201,6 +207,11 @@ class QuadrupedMPCEnvCfg(DirectRLEnvCfg):
     step_length_mod_range: tuple = (0.5, 2.0)
     step_height_mod_range: tuple = (0.5, 2.0)
     step_frequency_mod_range: tuple = (0.5, 2.0)
+
+    # Stage 2 safety filter, applied once per RL policy update. Ordering is
+    # (step_length, step_height, step_frequency).
+    stage2_gait_smoothing: float = 0.5
+    stage2_gait_max_delta: tuple = (0.15, 0.10, 0.10)
 
     # ==========================================================================
     # Robot Configuration
@@ -293,6 +304,8 @@ class QuadrupedMPCEnvCfg(DirectRLEnvCfg):
 
     # Regularization
     reward_action_rate_penalty: float = 0.0         # DISABLED: _prev_bezier_params_last lookup overhead not worth it yet
+    reward_gait_rate_penalty: float = -0.05
+    reward_gait_deviation_penalty: float = -0.01
     reward_alive: float = 0.05  # Reduced from 0.1 to discourage "alive but stationary" behavior
 
     # MPC constraint-related rewards
@@ -378,19 +391,34 @@ class QuadrupedMPCEnvCfg(DirectRLEnvCfg):
         self.max_pitch_rad = math.radians(self.max_pitch_deg)
         self.max_roll_rad = math.radians(self.max_roll_deg)
 
-        # Set action space based on fix_gait_params flag
-        if self.fix_gait_params:
-            self.action_space = self.num_bezier_actions  # 12D (Bezier only)
-        else:
-            self.action_space = self.num_bezier_actions + self.num_gait_mod_actions  # 15D
+        self.set_training_stage(1 if self.fix_gait_params else 2)
 
         # Validate configuration
         assert self.decimation > 0, "Decimation must be positive"
         assert self.mpc_horizon_steps > 0, "MPC horizon must be positive"
         assert self.rl_policy_period > 0, "RL policy period must be positive"
+        assert 0.0 < self.stage2_gait_smoothing <= 1.0, (
+            "stage2_gait_smoothing must be in (0, 1]"
+        )
+        assert len(self.stage2_gait_max_delta) == self.num_gait_mod_actions
+        assert all(delta > 0.0 for delta in self.stage2_gait_max_delta)
         assert self.num_bezier_waypoints > self.mpc_horizon_steps, (
             "Bezier horizon should be longer than MPC horizon"
         )
+
+    def set_training_stage(self, stage: int):
+        """Switch spaces and gait control without rebuilding the config object."""
+        if stage not in (1, 2):
+            raise ValueError(f"training stage must be 1 or 2, got {stage}")
+        self.fix_gait_params = stage == 1
+        self.rl_policy_period = (
+            self.stage1_rl_policy_period if stage == 1 else self.stage2_rl_policy_period
+        )
+        self.action_space = self.num_bezier_actions + (
+            0 if self.fix_gait_params else self.num_gait_mod_actions
+        )
+        # Stage 2 exposes the filter state so gait smoothing remains Markovian.
+        self.observation_space = 45 + (0 if self.fix_gait_params else 3)
 
 
 # Alias for convenience

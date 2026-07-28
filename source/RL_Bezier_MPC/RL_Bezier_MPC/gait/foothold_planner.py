@@ -25,6 +25,7 @@ import numpy as np
 from ..trajectory.bezier_foot_trajectory import BezierFootTrajectory
 from ..utils.math_utils import heading_from_tangent, rotation_matrix_z
 from .contact_sequence import ContactSequence
+from .stage2_modulation import scale_foothold_step
 
 
 @dataclass
@@ -107,6 +108,7 @@ class FootholdPlanner:
         dt: float,
         terrain_height_fn: Optional[Callable[[float, float], float]] = None,
         step_height: Optional[float] = None,
+        step_length_scale: float = 1.0,
     ) -> Dict[str, List[FootholdPlan]]:
         """Compute foot landing positions for each swing phase.
 
@@ -120,6 +122,7 @@ class FootholdPlanner:
             dt: Trajectory sampling timestep in seconds.
             terrain_height_fn: Optional function terrain_height(x, y) → z.
             step_height: Override step height for swing trajectories.
+            step_length_scale: Scale horizontal lift-off to landing displacement.
 
         Returns:
             Dict mapping foot name → list of FootholdPlan for each swing event.
@@ -166,6 +169,9 @@ class FootholdPlanner:
                     heading=heading,
                     hip_offset=self.hip_offsets[foot_name],
                     terrain_height_fn=terrain_height_fn,
+                )
+                landing_pos = scale_foothold_step(
+                    foot_positions[foot_name], landing_pos, step_length_scale
                 )
 
                 # Number of trajectory samples for this swing

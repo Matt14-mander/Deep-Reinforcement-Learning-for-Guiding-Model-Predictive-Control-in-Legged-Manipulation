@@ -44,6 +44,7 @@ from ..robots.quadruped_cfg import (
     load_pinocchio_model,
     get_foot_frame_ids,
 )
+from ..gait.stage2_modulation import advance_reference_clocks, filter_gait_modulation
 from ..trajectory import BezierTrajectoryGenerator
 from ..utils.math_utils import blend_trajectories, quat_to_euler, euler_to_quat
 from .quadruped_mpc_env_cfg import QuadrupedMPCEnvCfg
@@ -194,6 +195,9 @@ class QuadrupedMPCEnv(DirectRLEnv):
 
         # Previous gait modulation parameters
         self.prev_gait_mods = np.ones((self.num_envs, cfg.num_gait_mod_actions))
+        self._last_gait_mod_delta = np.zeros(
+            (self.num_envs, cfg.num_gait_mod_actions), dtype=np.float64
+        )
 
         # Previous Bezier params from last step — used for action rate penalty
         self._prev_bezier_params_last: dict[int, np.ndarray] = {}
@@ -436,9 +440,31 @@ class QuadrupedMPCEnv(DirectRLEnv):
         if self.cfg.fix_gait_params:
             # Stage 1: gait params fixed to defaults (1.0 = no modulation)
             gait_mods = np.ones((self.num_envs, self.cfg.num_gait_mod_actions))
+            self._last_gait_mod_delta[:] = 0.0
         else:
-            # Stage 2: gait params from RL policy
-            gait_mods = actions_np[:, self.cfg.num_bezier_actions:]
+            # Stage 2: filter gait changes before they alter contact timing or
+            # swing geometry. The mask also supports future action-hold modes.
+            raw_gait_mods = actions_np[:, self.cfg.num_bezier_actions:]
+            update_mask = (
+                self.mpc_step_counter % self.cfg.rl_policy_period == 0
+            )
+            gait_mods, self._last_gait_mod_delta = filter_gait_modulation(
+                raw_actions=raw_gait_mods,
+                previous=self.prev_gait_mods,
+                update_mask=update_mask,
+                lower=(
+                    self.cfg.step_length_mod_range[0],
+                    self.cfg.step_height_mod_range[0],
+                    self.cfg.step_frequency_mod_range[0],
+                ),
+                upper=(
+                    self.cfg.step_length_mod_range[1],
+                    self.cfg.step_height_mod_range[1],
+                    self.cfg.step_frequency_mod_range[1],
+                ),
+                max_delta=self.cfg.stage2_gait_max_delta,
+                smoothing=self.cfg.stage2_gait_smoothing,
+            )
 
         # Forward bias: curriculum step — gradually increase from 0.05 → 0.15 → 0.30 m/s.
         # With max_bezier_displacement=0.5m and _v_fwd=0.15:
@@ -466,6 +492,7 @@ class QuadrupedMPCEnv(DirectRLEnv):
         # batch apply. Serial path below is kept for debugging and A/B baseline.
         if self.mpc_cluster is not None:
             self._pre_physics_step_cluster(robot_states, bezier_params, gait_mods)
+            self._advance_reference_clocks()
             self._record_mpc_timing(_t_mpc_start)
             return
 
@@ -565,7 +592,15 @@ class QuadrupedMPCEnv(DirectRLEnv):
             self._apply_control(env_idx, joint_positions, joint_torques)
 
 
+        self._advance_reference_clocks()
         self._record_mpc_timing(_t_mpc_start)
+
+    def _advance_reference_clocks(self):
+        """Advance the 50 Hz MPC/reference clock after one successful step."""
+        max_phase = max(self.cfg.num_bezier_waypoints - 1, 0)
+        self.mpc_step_counter, self.trajectory_phases = advance_reference_clocks(
+            self.mpc_step_counter, self.trajectory_phases, max_phase
+        )
 
     def _prepare_env_mpc_inputs(self, env_idx, robot_states, bezier_params, gait_mods):
         """Per-env MPC input preparation (trajectory regen/blend/slice/pad + feet).
@@ -784,12 +819,13 @@ class QuadrupedMPCEnv(DirectRLEnv):
             Dictionary with 'policy' key containing observation tensor.
             Shape: (num_envs, num_observations)
 
-        Observation structure (45D):
+        Observation structure (45D Stage 1 / 48D Stage 2):
             - Base state (13D): position(3), quaternion(4), linear_vel(3), angular_vel(3)
             - Joint state (24D): joint_pos(12), joint_vel(12)
             - Foot contacts (4D): binary contact for each foot
             - Target position (3D): goal position
             - Gait phase (1D): normalized progress [0, 1]
+            - Applied gait modifiers (3D, Stage 2 only)
         """
         robot_data = self.robot.data
 
@@ -816,8 +852,9 @@ class QuadrupedMPCEnv(DirectRLEnv):
             traj_len = len(self.current_com_trajectories[env_idx])
             phases[env_idx] = phase / max(traj_len - 1, 1)
 
-        # Concatenate observations
-        obs = torch.cat([
+        # Concatenate observations. Stage 2 appends the currently applied gait
+        # modifiers because the rate limiter makes them part of environment state.
+        obs_parts = [
             position,           # 3D
             orientation,        # 4D
             linear_vel,         # 3D
@@ -827,7 +864,12 @@ class QuadrupedMPCEnv(DirectRLEnv):
             foot_contacts,      # 4D
             self.target_positions,  # 3D
             phases,             # 1D
-        ], dim=-1)
+        ]
+        if not self.cfg.fix_gait_params:
+            obs_parts.append(torch.as_tensor(
+                self.prev_gait_mods, device=self.device, dtype=torch.float32
+            ))
+        obs = torch.cat(obs_parts, dim=-1)
 
         return {"policy": obs}
 
@@ -913,6 +955,16 @@ class QuadrupedMPCEnv(DirectRLEnv):
                 np.sum((curr_params - prev_params) ** 2)
             )
 
+            gait_rate_penalty = 0.0
+            gait_deviation_penalty = 0.0
+            if not self.cfg.fix_gait_params:
+                gait_rate_penalty = self.cfg.reward_gait_rate_penalty * float(
+                    np.sum(self._last_gait_mod_delta[env_idx] ** 2)
+                )
+                gait_deviation_penalty = self.cfg.reward_gait_deviation_penalty * float(
+                    np.sum((self.prev_gait_mods[env_idx] - 1.0) ** 2)
+                )
+
             # Height tracking reward: encourage nominal standing height (0.35m)
             target_height = 0.35  # Go2 nominal CoM height
             height_error = abs(float(position[env_idx, 2].cpu()) - target_height)
@@ -952,6 +1004,8 @@ class QuadrupedMPCEnv(DirectRLEnv):
                 + lateral_penalty
                 + joint_vel_penalty
                 + action_rate_penalty
+                + gait_rate_penalty
+                + gait_deviation_penalty
                 + fall_penalty
             )
 
@@ -1126,6 +1180,7 @@ class QuadrupedMPCEnv(DirectRLEnv):
             # Reset stored params
             self.prev_bezier_params[env_idx] = initial_params
             self.prev_gait_mods[env_idx] = np.ones(self.cfg.num_gait_mod_actions)
+            self._last_gait_mod_delta[env_idx] = 0.0
             self._prev_bezier_params_last[env_idx] = initial_params.copy()
 
     def _generate_initial_bezier_params(
