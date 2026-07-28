@@ -156,6 +156,12 @@ class QuadrupedMPCEnvCfg(DirectRLEnvCfg):
     # `python -m RL_Bezier_MPC.mpc_cluster.launcher ...` manually (debugging).
     cluster_autostart: bool = True
 
+    # Python executable of the separate MPC environment. On AutoDL use:
+    # /root/autodl-tmp/rlbmpc_workspace/envs/rlbmpc_mpc/bin/python
+    # Empty keeps the current interpreter and is only suitable when both
+    # dependency stacks are installed in one environment.
+    cluster_python_executable: str = ""
+
     # Barrier timeout per solve cycle (ms). Generous default: first cycle
     # includes worker-side model building.
     cluster_timeout_ms: int = 60000
@@ -203,12 +209,24 @@ class QuadrupedMPCEnvCfg(DirectRLEnvCfg):
     # Robot type identifier
     robot_name: str = "go2"
 
+    # Explicit URDF shared with the MPC worker. Set an absolute path on the
+    # training server so the worker never depends on example-robot-data lookup.
+    robot_urdf_path: str = ""
+
     # Physical parameters for Unitree Go2
     robot_mass: float = 15.0  # kg (Go2 is ~15kg)
     standing_height: float = 0.4  # meters
 
     # Joint configuration
     num_joints: int = 12
+    # Pinocchio/URDF actuated-joint order. This lets the Isaac environment
+    # reorder state and control vectors without importing Pinocchio itself.
+    pinocchio_joint_names: tuple = (
+        "FL_hip_joint", "FL_thigh_joint", "FL_calf_joint",
+        "FR_hip_joint", "FR_thigh_joint", "FR_calf_joint",
+        "RL_hip_joint", "RL_thigh_joint", "RL_calf_joint",
+        "RR_hip_joint", "RR_thigh_joint", "RR_calf_joint",
+    )
     max_joint_torque: float = 23.5  # N.m (Go2 HV motor peak torque)
 
     # Friction coefficient for MPC

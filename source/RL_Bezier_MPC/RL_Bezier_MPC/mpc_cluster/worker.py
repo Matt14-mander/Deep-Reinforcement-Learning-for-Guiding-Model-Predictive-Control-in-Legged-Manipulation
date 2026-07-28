@@ -15,6 +15,7 @@ created here.
 """
 
 import os
+import sys
 import traceback
 from typing import Callable, Dict, Iterable, Optional
 
@@ -49,7 +50,17 @@ def build_default_controllers(env_ids: Iterable[int], mpc_cfg: Dict) -> Dict[int
     )
     from RL_Bezier_MPC.controllers.crocoddyl_quadruped_mpc import CrocoddylQuadrupedMPC
 
-    rmodel, _ = load_pinocchio_model(robot_name=mpc_cfg["robot_name"])
+    rmodel, urdf_path = load_pinocchio_model(
+        urdf_path=mpc_cfg.get("robot_urdf_path") or None,
+        robot_name=mpc_cfg["robot_name"],
+        floating_base=True,
+    )
+    if (rmodel.nq, rmodel.nv) != (19, 18):
+        raise ValueError(
+            "MPC protocol requires a floating-base 12-DoF model "
+            f"(nq=19, nv=18), got nq={rmodel.nq}, nv={rmodel.nv} "
+            f"from {urdf_path!r}."
+        )
     get_foot_frame_ids(rmodel, mpc_cfg["foot_frame_names"])  # fail fast if frames wrong
 
     hip_offsets = {k: np.asarray(v) for k, v in mpc_cfg["hip_offsets"].items()}
@@ -174,7 +185,8 @@ def worker_main(
     env_ids = range(env_start, env_end)
     horizon_steps = mpc_cfg["mpc_horizon_steps"]
 
-    print(f"[MPCWorker {worker_id}] envs [{env_start}, {env_end}), building controllers...",
+    print(f"[MPCWorker {worker_id}] python={sys.executable} "
+          f"envs [{env_start}, {env_end}), building controllers...",
           flush=True)
     controllers = build_default_controllers(env_ids, mpc_cfg)
     tensors = EigenIPCTensorSet(namespace, num_envs, horizon_steps,

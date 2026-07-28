@@ -100,7 +100,9 @@ class QuadrupedMPCEnv(DirectRLEnv):
         if CROCODDYL_AVAILABLE:
             try:
                 self._pinocchio_model, _ = load_pinocchio_model(
-                    robot_name=cfg.robot_name
+                    urdf_path=(cfg.robot_urdf_path or None),
+                    robot_name=cfg.robot_name,
+                    floating_base=True,
                 )
                 self._pinocchio_data = self._pinocchio_model.createData()
                 self._foot_frame_ids = get_foot_frame_ids(
@@ -114,7 +116,7 @@ class QuadrupedMPCEnv(DirectRLEnv):
         # MPC cluster mode: solving happens in external worker processes via
         # shared memory (docs/mpc_cluster_design.md); no in-process controllers.
         self.mpc_cluster = None
-        _use_cluster = bool(getattr(cfg, "use_mpc_cluster", False)) and self._pinocchio_model is not None
+        _use_cluster = bool(getattr(cfg, "use_mpc_cluster", False))
 
         # Initialize MPC controllers (one per environment, serial path only)
         self.mpc_controllers = []
@@ -148,6 +150,7 @@ class QuadrupedMPCEnv(DirectRLEnv):
                 namespace=(cfg.cluster_namespace or None),
                 autostart=cfg.cluster_autostart,
                 timeout_ms=cfg.cluster_timeout_ms,
+                python_executable=(cfg.cluster_python_executable or None),
             )
             # Array-based last-good storage for the cluster guard path
             # (solution objects never cross the IPC boundary).
@@ -163,8 +166,9 @@ class QuadrupedMPCEnv(DirectRLEnv):
         self._isaac_to_pin_joint_idx = None  # Isaac Lab index → Pinocchio index
         self._pin_to_isaac_joint_idx = None  # Pinocchio index → Isaac Lab index
 
-        if self._pinocchio_model is not None:
-            self._build_joint_mapping()
+        self._foot_body_indices = None
+        self._build_joint_mapping()
+        self._build_foot_body_mapping()
 
         # Initialize CoM trajectory buffers
         # Shape: (num_envs, num_waypoints, 3)
@@ -281,19 +285,20 @@ class QuadrupedMPCEnv(DirectRLEnv):
         root_joint/floating base). These must be filtered out so that the mapping
         indices correspond directly to positions in q[7:] and the control vector.
         """
-        import pinocchio
-
         # Get Pinocchio ACTUATED joint names only (skip universe + floating base)
         # Filter: only 1-DOF joints (nq==1) are actuated revolute/prismatic
         pin_actuated_names = []
-        for i in range(1, self._pinocchio_model.njoints):
-            joint = self._pinocchio_model.joints[i]
-            name = self._pinocchio_model.names[i]
-            if joint.nq == 1:  # 1-DOF = actuated revolute/prismatic
-                pin_actuated_names.append(name)
-            else:
-                print(f"[JointMapping] Skipping non-actuated Pinocchio joint: "
-                      f"'{name}' (nq={joint.nq}, nv={joint.nv})")
+        if self._pinocchio_model is not None:
+            for i in range(1, self._pinocchio_model.njoints):
+                joint = self._pinocchio_model.joints[i]
+                name = self._pinocchio_model.names[i]
+                if joint.nq == 1:  # 1-DOF = actuated revolute/prismatic
+                    pin_actuated_names.append(name)
+                else:
+                    print(f"[JointMapping] Skipping non-actuated Pinocchio joint: "
+                          f"'{name}' (nq={joint.nq}, nv={joint.nv})")
+        else:
+            pin_actuated_names = list(self.cfg.pinocchio_joint_names)
 
         # Get Isaac Lab joint names (available after _setup_scene via super().__init__)
         isaac_joint_names = list(self.robot.joint_names)
@@ -304,8 +309,10 @@ class QuadrupedMPCEnv(DirectRLEnv):
               f"{pin_actuated_names}")
 
         if len(pin_actuated_names) != len(isaac_joint_names):
-            print(f"  WARNING: Joint count mismatch! Isaac={len(isaac_joint_names)}, "
-                  f"Pinocchio={len(pin_actuated_names)}")
+            raise ValueError(
+                f"Joint count mismatch: Isaac={len(isaac_joint_names)}, "
+                f"Pinocchio/config={len(pin_actuated_names)}"
+            )
 
         # Build mapping: isaac_to_pin[isaac_idx] = pin_actuated_idx
         # "For Isaac Lab joint at index i, what is its index among Pinocchio actuated joints?"
@@ -323,8 +330,10 @@ class QuadrupedMPCEnv(DirectRLEnv):
                     found = True
                     break
             if not found:
-                print(f"  WARNING: Isaac Lab joint '{isaac_name}' not found in Pinocchio!")
-                self._isaac_to_pin_joint_idx[isaac_idx] = isaac_idx  # fallback: identity
+                raise ValueError(
+                    f"Isaac Lab joint '{isaac_name}' is missing from the configured "
+                    f"Pinocchio joint order: {pin_actuated_names}"
+                )
 
         # Check if mapping is actually different from identity
         identity = np.arange(n_joints)
@@ -343,6 +352,8 @@ class QuadrupedMPCEnv(DirectRLEnv):
             print("[JointMapping] Round-trip consistency check PASSED.")
 
         # Validate foot frame names
+        if self._pinocchio_model is None:
+            return
         cfg = self._env_cfg
         for foot_key, frame_name in cfg.foot_frame_names.items():
             fid = self._pinocchio_model.getFrameId(frame_name)
@@ -350,6 +361,24 @@ class QuadrupedMPCEnv(DirectRLEnv):
                 print(f"  WARNING: Foot frame '{frame_name}' ({foot_key}) NOT found in Pinocchio!")
             else:
                 print(f"  [OK] Foot frame '{frame_name}' ({foot_key}) → frame_id={fid}")
+
+    def _build_foot_body_mapping(self):
+        """Map protocol foot order to Isaac articulation body indices."""
+        body_names = list(self.robot.body_names)
+        indices = []
+        for foot_key in ("LF", "RF", "LH", "RH"):
+            frame_name = self.cfg.foot_frame_names[foot_key]
+            try:
+                indices.append(body_names.index(frame_name))
+            except ValueError:
+                print(
+                    f"[FootMapping] WARNING: Isaac body '{frame_name}' ({foot_key}) "
+                    "not found; using nominal foot positions."
+                )
+                self._foot_body_indices = None
+                return
+        self._foot_body_indices = np.asarray(indices, dtype=np.int32)
+        print(f"[FootMapping] Isaac foot body indices: {indices}")
 
     def _setup_scene(self):
         """Set up the simulation scene with Go2 quadruped and ground plane."""
@@ -1244,6 +1273,18 @@ class QuadrupedMPCEnv(DirectRLEnv):
         Returns:
             Dict mapping foot name to position (3,).
         """
+        # In cluster mode the Isaac environment intentionally has no Pinocchio.
+        # Read the simulated link positions directly and serialize them in the
+        # protocol's fixed LF/RF/LH/RH order.
+        if self._foot_body_indices is not None:
+            body_pos_w = self.robot.data.body_pos_w[env_idx].detach().cpu().numpy()
+            return {
+                foot_name: body_pos_w[body_idx].copy()
+                for foot_name, body_idx in zip(
+                    ("LF", "RF", "LH", "RH"), self._foot_body_indices.tolist()
+                )
+            }
+
         # Try FK with Pinocchio if available
         if self._pinocchio_model is not None and self._foot_frame_ids is not None:
             try:

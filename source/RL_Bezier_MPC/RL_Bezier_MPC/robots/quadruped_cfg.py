@@ -443,7 +443,11 @@ if ISAACLAB_AVAILABLE:
 # Pinocchio model loading utilities
 # =============================================================================
 
-def load_pinocchio_model(urdf_path: Optional[str] = None, robot_name: str = "go2"):
+def load_pinocchio_model(
+    urdf_path: Optional[str] = None,
+    robot_name: str = "go2",
+    floating_base: bool = True,
+):
     """Load a Pinocchio model for MPC.
 
     Tries to load from:
@@ -455,6 +459,7 @@ def load_pinocchio_model(urdf_path: Optional[str] = None, robot_name: str = "go2
     Args:
         urdf_path: Path to URDF file. If None, tries other sources.
         robot_name: Name of robot ("go2", "solo12", "anymal", etc.)
+        floating_base: Add a free-flyer root joint when building from URDF.
 
     Returns:
         Tuple of (pinocchio.Model, urdf_path_used).
@@ -466,9 +471,16 @@ def load_pinocchio_model(urdf_path: Optional[str] = None, robot_name: str = "go2
     except ImportError:
         raise ImportError("Pinocchio is required for loading robot models.")
 
+    def build_from_urdf(path: str):
+        if floating_base:
+            return pinocchio.buildModelFromUrdf(path, pinocchio.JointModelFreeFlyer())
+        return pinocchio.buildModelFromUrdf(path)
+
     # 1. Direct URDF path
     if urdf_path is not None:
-        model = pinocchio.buildModelFromUrdf(urdf_path)
+        if not os.path.isfile(urdf_path):
+            raise FileNotFoundError(f"Robot URDF does not exist: {urdf_path}")
+        model = build_from_urdf(urdf_path)
         return model, urdf_path
 
     # 2. Try Go2 URDF from project assets directory
@@ -482,7 +494,7 @@ def load_pinocchio_model(urdf_path: Optional[str] = None, robot_name: str = "go2
     if robot_name in local_urdf_map:
         local_path = local_urdf_map[robot_name]
         if os.path.exists(local_path):
-            model = pinocchio.buildModelFromUrdf(local_path)
+            model = build_from_urdf(local_path)
             return model, local_path
 
     # 3. Try UNITREE_ROS_DIR environment variable
@@ -494,7 +506,7 @@ def load_pinocchio_model(urdf_path: Optional[str] = None, robot_name: str = "go2
         ]
         for candidate in urdf_candidates:
             if os.path.exists(candidate):
-                model = pinocchio.buildModelFromUrdf(candidate)
+                model = build_from_urdf(candidate)
                 return model, candidate
 
     # 4. Try example-robot-data

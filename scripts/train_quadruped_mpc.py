@@ -45,6 +45,22 @@ parser.add_argument(
     choices=["trot", "walk", "pace", "bound"],
     help="Gait type (default: trot)",
 )
+parser.add_argument(
+    "--use_mpc_cluster", action="store_true",
+    help="Run Crocoddyl in the separate EigenIPC MPC environment",
+)
+parser.add_argument(
+    "--cluster_workers", type=int, default=8,
+    help="Number of MPC worker processes",
+)
+parser.add_argument(
+    "--mpc_python", type=str, default="",
+    help="Absolute path to the rlbmpc_mpc environment Python executable",
+)
+parser.add_argument(
+    "--robot_urdf", type=str, default="",
+    help="Absolute path to the Go2 URDF used by MPC workers",
+)
 
 # AppLauncher arguments
 AppLauncher.add_app_launcher_args(parser)
@@ -205,9 +221,24 @@ def main():
     env_cfg.scene.num_envs = args_cli.num_envs
     env_cfg.seed = args_cli.seed
     env_cfg.gait_type = args_cli.gait
+    env_cfg.use_mpc_cluster = args_cli.use_mpc_cluster
+    env_cfg.cluster_num_workers = args_cli.cluster_workers
+    env_cfg.cluster_python_executable = args_cli.mpc_python
+    env_cfg.robot_urdf_path = args_cli.robot_urdf
+
+    if env_cfg.use_mpc_cluster:
+        if not env_cfg.cluster_python_executable:
+            parser.error("--use_mpc_cluster requires --mpc_python")
+        if not env_cfg.robot_urdf_path:
+            parser.error("--use_mpc_cluster requires --robot_urdf")
 
     print(f"Number of environments: {env_cfg.scene.num_envs}")
     print(f"Gait type: {env_cfg.gait_type}")
+    print(f"MPC cluster: {env_cfg.use_mpc_cluster}")
+    if env_cfg.use_mpc_cluster:
+        print(f"MPC Python: {env_cfg.cluster_python_executable}")
+        print(f"MPC workers: {env_cfg.cluster_num_workers}")
+        print(f"Robot URDF: {env_cfg.robot_urdf_path}")
     print(f"Episode length: {env_cfg.episode_length_s}s")
     print(f"Observation dim: {env_cfg.observation_space}")
     print(f"Action dim: {env_cfg.action_space}")

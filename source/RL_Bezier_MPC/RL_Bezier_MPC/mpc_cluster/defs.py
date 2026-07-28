@@ -98,6 +98,7 @@ def mpc_cfg_to_dict(cfg) -> Dict:
     to construct CrocoddylQuadrupedMPC instances identical to the serial path."""
     return {
         "robot_name": cfg.robot_name,
+        "robot_urdf_path": str(getattr(cfg, "robot_urdf_path", "") or ""),
         "foot_frame_names": dict(cfg.foot_frame_names),
         "hip_offsets": {k: list(map(float, v)) for k, v in cfg.hip_offsets.items()},
         "gait_type": cfg.gait_type,

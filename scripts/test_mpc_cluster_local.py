@@ -14,18 +14,34 @@ exception -> status reporting, barrier semantics, and clean shutdown.
 
 import os
 import sys
+import types
+from types import SimpleNamespace
 
 import numpy as np
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..",
                                 "source", "RL_Bezier_MPC"))
 
+# Load only the IPC subpackage. The protocol test intentionally must not need
+# scipy, Isaac Lab, Pinocchio, or Crocoddyl through the project root imports.
+package_root = os.path.abspath(os.path.join(
+    os.path.dirname(__file__), "..", "source", "RL_Bezier_MPC", "RL_Bezier_MPC"
+))
+root_package = types.ModuleType("RL_Bezier_MPC")
+root_package.__path__ = [package_root]
+sys.modules.setdefault("RL_Bezier_MPC", root_package)
+
 from RL_Bezier_MPC.mpc_cluster import MPCClusterClient  # noqa: E402
+from RL_Bezier_MPC.mpc_cluster.client import (  # noqa: E402
+    build_launcher_command,
+    resolve_python_executable,
+)
 from RL_Bezier_MPC.mpc_cluster.defs import (  # noqa: E402
     STANDING_JOINTS,
     STATE_DIM,
     STATUS_EXCEPTION,
     STATUS_OK,
+    mpc_cfg_to_dict,
 )
 
 NUM_ENVS = 8
@@ -81,6 +97,35 @@ def factory(env_ids):
 
 
 def main():
+    # --- pure dual-environment launch/config checks -------------------------
+    launcher_python = resolve_python_executable(sys.executable)
+    command = build_launcher_command(
+        launcher_python, "test_namespace", NUM_ENVS, NUM_WORKERS,
+        "/tmp/test_mpc_cfg.json", verbose=True,
+    )
+    assert command[0] == launcher_python
+    assert command[1:3] == ["-m", "RL_Bezier_MPC.mpc_cluster.launcher"]
+    assert command[-1] == "--verbose"
+
+    cfg = SimpleNamespace(
+        robot_name="go2",
+        robot_urdf_path="/models/go2.urdf",
+        foot_frame_names={"LF": "FL_foot", "RF": "FR_foot",
+                          "LH": "RL_foot", "RH": "RR_foot"},
+        hip_offsets={name: np.zeros(3) for name in ("LF", "RF", "LH", "RH")},
+        gait_type="trot",
+        mpc_dt=0.02,
+        mpc_horizon_steps=HORIZON,
+        default_step_duration=0.25,
+        default_support_duration=0.10,
+        default_step_height=0.15,
+        friction_coefficient=0.7,
+        mpc_max_iterations=50,
+    )
+    serialized = mpc_cfg_to_dict(cfg)
+    assert serialized["robot_urdf_path"] == "/models/go2.urdf"
+    print("[0/5] external Python launcher and URDF config serialization OK")
+
     mpc_cfg = {"mpc_horizon_steps": HORIZON}
     client = MPCClusterClient(
         num_envs=NUM_ENVS, mpc_cfg=mpc_cfg, num_workers=NUM_WORKERS,

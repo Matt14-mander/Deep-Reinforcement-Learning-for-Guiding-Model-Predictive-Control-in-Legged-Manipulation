@@ -43,6 +43,45 @@ from .defs import (
 )
 
 
+def resolve_python_executable(python_executable: Optional[str] = None) -> str:
+    """Resolve the interpreter used to launch the external MPC environment."""
+    candidate = python_executable or sys.executable
+    candidate = os.path.abspath(os.path.expandvars(os.path.expanduser(candidate)))
+    if not os.path.isfile(candidate):
+        raise FileNotFoundError(
+            f"MPC Python executable does not exist: {candidate}. "
+            "Set cluster_python_executable to the rlbmpc_mpc environment Python."
+        )
+    return candidate
+
+
+def build_launcher_command(
+    python_executable: str,
+    namespace: str,
+    num_envs: int,
+    num_workers: int,
+    cfg_path: str,
+    verbose: bool = False,
+) -> list[str]:
+    """Build the launcher command without importing Isaac Sim or Crocoddyl."""
+    command = [
+        python_executable,
+        "-m",
+        "RL_Bezier_MPC.mpc_cluster.launcher",
+        "--namespace",
+        namespace,
+        "--num-envs",
+        str(num_envs),
+        "--workers",
+        str(num_workers),
+        "--mpc-cfg",
+        cfg_path,
+    ]
+    if verbose:
+        command.append("--verbose")
+    return command
+
+
 class MPCClusterClient:
     """Server-side (environment) handle to the solver cluster.
 
@@ -70,6 +109,7 @@ class MPCClusterClient:
         timeout_ms: int = 30000,
         verbose: bool = False,
         controller_factory: Optional[Callable] = None,
+        python_executable: Optional[str] = None,
     ):
         self.num_envs = num_envs
         self.horizon_steps = int(mpc_cfg["mpc_horizon_steps"])
@@ -80,33 +120,40 @@ class MPCClusterClient:
         self.num_workers = len(self._partitions)
         self._pending_reset = np.zeros(num_envs, dtype=bool)
         self._proc = None
+        self._cfg_path = None
         self._threads = []
         self._closed = False
 
         if backend == "eigenipc":
             from .backend import EigenIPCProducer, EigenIPCTensorSet
 
+            launcher_python = (
+                resolve_python_executable(python_executable) if autostart else None
+            )
             self.tensors = EigenIPCTensorSet(
                 self.namespace, num_envs, self.horizon_steps,
                 is_server=True, verbose=verbose,
             )
             self.producer = EigenIPCProducer(self.namespace, TRIGGER_BASENAME, verbose)
             if autostart:
-                cfg_path = os.path.join(
+                self._cfg_path = os.path.join(
                     tempfile.gettempdir(), f"{self.namespace}_mpc_cfg.json"
                 )
-                with open(cfg_path, "w") as f:
+                with open(self._cfg_path, "w", encoding="utf-8") as f:
                     json.dump(mpc_cfg, f)
                 self._proc = subprocess.Popen(
-                    [sys.executable, "-m", "RL_Bezier_MPC.mpc_cluster.launcher",
-                     "--namespace", self.namespace,
-                     "--num-envs", str(num_envs),
-                     "--workers", str(self.num_workers),
-                     "--mpc-cfg", cfg_path]
-                    + (["--verbose"] if verbose else []),
+                    build_launcher_command(
+                        launcher_python,
+                        self.namespace,
+                        num_envs,
+                        self.num_workers,
+                        self._cfg_path,
+                        verbose,
+                    ),
                 )
                 print(f"[MPCClusterClient] launched cluster pid={self._proc.pid} "
-                      f"namespace={self.namespace} workers={self.num_workers}", flush=True)
+                      f"python={launcher_python} namespace={self.namespace} "
+                      f"workers={self.num_workers}", flush=True)
 
         elif backend == "local":
             from .backend import LocalConsumer, LocalHub, LocalProducer, LocalTensorSet
@@ -207,6 +254,11 @@ class MPCClusterClient:
                 self._proc.terminate()
         self.producer.close()
         self.tensors.close()
+        if self._cfg_path is not None:
+            try:
+                os.remove(self._cfg_path)
+            except FileNotFoundError:
+                pass
         print("[MPCClusterClient] shut down.", flush=True)
 
     def __del__(self):

@@ -34,7 +34,12 @@ try:  # POSIX only — absent on the Windows dev machine
     from EigenIPC.PyEigenIPC import Consumer as _EConsumer
     from EigenIPC.PyEigenIPC import VLevel
     from EigenIPC.PyEigenIPC import dtype as eigenipc_dtype
-    from EigenIPC.PyEigenIPC.wrappers.shared_data_view import SharedTWrapper
+    try:
+        # EigenIPC 1.0.0 conda package exposes wrappers through PyEigenIPCExt.
+        from EigenIPC.PyEigenIPCExt.wrappers.shared_data_view import SharedTWrapper
+    except ImportError:
+        # Keep compatibility with older/source installations.
+        from EigenIPC.PyEigenIPC.wrappers.shared_data_view import SharedTWrapper
 
     EIGENIPC_AVAILABLE = True
 except ImportError:
