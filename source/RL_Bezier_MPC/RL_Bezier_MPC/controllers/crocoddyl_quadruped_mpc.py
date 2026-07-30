@@ -86,6 +86,8 @@ class CrocoddylQuadrupedMPC(BaseMPC):
         max_iterations: int = 50,
         convergence_threshold: float = 1e-4,
         verbose: bool = False,
+        force_standing_contacts: bool = False,
+        enable_warm_start: bool = True,
     ):
         """Initialize MPC with all sub-components.
 
@@ -125,6 +127,8 @@ class CrocoddylQuadrupedMPC(BaseMPC):
         self.max_iterations = max_iterations
         self.convergence_threshold = convergence_threshold
         self.verbose = verbose
+        self.force_standing_contacts = force_standing_contacts
+        self.enable_warm_start = enable_warm_start
         self._solve_count = 0  # Track solve calls for selective verbose
 
         # Get frame IDs from names
@@ -228,23 +232,29 @@ class CrocoddylQuadrupedMPC(BaseMPC):
         step_duration = self.step_duration / step_frequency_mod
         support_duration = self.support_duration / step_frequency_mod
 
-        # Determine number of gait cycles to fill horizon
-        cycle_duration = self._get_cycle_duration(step_duration, support_duration)
-        num_cycles = max(1, int(np.ceil(self.horizon_steps * self.dt / cycle_duration)))
+        if self.force_standing_contacts:
+            # Isolation groups 1 and 2 keep exactly the same four-foot support
+            # topology at every node and solve. This removes gait-clock, swing,
+            # impact and topology-transition effects from the closed-loop test.
+            contact_sequence = self.gait_scheduler.generate_standing(
+                duration=max(self.horizon_steps * self.dt, self.dt)
+            )
+        else:
+            # Determine number of gait cycles to fill horizon
+            cycle_duration = self._get_cycle_duration(step_duration, support_duration)
+            num_cycles = max(
+                1, int(np.ceil(self.horizon_steps * self.dt / cycle_duration))
+            )
 
-        # Compute phase offset from the global gait clock.
-        # This ensures each MPC call starts the contact sequence from the correct
-        # position in the gait cycle, rather than always starting at t=0 (the
-        # "Groundhog Day" bug that caused the robot to always execute support torques).
-        phase_offset = self._gait_clock % cycle_duration
-
-        contact_sequence = self.gait_scheduler.generate_from_phase_offset(
-            gait_type=self.gait_type,
-            step_duration=step_duration,
-            support_duration=support_duration,
-            num_cycles=num_cycles,
-            phase_offset=phase_offset,
-        )
+            # Start the horizon at the current gait phase.
+            phase_offset = self._gait_clock % cycle_duration
+            contact_sequence = self.gait_scheduler.generate_from_phase_offset(
+                gait_type=self.gait_type,
+                step_duration=step_duration,
+                support_duration=support_duration,
+                num_cycles=num_cycles,
+                phase_offset=phase_offset,
+            )
 
         # Compute heading trajectory from CoM reference tangent
         heading_trajectory = self._compute_heading_trajectory(com_reference, self.dt)
@@ -299,6 +309,20 @@ class CrocoddylQuadrupedMPC(BaseMPC):
             print(f"  x0 joints[:6]: {current_state[7:13]}", flush=True)
             print(f"  CoM ref[0]: {com_reference[0]}", flush=True)
             print(f"  CoM ref[-1]: {com_reference[-1]}", flush=True)
+            print(
+                "  Isolation: "
+                f"fixed_contacts={self.force_standing_contacts}, "
+                f"warm_start_enabled={self.enable_warm_start}",
+                flush=True,
+            )
+            print(
+                "  Contact phases: "
+                + ", ".join(
+                    f"{phase.phase_type}:{'/'.join(phase.support_feet)}"
+                    for phase in contact_sequence.phases
+                ),
+                flush=True,
+            )
             if current_foot_positions:
                 for fname, fpos in current_foot_positions.items():
                     print(f"  Foot {fname}: [{fpos[0]:.3f}, {fpos[1]:.3f}, {fpos[2]:.3f}]", flush=True)
@@ -313,7 +337,12 @@ class CrocoddylQuadrupedMPC(BaseMPC):
         # For warm-start, use shift_trajectory + shift_controls (original approach),
         # which keeps ffeas low for stand mode and acceptable for walk mode.
         use_warm_start = False
-        if warm_start and self._prev_xs is not None and self._prev_us is not None:
+        if (
+            warm_start
+            and self.enable_warm_start
+            and self._prev_xs is not None
+            and self._prev_us is not None
+        ):
             # Shift previous solution by one step (xs stays near current state)
             xs_init = self._shift_trajectory(self._prev_xs, current_state)
             us_init = self._shift_controls(self._prev_us)
@@ -374,7 +403,8 @@ class CrocoddylQuadrupedMPC(BaseMPC):
 
         # Advance the gait phase clock so the next solve starts from the correct
         # position in the gait cycle (fixes the "Groundhog Day" bug).
-        self._gait_clock += self.dt
+        if not self.force_standing_contacts:
+            self._gait_clock += self.dt
 
         # First control action
         control = us[0] if len(us) > 0 else np.zeros(self.actuation.nu)

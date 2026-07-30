@@ -139,6 +139,12 @@ class QuadrupedMPCEnvCfg(DirectRLEnvCfg):
     # Previous value of 10 was too low → 0% convergence rate
     mpc_max_iterations: int = 50
 
+    # Diagnostic switches. Production training keeps the existing behaviour;
+    # the standalone diagnostic overrides one dimension at a time.
+    mpc_force_standing_contacts: bool = False
+    mpc_enable_warm_start: bool = True
+    mpc_use_raw_state_input: bool = False
+
     # MPC verbose mode (print solver info for first 5 solves, for debugging)
     mpc_verbose: bool = False
 

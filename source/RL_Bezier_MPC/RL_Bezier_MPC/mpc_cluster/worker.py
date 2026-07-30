@@ -79,6 +79,12 @@ def build_default_controllers(env_ids: Iterable[int], mpc_cfg: Dict) -> Dict[int
             mu=mpc_cfg["friction_coefficient"],
             max_iterations=mpc_cfg["mpc_max_iterations"],
             verbose=bool(mpc_cfg.get("mpc_verbose", False)),
+            force_standing_contacts=bool(
+                mpc_cfg.get("mpc_force_standing_contacts", False)
+            ),
+            enable_warm_start=bool(
+                mpc_cfg.get("mpc_enable_warm_start", True)
+            ),
         )
     return controllers
 

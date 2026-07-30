@@ -67,6 +67,15 @@ parser.add_argument(
     "--robot_urdf", type=str, default="",
     help="Absolute path to the Go2 URDF used by MPC workers",
 )
+parser.add_argument(
+    "--debug_group",
+    choices=["cold_fixed", "warm_fixed", "warm_trot"],
+    default=None,
+    help=(
+        "Controlled isolation experiment: cold/fixed contacts, "
+        "warm/fixed contacts, or warm/trot contacts"
+    ),
+)
 
 # AppLauncher arguments (adds --headless, --device, --livestream, etc.)
 AppLauncher.add_app_launcher_args(parser)
@@ -296,6 +305,12 @@ def plot_diagnostic(positions, orientations, target_pos, rewards,
 
 def main():
     """Main MPC diagnostic test."""
+    if args_cli.debug_group is not None:
+        # Keep the task identical across all groups. Only warm start and contact
+        # topology are changed, so a pass/fail transition identifies the cause.
+        args_cli.mode = "stand"
+        args_cli.num_envs = 1
+
     print("=" * 70)
     print("MPC STANDALONE DIAGNOSTIC TEST")
     print("=" * 70)
@@ -317,6 +332,21 @@ def main():
     env_cfg.cluster_num_workers = args_cli.cluster_workers
     env_cfg.cluster_python_executable = args_cli.mpc_python
     env_cfg.robot_urdf_path = args_cli.robot_urdf
+
+    if args_cli.debug_group is not None:
+        env_cfg.mpc_force_standing_contacts = (
+            args_cli.debug_group in ("cold_fixed", "warm_fixed")
+        )
+        env_cfg.mpc_enable_warm_start = args_cli.debug_group != "cold_fixed"
+        env_cfg.mpc_torque_control_only = True
+        env_cfg.mpc_use_raw_state_input = True
+        print(
+            "Isolation group: "
+            f"{args_cli.debug_group} | "
+            f"fixed_contacts={env_cfg.mpc_force_standing_contacts} | "
+            f"warm_start={env_cfg.mpc_enable_warm_start} | "
+            "torque_only=True | raw_state=True"
+        )
 
     if env_cfg.use_mpc_cluster:
         if not env_cfg.cluster_python_executable:

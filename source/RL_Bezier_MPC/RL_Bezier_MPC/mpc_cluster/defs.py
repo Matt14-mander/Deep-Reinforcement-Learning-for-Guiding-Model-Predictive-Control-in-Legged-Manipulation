@@ -110,4 +110,10 @@ def mpc_cfg_to_dict(cfg) -> Dict:
         "friction_coefficient": float(cfg.friction_coefficient),
         "mpc_max_iterations": int(cfg.mpc_max_iterations),
         "mpc_verbose": bool(getattr(cfg, "mpc_verbose", False)),
+        "mpc_force_standing_contacts": bool(
+            getattr(cfg, "mpc_force_standing_contacts", False)
+        ),
+        "mpc_enable_warm_start": bool(
+            getattr(cfg, "mpc_enable_warm_start", True)
+        ),
     }

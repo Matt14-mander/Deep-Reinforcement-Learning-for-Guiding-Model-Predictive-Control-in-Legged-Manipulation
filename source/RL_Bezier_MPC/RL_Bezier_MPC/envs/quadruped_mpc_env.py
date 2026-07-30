@@ -136,6 +136,8 @@ class QuadrupedMPCEnv(DirectRLEnv):
                     mu=cfg.friction_coefficient,
                     max_iterations=cfg.mpc_max_iterations,
                     verbose=(cfg.mpc_verbose and _ == 0),  # Only verbose for env 0
+                    force_standing_contacts=cfg.mpc_force_standing_contacts,
+                    enable_warm_start=cfg.mpc_enable_warm_start,
                 )
             else:
                 mpc = None  # Dummy mode / cluster mode
@@ -1506,16 +1508,23 @@ class QuadrupedMPCEnv(DirectRLEnv):
         
         # Z 轴速度：EMA 低通滤波 + 收紧钳位，防止足端冲击脉冲和下落速度引爆 MPC 代价
         # alpha=0.3：新值权重；0.7 保留历史，有效抑制单帧尖峰
-        _alpha = 0.3
-        self._z_vel_filtered = _alpha * root_lin_vel_b[:, 2] + (1.0 - _alpha) * self._z_vel_filtered
-        root_lin_vel_b[:, 2] = np.clip(self._z_vel_filtered, -0.15, 0.15)
+        if not self.cfg.mpc_use_raw_state_input:
+            _alpha = 0.3
+            self._z_vel_filtered = (
+                _alpha * root_lin_vel_b[:, 2]
+                + (1.0 - _alpha) * self._z_vel_filtered
+            )
+            root_lin_vel_b[:, 2] = np.clip(
+                self._z_vel_filtered, -0.15, 0.15
+            )
         
         states[:, nq:nq + 3] = root_lin_vel_b
 
         root_ang_vel_b = robot_data.root_ang_vel_b.cpu().numpy()
         
         # 加入角速度钳制
-        root_ang_vel_b = np.clip(root_ang_vel_b, -1.0, 1.0)
+        if not self.cfg.mpc_use_raw_state_input:
+            root_ang_vel_b = np.clip(root_ang_vel_b, -1.0, 1.0)
         
         states[:, nq + 3:nq + 6] = root_ang_vel_b
 
