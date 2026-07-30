@@ -466,6 +466,7 @@ class QuadrupedMPCEnv(DirectRLEnv):
         # batch apply. Serial path below is kept for debugging and A/B baseline.
         if self.mpc_cluster is not None:
             self._pre_physics_step_cluster(robot_states, bezier_params, gait_mods)
+            self._advance_reference_clocks()
             self._record_mpc_timing(_t_mpc_start)
             return
 
@@ -565,7 +566,24 @@ class QuadrupedMPCEnv(DirectRLEnv):
             self._apply_control(env_idx, joint_positions, joint_torques)
 
 
+        self._advance_reference_clocks()
         self._record_mpc_timing(_t_mpc_start)
+
+    def _advance_reference_clocks(self):
+        """Advance the shared MPC/reference clock after one control step.
+
+        Both the serial and IPC-cluster backends prepare their references from
+        the same counters, so the counters must advance exactly once after
+        either backend finishes.  Saturating the trajectory phase keeps the
+        final waypoint valid until the next policy-period regeneration.
+        """
+        max_phase = max(self.cfg.num_bezier_waypoints - 1, 0)
+        self.mpc_step_counter += 1
+        np.minimum(
+            self.trajectory_phases + 1,
+            max_phase,
+            out=self.trajectory_phases,
+        )
 
     def _prepare_env_mpc_inputs(self, env_idx, robot_states, bezier_params, gait_mods):
         """Per-env MPC input preparation (trajectory regen/blend/slice/pad + feet).
