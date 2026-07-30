@@ -94,6 +94,10 @@ class OCPFactory:
         "ctrl_reg": 1e-1,
     }
 
+    # Baumgarte gains used by Crocoddyl's quadrupedal-gait example.  The
+    # derivative term damps foot velocity when a new contact becomes active.
+    CONTACT_GAINS = np.array([0.0, 50.0])
+
     def __init__(
         self,
         rmodel: "pinocchio.Model",
@@ -273,7 +277,10 @@ class OCPFactory:
                 np.asarray(contact_position, dtype=float),
                 pinocchio.LOCAL_WORLD_ALIGNED,
                 self.nu,
-                np.array([0.0, 0.0]),  # gains
+                # Match Crocoddyl's quadrupedal-gait helper: damp contact
+                # velocity at touchdown instead of leaving the constraint
+                # completely unstabilized.
+                self.CONTACT_GAINS.copy(),
             )
             contact_model.addContact(f"contact_{foot_id}", contact)
 
@@ -501,7 +508,7 @@ class OCPFactory:
                 np.asarray(contact_position, dtype=float),
                 pinocchio.LOCAL_WORLD_ALIGNED,
                 self.nu,
-                np.array([0.0, 0.0]),
+                self.CONTACT_GAINS.copy(),
             )
             contact_model.addContact(f"contact_{foot_id}", contact)
 

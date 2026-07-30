@@ -426,7 +426,8 @@ class CrocoddylQuadrupedMPC(BaseMPC):
                 f"swing={step_duration:.3f}s, "
                 f"support={support_duration:.3f}s, "
                 f"step_height={step_height:.3f}m, "
-                f"phase_clock={self._gait_clock:.3f}s",
+                f"phase_clock={self._gait_clock:.3f}s, "
+                f"contact_gains={self.ocp_factory.CONTACT_GAINS.tolist()}",
                 flush=True,
             )
             print(
