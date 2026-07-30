@@ -162,6 +162,7 @@ class CrocoddylQuadrupedMPC(BaseMPC):
             rmodel=rmodel,
             foot_frame_ids=self.foot_frame_ids,
             mu=mu,
+            use_demo_stabilization_weights=force_standing_contacts,
         )
 
         # State and actuation from factory
@@ -345,7 +346,15 @@ class CrocoddylQuadrupedMPC(BaseMPC):
                 "  Isolation: "
                 f"fixed_contacts={self.force_standing_contacts}, "
                 f"warm_start_enabled={self.enable_warm_start}, "
-                f"root_reference={self.reference_is_root_position}",
+                f"root_reference={self.reference_is_root_position}, "
+                f"demo_weights={self.force_standing_contacts}",
+                flush=True,
+            )
+            print(
+                "  OCP weights: "
+                f"com={self.ocp_factory.weights['com_track']:.1e}, "
+                f"state={self.ocp_factory.weights['state_reg']:.1e}, "
+                f"control={self.ocp_factory.weights['ctrl_reg']:.1e}",
                 flush=True,
             )
             print(

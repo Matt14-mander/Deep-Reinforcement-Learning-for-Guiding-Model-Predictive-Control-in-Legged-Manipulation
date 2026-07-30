@@ -81,6 +81,14 @@ class OCPFactory:
                                     # than physical constraint satisfaction)
     }
 
+    # Crocoddyl SimpleQuadrupedGaitProblem reference values. Keep these behind
+    # an isolation switch until the closed-loop standing test validates them.
+    DEMO_STANDING_WEIGHTS = {
+        "com_track": 1e6,
+        "state_reg": 1e1,
+        "ctrl_reg": 1e-1,
+    }
+
     def __init__(
         self,
         rmodel: "pinocchio.Model",
@@ -89,6 +97,7 @@ class OCPFactory:
         integrator: str = "euler",
         fwddyn: bool = True,
         weights: Optional[Dict[str, float]] = None,
+        use_demo_stabilization_weights: bool = False,
     ):
         """Initialize factory with robot model and cost weights.
 
@@ -100,6 +109,8 @@ class OCPFactory:
             integrator: Integration scheme, "euler" or "rk4".
             fwddyn: If True, use forward dynamics. Otherwise inverse dynamics.
             weights: Dict of cost weights. Uses DEFAULT_WEIGHTS for missing keys.
+            use_demo_stabilization_weights: Use the state and main task weights
+                from Crocoddyl's SimpleQuadrupedGaitProblem standing model.
         """
         if not CROCODDYL_AVAILABLE:
             raise ImportError(
@@ -112,9 +123,12 @@ class OCPFactory:
         self.mu = mu
         self.integrator = integrator
         self.fwddyn = fwddyn
+        self.use_demo_stabilization_weights = use_demo_stabilization_weights
 
         # Merge weights with defaults
         self.weights = self.DEFAULT_WEIGHTS.copy()
+        if self.use_demo_stabilization_weights:
+            self.weights.update(self.DEMO_STANDING_WEIGHTS)
         if weights is not None:
             self.weights.update(weights)
 
@@ -180,17 +194,30 @@ class OCPFactory:
         """
         # Configuration tangent space (nv dimensions)
         # Structure: [base_pos(3), base_SO3(3), joints(nv-6)]
-        state_weights_q = np.array(
-            [0.0] * 3        # base position — free (tracked by comTrack)
-            + [500.0] * 3    # base orientation — keep upright (critical for balance)
-            + [0.0] * (self.nv - 6)  # joints — zero weight avoids wrong-reference pull
-        )
+        if self.use_demo_stabilization_weights:
+            # ActivationModelWeightedQuad consumes quadratic coefficients. The
+            # Crocoddyl quadruped demo explicitly squares its intuitive weights.
+            state_weights_q = np.array(
+                [0.0] * 3
+                + [500.0**2] * 3
+                + [0.01**2] * (self.nv - 6)
+            )
+            state_weights_v = np.array(
+                [10.0**2] * 6
+                + [1.0**2] * (self.nv - 6)
+            )
+        else:
+            state_weights_q = np.array(
+                [0.0] * 3        # base position — free (tracked by comTrack)
+                + [500.0] * 3    # base orientation — keep upright (critical for balance)
+                + [0.0] * (self.nv - 6)  # joints — zero weight avoids wrong-reference pull
+            )
 
-        # Velocity tangent space (nv dimensions)
-        state_weights_v = np.array(
-            [10.0] * 6       # base linear+angular velocity damping
-            + [0.1] * (self.nv - 6)  # joint velocity damping (light)
-        )
+            # Velocity tangent space (nv dimensions)
+            state_weights_v = np.array(
+                [10.0] * 6       # base linear+angular velocity damping
+                + [0.1] * (self.nv - 6)  # joint velocity damping (light)
+            )
 
         self.state_weights = np.concatenate([state_weights_q, state_weights_v])
 
