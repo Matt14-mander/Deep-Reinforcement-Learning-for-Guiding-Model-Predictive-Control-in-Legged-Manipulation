@@ -305,6 +305,14 @@ class QuadrupedMPCEnv(DirectRLEnv):
         self._lifetime_mpc_converged_counts = torch.zeros(
             self.num_envs, device=self.device, dtype=torch.long
         )
+        # Last pre-reset terminal snapshot. Columns in the reason mask are:
+        # low height, high height, flipped, out of bounds, MPC failures.
+        self._last_termination_reason_mask = torch.zeros(
+            (self.num_envs, 5), device=self.device, dtype=torch.bool
+        )
+        self._last_terminal_root_state = torch.zeros(
+            (self.num_envs, 13), device=self.device, dtype=torch.float32
+        )
         self._inner_terminated = torch.zeros(
             self.num_envs, device=self.device, dtype=torch.bool
         )
@@ -921,9 +929,25 @@ class QuadrupedMPCEnv(DirectRLEnv):
             > self.cfg.max_distance_from_start
         )
         too_many_failures = self.consecutive_mpc_failures >= 5
-        self._inner_terminated |= (
-            too_low | too_high | flipped | out_of_bounds | too_many_failures
+        reason_mask = torch.stack(
+            (too_low, too_high, flipped, out_of_bounds, too_many_failures),
+            dim=1,
         )
+        newly_terminated = reason_mask.any(dim=1) & active
+        if torch.any(newly_terminated):
+            self._last_termination_reason_mask[newly_terminated] = reason_mask[
+                newly_terminated
+            ]
+            self._last_terminal_root_state[newly_terminated] = torch.cat(
+                (
+                    position,
+                    orientation,
+                    self.robot.data.root_lin_vel_w,
+                    self.robot.data.root_ang_vel_w,
+                ),
+                dim=1,
+            )[newly_terminated]
+        self._inner_terminated |= reason_mask.any(dim=1)
 
     def _apply_safe_control_to_terminated_envs(self):
         """Hold latched environments safely until the policy step ends."""

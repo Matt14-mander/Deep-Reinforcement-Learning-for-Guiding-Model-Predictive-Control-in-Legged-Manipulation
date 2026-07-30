@@ -46,6 +46,7 @@ parser.add_argument(
     "--plot_dir", type=str, default="plots/mpc_diagnostic",
     help="Directory to save diagnostic plots",
 )
+parser.add_argument("--seed", type=int, default=42, help="Deterministic test seed")
 parser.add_argument(
     "--use_mpc_cluster", action="store_true",
     help="Run Crocoddyl in the separate EigenIPC MPC environment",
@@ -303,6 +304,7 @@ def main():
     # Create environment configuration
     env_cfg = QuadrupedMPCEnvCfg()
     env_cfg.scene.num_envs = args_cli.num_envs
+    env_cfg.seed = args_cli.seed
     env_cfg.fix_gait_params = True  # Fixed gait for diagnostic
     env_cfg.mpc_verbose = True  # Enable verbose MPC debugging (first 5 solves)
     env_cfg.forward_velocity_bias = 0.0  # test exactly the trajectory selected above
@@ -447,8 +449,36 @@ def main():
         # Check termination
         dones = terminated | truncated
         if dones.any():
+            reason_names = (
+                "low_height", "high_height", "flipped",
+                "out_of_bounds", "consecutive_mpc_failures",
+            )
+            reason_mask = env._last_termination_reason_mask[0].cpu().tolist()
+            reasons = [
+                name for name, triggered in zip(reason_names, reason_mask)
+                if triggered
+            ]
+            terminal_state = env._last_terminal_root_state[0].cpu().numpy()
+            terminal_quat = terminal_state[3:7]
+            tw, tx, ty, tz = terminal_quat
+            terminal_roll = np.degrees(np.arctan2(
+                2.0 * (tw * tx + ty * tz),
+                1.0 - 2.0 * (tx * tx + ty * ty),
+            ))
+            terminal_pitch = np.degrees(np.arcsin(np.clip(
+                2.0 * (tw * ty - tz * tx), -1.0, 1.0
+            )))
             print(f"\n  *** TERMINATED at step {step + 1} "
                   f"(terminated={terminated[0].item()}, truncated={truncated[0].item()}) ***")
+            print(f"  Reasons: {reasons or ['timeout/unknown']}")
+            print(
+                "  Pre-reset state: "
+                f"pos=[{terminal_state[0]:+.3f}, {terminal_state[1]:+.3f}, "
+                f"{terminal_state[2]:.3f}], roll={terminal_roll:+.1f} deg, "
+                f"pitch={terminal_pitch:+.1f} deg, "
+                f"lin_vel=[{terminal_state[7]:+.3f}, {terminal_state[8]:+.3f}, "
+                f"{terminal_state[9]:+.3f}]"
+            )
             break
 
     # Convert logs to arrays
