@@ -52,6 +52,14 @@ parser.add_argument(
     "--random", action="store_true",
     help="Use random actions instead of policy",
 )
+parser.add_argument(
+    "--stage2", action="store_true",
+    help="Use the Stage 2 contract (48D observation, 15D action with gait modulation)",
+)
+parser.add_argument(
+    "--policy_io_sample", type=str, default=None,
+    help="Save the first raw observation and deterministic actor action to an NPZ file",
+)
 
 # Episode settings
 parser.add_argument(
@@ -412,6 +420,7 @@ def main():
 
     # Create environment configuration
     env_cfg = QuadrupedMPCEnvCfg()
+    env_cfg.set_training_stage(2 if args_cli.stage2 else 1)
     env_cfg.scene.num_envs = args_cli.num_envs
     env_cfg.gait_type = args_cli.gait
 
@@ -528,6 +537,7 @@ def main():
 
     episode_rewards_all = []
     episode_lengths_all = []
+    policy_io_sample_saved = False
 
     for episode in range(args_cli.num_episodes):
         print(f"\nEpisode {episode + 1}/{args_cli.num_episodes}")
@@ -578,6 +588,17 @@ def main():
                 actions = torch.rand(
                     args_cli.num_envs, env_cfg.action_space, device=device,
                 ) * 2 - 1
+
+            if args_cli.policy_io_sample and not policy_io_sample_saved:
+                sample_path = Path(args_cli.policy_io_sample).expanduser().resolve()
+                sample_path.parent.mkdir(parents=True, exist_ok=True)
+                np.savez(
+                    sample_path,
+                    observation=obs_tensor.detach().cpu().numpy(),
+                    action=actions.detach().cpu().numpy(),
+                )
+                policy_io_sample_saved = True
+                print(f"Policy I/O sample saved: {sample_path}")
 
             # ── Snapshot state BEFORE env.step() ─────────────────────────────
             # IsaacLab auto-resets done envs inside env.step(), so reading

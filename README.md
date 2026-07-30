@@ -175,6 +175,10 @@ A few non-obvious traps documented during Stage 1:
 | **4** | + terrain randomization, perceptive obs | Rough terrain, obstacles |
 | **5** | Sim-to-real | B1 / Go2 hardware deployment |
 
+Stage 2 training details are in [docs/stage2_swing_training.md](docs/stage2_swing_training.md).
+Checkpoint evaluation through the full policy + Crocoddyl chain in MuJoCo is
+documented in [docs/mujoco_deployment.md](docs/mujoco_deployment.md).
+
 ---
 
 ## 9. Installation
