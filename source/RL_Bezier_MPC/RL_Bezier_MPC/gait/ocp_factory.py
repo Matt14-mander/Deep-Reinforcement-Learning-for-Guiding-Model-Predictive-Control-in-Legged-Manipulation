@@ -492,8 +492,10 @@ class OCPFactory:
         Returns:
             Crocoddyl IntegratedActionModel with zero time step.
         """
-        # All feet are in contact at the terminal state, at their respective
-        # planned world positions rather than all at the world origin.
+        # The caller supplies the support topology active at the end of the
+        # prediction horizon.  Falling back to four-foot support preserves the
+        # standalone use of this helper, but build_problem() must not introduce
+        # phantom contacts when its horizon ends inside a swing phase.
         if support_foot_targets is None:
             support_foot_targets = [
                 (frame_id, np.zeros(3))
@@ -630,6 +632,11 @@ class OCPFactory:
         terminal_foot_positions = {
             foot: position.copy() for foot, position in stance_positions.items()
         }
+        # Keep the terminal contact topology aligned with the last running
+        # model.  The horizon moves through the gait on every MPC tick, so
+        # forcing all four feet into terminal contact would intermittently
+        # constrain airborne swing feet and create discontinuous solutions.
+        terminal_support_feet = list(self.foot_frame_ids.keys())
         # A contact model with zero Baumgarte gains constrains acceleration but
         # does not make the state at a swing-to-support boundary reach the
         # planned foothold.  Keep the completed swing targets for the first
@@ -712,6 +719,7 @@ class OCPFactory:
                     body_yaw_target=body_yaw_target,
                 )
                 running_models.append(model)
+                terminal_support_feet = list(phase.support_feet)
                 knot_index += 1
 
             # After each swing phase, increment the swing index for those feet
@@ -747,7 +755,8 @@ class OCPFactory:
             body_yaw_target=terminal_yaw,
             support_foot_targets=[
                 (self.foot_frame_ids[foot], terminal_foot_positions[foot])
-                for foot in self.foot_frame_ids.keys()
+                for foot in terminal_support_feet
+                if foot in self.foot_frame_ids
             ],
         )
 
