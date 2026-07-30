@@ -35,7 +35,7 @@ from ..gait.foothold_planner import FootholdPlan, FootholdPlanner
 from ..gait.gait_scheduler import GaitScheduler
 from ..gait.ocp_factory import OCPFactory
 from ..trajectory.bezier_foot_trajectory import BezierFootTrajectory
-from ..utils.math_utils import heading_from_tangent
+from ..utils.math_utils import heading_from_tangent, rotation_matrix_z
 from .base_mpc import BaseMPC, MPCSolution
 
 # Try to import Crocoddyl
@@ -192,6 +192,7 @@ class CrocoddylQuadrupedMPC(BaseMPC):
         # never reaches the swing phases — the "Groundhog Day" bug.
         self._gait_clock: float = 0.0
         self._active_swing_start_positions: Dict[str, np.ndarray] = {}
+        self._nominal_foot_offsets: Optional[Dict[str, np.ndarray]] = None
 
 
     def solve(
@@ -251,20 +252,36 @@ class CrocoddylQuadrupedMPC(BaseMPC):
         # the OCP trajectory at Pinocchio's current CoM.
         raw_reference = np.asarray(com_reference, dtype=float)
         ocp_com_reference = raw_reference
-        current_model_com = None
-        root_to_com_offset = None
+        q = np.asarray(current_state[: self.rmodel.nq], dtype=float)
+        current_model_com = np.asarray(
+            pinocchio.centerOfMass(self.rmodel, self.rdata, q), dtype=float
+        ).copy()
+        root_to_com_offset = current_model_com - np.asarray(
+            current_state[:3], dtype=float
+        )
         if self.reference_is_root_position:
-            q = np.asarray(current_state[: self.rmodel.nq], dtype=float)
-            current_model_com = np.asarray(
-                pinocchio.centerOfMass(self.rmodel, self.rdata, q), dtype=float
-            ).copy()
-            root_to_com_offset = current_model_com - np.asarray(
-                current_state[:3], dtype=float
-            )
             ocp_com_reference = raw_reference + root_to_com_offset[None, :]
 
         # Compute current heading from state
         current_heading = self._extract_heading(current_state)
+
+        # The configured offsets locate Go2's hip joints, not its nominal foot
+        # contacts.  Calibrate the support footprint once from the simulator's
+        # actual standing feet so foothold planning preserves the robot's true
+        # fore/aft and lateral stance instead of pulling every foot under a hip.
+        if self._nominal_foot_offsets is None and current_foot_positions:
+            world_to_heading = rotation_matrix_z(current_heading).T
+            self._nominal_foot_offsets = {}
+            for foot_name, foot_position in current_foot_positions.items():
+                offset = world_to_heading @ (
+                    np.asarray(foot_position, dtype=float) - current_model_com
+                )
+                offset[2] = 0.0
+                self._nominal_foot_offsets[foot_name] = offset
+            self.foothold_planner.hip_offsets = {
+                foot: offset.copy()
+                for foot, offset in self._nominal_foot_offsets.items()
+            }
 
         # Generate contact sequence
         step_duration = self.step_duration / step_frequency_mod
@@ -426,6 +443,29 @@ class CrocoddylQuadrupedMPC(BaseMPC):
             if current_foot_positions:
                 for fname, fpos in current_foot_positions.items():
                     print(f"  Foot {fname}: [{fpos[0]:.3f}, {fpos[1]:.3f}, {fpos[2]:.3f}]", flush=True)
+            if self._nominal_foot_offsets:
+                print(
+                    "  Nominal foot offsets: "
+                    + ", ".join(
+                        f"{foot}=[{offset[0]:.3f},{offset[1]:.3f}]"
+                        for foot, offset in self._nominal_foot_offsets.items()
+                    ),
+                    flush=True,
+                )
+            first_landings = {
+                foot: plans[0].end_pos
+                for foot, plans in foothold_plans.items()
+                if plans
+            }
+            if first_landings:
+                print(
+                    "  First landing targets: "
+                    + ", ".join(
+                        f"{foot}=[{target[0]:.3f},{target[1]:.3f},{target[2]:.3f}]"
+                        for foot, target in first_landings.items()
+                    ),
+                    flush=True,
+                )
             sys.stdout.flush()
 
         # Warm-start from the shifted previous solution, or cold-start from a
@@ -792,6 +832,7 @@ class CrocoddylQuadrupedMPC(BaseMPC):
         self._cached_contact_sequence = None
         self._gait_clock = 0.0
         self._active_swing_start_positions.clear()
+        self._nominal_foot_offsets = None
 
     def set_gait_type(self, gait_type: str):
         """Change the gait type.
