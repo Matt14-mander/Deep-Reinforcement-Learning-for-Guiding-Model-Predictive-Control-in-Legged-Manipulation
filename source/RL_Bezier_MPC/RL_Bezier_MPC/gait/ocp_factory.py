@@ -623,6 +623,11 @@ class OCPFactory:
         terminal_foot_positions = {
             foot: position.copy() for foot, position in stance_positions.items()
         }
+        # A contact model with zero Baumgarte gains constrains acceleration but
+        # does not make the state at a swing-to-support boundary reach the
+        # planned foothold.  Keep the completed swing targets for the first
+        # support node so the preceding control is optimized for touchdown.
+        touchdown_targets: Dict[str, np.ndarray] = {}
 
         # Iterate through contact sequence phases
         done = False
@@ -658,6 +663,15 @@ class OCPFactory:
 
                 # Get swing foot targets
                 swing_foot_targets = []
+                if phase.phase_type == "support" and knot == 0:
+                    for foot_name, target_pos in touchdown_targets.items():
+                        if foot_name in self.foot_frame_ids:
+                            swing_foot_targets.append(
+                                (
+                                    self.foot_frame_ids[foot_name],
+                                    np.asarray(target_pos, dtype=float),
+                                )
+                            )
                 for foot_name in phase.swing_feet:
                     if foot_name not in self.foot_frame_ids:
                         continue
@@ -695,6 +709,7 @@ class OCPFactory:
 
             # After each swing phase, increment the swing index for those feet
             if phase.phase_type == "swing" and not done:
+                touchdown_targets = {}
                 for foot_name in phase.swing_feet:
                     if foot_name in foot_swing_indices:
                         swing_idx = foot_swing_indices[foot_name]
@@ -706,7 +721,12 @@ class OCPFactory:
                             terminal_foot_positions[foot_name] = stance_positions[
                                 foot_name
                             ].copy()
+                            touchdown_targets[foot_name] = stance_positions[
+                                foot_name
+                            ].copy()
                         foot_swing_indices[foot_name] += 1
+            elif phase.phase_type == "support":
+                touchdown_targets = {}
 
         # Terminal target: the waypoint at the end of the actual OCP horizon.
         # Using the index of the last running node ensures the terminal cost
