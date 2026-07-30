@@ -74,12 +74,13 @@ parser.add_argument(
         "cold_fixed",
         "warm_fixed",
         "warm_trot",
+        "cold_trot_infeasible_init",
         "warm_trot_infeasible_init",
     ],
     default=None,
     help=(
         "Controlled isolation experiment: quasi-static/fixed contacts, cold/fixed contacts, "
-        "warm/fixed contacts, or warm/trot contacts"
+        "warm/fixed contacts, or cold/warm trot contacts"
     ),
 )
 parser.add_argument(
@@ -356,13 +357,16 @@ def main():
         # controlled groups. warm_trot must change only the contact schedule.
         env_cfg.mpc_use_demo_stabilization_weights = True
         env_cfg.mpc_initial_full_support_duration = 0.10 if args_cli.debug_group in (
-            "warm_trot", "warm_trot_infeasible_init"
+            "warm_trot",
+            "cold_trot_infeasible_init",
+            "warm_trot_infeasible_init",
         ) else 0.0
         env_cfg.mpc_use_feasible_cold_start_rollout = (
-            args_cli.debug_group != "warm_trot_infeasible_init"
+            args_cli.debug_group
+            not in ("cold_trot_infeasible_init", "warm_trot_infeasible_init")
         )
         env_cfg.mpc_enable_warm_start = args_cli.debug_group not in (
-            "static_fixed", "cold_fixed"
+            "static_fixed", "cold_fixed", "cold_trot_infeasible_init"
         )
         env_cfg.mpc_return_quasi_static_control = (
             args_cli.debug_group == "static_fixed"
