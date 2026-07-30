@@ -357,6 +357,7 @@ class GaitScheduler:
                 phases.pop(0)
             else:
                 phases[0].duration -= remaining
+                phases[0].elapsed += remaining
                 remaining = 0.0
 
         if not phases:

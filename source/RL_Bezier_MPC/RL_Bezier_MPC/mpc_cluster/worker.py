@@ -89,7 +89,7 @@ def build_default_controllers(env_ids: Iterable[int], mpc_cfg: Dict) -> Dict[int
                 mpc_cfg.get("mpc_initial_full_support_duration", 0.0)
             ),
             use_feasible_cold_start_rollout=bool(
-                mpc_cfg.get("mpc_use_feasible_cold_start_rollout", True)
+                mpc_cfg.get("mpc_use_feasible_cold_start_rollout", False)
             ),
             enable_warm_start=bool(
                 mpc_cfg.get("mpc_enable_warm_start", True)

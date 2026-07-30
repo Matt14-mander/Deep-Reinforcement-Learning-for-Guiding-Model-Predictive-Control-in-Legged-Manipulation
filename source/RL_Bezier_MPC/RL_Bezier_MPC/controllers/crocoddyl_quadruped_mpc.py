@@ -89,7 +89,7 @@ class CrocoddylQuadrupedMPC(BaseMPC):
         force_standing_contacts: bool = False,
         use_demo_stabilization_weights: bool = False,
         initial_full_support_duration: float = 0.0,
-        use_feasible_cold_start_rollout: bool = True,
+        use_feasible_cold_start_rollout: bool = False,
         enable_warm_start: bool = True,
         reference_is_root_position: bool = False,
         return_quasi_static_control: bool = False,
@@ -191,6 +191,7 @@ class CrocoddylQuadrupedMPC(BaseMPC):
         # Without this, every solve starts with "initial support phase" and the robot
         # never reaches the swing phases — the "Groundhog Day" bug.
         self._gait_clock: float = 0.0
+        self._active_swing_start_positions: Dict[str, np.ndarray] = {}
 
 
     def solve(
@@ -320,12 +321,31 @@ class CrocoddylQuadrupedMPC(BaseMPC):
 
         # Plan footholds
         step_height = self.step_height * step_height_mod
+        current_phase = (
+            contact_sequence.phases[0] if contact_sequence.phases else None
+        )
+        if current_phase is not None and current_phase.phase_type == "swing":
+            active_feet = set(current_phase.swing_feet)
+            self._active_swing_start_positions = {
+                foot: start
+                for foot, start in self._active_swing_start_positions.items()
+                if foot in active_feet
+            }
+            for foot in active_feet:
+                if foot not in self._active_swing_start_positions:
+                    self._active_swing_start_positions[foot] = np.asarray(
+                        current_foot_positions[foot], dtype=float
+                    ).copy()
+        else:
+            self._active_swing_start_positions.clear()
+
         foothold_plans = self.foothold_planner.plan_footholds(
             com_trajectory=ocp_com_reference,
             contact_sequence=contact_sequence,
             current_foot_positions=current_foot_positions,
             dt=self.dt,
             step_height=step_height,
+            active_swing_start_positions=self._active_swing_start_positions,
         )
 
         # Build OCP (cap at horizon_steps to prevent node overflow from long contact sequences)
@@ -388,7 +408,8 @@ class CrocoddylQuadrupedMPC(BaseMPC):
                 + ", ".join(
                     f"{phase.phase_type}[support="
                     f"{'/'.join(phase.support_feet) or '-'},swing="
-                    f"{'/'.join(phase.swing_feet) or '-'}]"
+                    f"{'/'.join(phase.swing_feet) or '-'},"
+                    f"elapsed={phase.elapsed:.3f}]"
                     for phase in contact_sequence.phases
                 ),
                 flush=True,
@@ -761,6 +782,7 @@ class CrocoddylQuadrupedMPC(BaseMPC):
         self._solver = None
         self._cached_contact_sequence = None
         self._gait_clock = 0.0
+        self._active_swing_start_positions.clear()
 
     def set_gait_type(self, gait_type: str):
         """Change the gait type.
@@ -772,3 +794,4 @@ class CrocoddylQuadrupedMPC(BaseMPC):
             raise ValueError(f"Unknown gait type: {gait_type}")
         self.gait_type = gait_type
         self._cached_contact_sequence = None
+        self._active_swing_start_positions.clear()

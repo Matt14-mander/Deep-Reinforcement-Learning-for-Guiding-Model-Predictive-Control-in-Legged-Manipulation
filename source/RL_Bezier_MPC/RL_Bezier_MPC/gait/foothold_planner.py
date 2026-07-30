@@ -107,6 +107,7 @@ class FootholdPlanner:
         dt: float,
         terrain_height_fn: Optional[Callable[[float, float], float]] = None,
         step_height: Optional[float] = None,
+        active_swing_start_positions: Optional[Dict[str, np.ndarray]] = None,
     ) -> Dict[str, List[FootholdPlan]]:
         """Compute foot landing positions for each swing phase.
 
@@ -120,6 +121,10 @@ class FootholdPlanner:
             dt: Trajectory sampling timestep in seconds.
             terrain_height_fn: Optional function terrain_height(x, y) → z.
             step_height: Override step height for swing trajectories.
+            active_swing_start_positions: Cached liftoff positions for feet in
+                the first, already-active swing phase. These keep receding-horizon
+                replanning on the same Bezier curve instead of restarting the
+                swing from the current elevated foot position.
 
         Returns:
             Dict mapping foot name → list of FootholdPlan for each swing event.
@@ -135,7 +140,7 @@ class FootholdPlanner:
         # Track time through the contact sequence
         cumulative_time = 0.0
 
-        for phase in contact_sequence.phases:
+        for phase_index, phase in enumerate(contact_sequence.phases):
             phase_duration = phase.duration
             phase_end_time = cumulative_time + phase_duration
 
@@ -168,21 +173,44 @@ class FootholdPlanner:
                     terrain_height_fn=terrain_height_fn,
                 )
 
-                # Number of trajectory samples for this swing
-                num_swing_samples = max(2, phase_end_idx - phase_start_idx + 1)
+                cached_start = None
+                if phase_index == 0 and active_swing_start_positions is not None:
+                    cached_start = active_swing_start_positions.get(foot_name)
 
-                # Generate swing trajectory
-                swing_trajectory = self.foot_trajectory_gen.generate(
-                    start_pos=foot_positions[foot_name],
-                    end_pos=landing_pos,
-                    num_samples=num_swing_samples,
-                    step_height=step_height,
-                )
+                if cached_start is not None:
+                    # Rebuild the full swing from its original liftoff point,
+                    # then retain only the segment after phase.elapsed. This
+                    # prevents a fresh step-height offset being added at every
+                    # MPC tick while the foot is already airborne.
+                    full_duration = phase.elapsed + phase.duration
+                    num_full_samples = max(2, round(full_duration / dt) + 1)
+                    full_trajectory = self.foot_trajectory_gen.generate(
+                        start_pos=np.asarray(cached_start, dtype=float),
+                        end_pos=landing_pos,
+                        num_samples=num_full_samples,
+                        step_height=step_height,
+                    )
+                    elapsed_samples = min(
+                        round(phase.elapsed / dt), len(full_trajectory) - 1
+                    )
+                    swing_trajectory = full_trajectory[elapsed_samples:]
+                    trajectory_start = np.asarray(cached_start, dtype=float)
+                else:
+                    num_swing_samples = max(
+                        2, phase_end_idx - phase_start_idx + 1
+                    )
+                    trajectory_start = foot_positions[foot_name]
+                    swing_trajectory = self.foot_trajectory_gen.generate(
+                        start_pos=trajectory_start,
+                        end_pos=landing_pos,
+                        num_samples=num_swing_samples,
+                        step_height=step_height,
+                    )
 
                 # Create foothold plan
                 plan = FootholdPlan(
                     foot_name=foot_name,
-                    start_pos=foot_positions[foot_name].copy(),
+                    start_pos=np.asarray(trajectory_start, dtype=float).copy(),
                     end_pos=landing_pos,
                     swing_start_time=cumulative_time,
                     swing_end_time=phase_end_time,

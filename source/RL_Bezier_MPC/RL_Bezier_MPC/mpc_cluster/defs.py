@@ -120,7 +120,7 @@ def mpc_cfg_to_dict(cfg) -> Dict:
             getattr(cfg, "mpc_initial_full_support_duration", 0.0)
         ),
         "mpc_use_feasible_cold_start_rollout": bool(
-            getattr(cfg, "mpc_use_feasible_cold_start_rollout", True)
+            getattr(cfg, "mpc_use_feasible_cold_start_rollout", False)
         ),
         "mpc_enable_warm_start": bool(
             getattr(cfg, "mpc_enable_warm_start", True)
