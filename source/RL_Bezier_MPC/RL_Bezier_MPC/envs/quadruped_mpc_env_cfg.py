@@ -243,7 +243,7 @@ class QuadrupedMPCEnvCfg(DirectRLEnvCfg):
     # actuator adds Kp/Kd position tracking to the requested feed-forward
     # effort, which changes the dynamics that MPC optimized. Disable those
     # extra PD terms so simulated actuation matches the MPC model.
-    mpc_torque_control_only: bool = True
+    mpc_torque_control_only: bool = False
 
     # Minimum net normal force used to classify a foot as being in contact.
     # A small non-zero threshold rejects PhysX contact-force numerical noise.

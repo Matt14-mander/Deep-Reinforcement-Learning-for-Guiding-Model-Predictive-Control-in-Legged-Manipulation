@@ -161,6 +161,7 @@ class QuadrupedMPCEnv(DirectRLEnv):
         # P0 timing instrumentation: wall time of the MPC block per control step
         self._mpc_timing_accum_ms = 0.0
         self._mpc_timing_count = 0
+        self._mpc_debug_tick = 0
 
         # Build joint reordering maps between Isaac Lab and Pinocchio
         # Isaac Lab (USD) and Pinocchio (URDF) may have different joint orderings
@@ -804,6 +805,24 @@ class QuadrupedMPCEnv(DirectRLEnv):
             foot_pos=foot_pos,
             gait=gait_mods,
         )
+
+        if self.cfg.mpc_verbose and self._mpc_debug_tick < 20:
+            raw_torque = out["torques"][0]
+            q_target_pin = out["qpos"][0]
+            q_current_pin = robot_states[0, 7:19]
+            print(
+                f"[MPC Tick {self._mpc_debug_tick:02d}] "
+                f"z={robot_states[0, 2]:.3f} "
+                f"vz={robot_states[0, 21]:+.3f} "
+                f"cost={float(out['cost'][0]):.1f} "
+                f"status={int(out['status'][0])} "
+                f"conv={bool(out['converged'][0])} "
+                f"|u|={np.linalg.norm(raw_torque):.2f} "
+                f"max|u|={np.max(np.abs(raw_torque)):.2f} "
+                f"|q_target-q|={np.linalg.norm(q_target_pin - q_current_pin):.3f}",
+                flush=True,
+            )
+        self._mpc_debug_tick += 1
 
         _COST_THRESHOLD = 50000.0
         if hasattr(self._pinocchio_model, "referenceConfigurations") and \

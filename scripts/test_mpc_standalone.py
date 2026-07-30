@@ -48,6 +48,10 @@ parser.add_argument(
 )
 parser.add_argument("--seed", type=int, default=42, help="Deterministic test seed")
 parser.add_argument(
+    "--torque_only", action="store_true",
+    help="Disable Isaac actuator Kp/Kd for an explicit torque-only A/B test",
+)
+parser.add_argument(
     "--use_mpc_cluster", action="store_true",
     help="Run Crocoddyl in the separate EigenIPC MPC environment",
 )
@@ -307,6 +311,7 @@ def main():
     env_cfg.seed = args_cli.seed
     env_cfg.fix_gait_params = True  # Fixed gait for diagnostic
     env_cfg.mpc_verbose = True  # Enable verbose MPC debugging (first 5 solves)
+    env_cfg.mpc_torque_control_only = args_cli.torque_only
     env_cfg.forward_velocity_bias = 0.0  # test exactly the trajectory selected above
     env_cfg.use_mpc_cluster = args_cli.use_mpc_cluster
     env_cfg.cluster_num_workers = args_cli.cluster_workers

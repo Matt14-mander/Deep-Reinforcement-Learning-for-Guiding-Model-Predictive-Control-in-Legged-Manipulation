@@ -78,7 +78,7 @@ def build_default_controllers(env_ids: Iterable[int], mpc_cfg: Dict) -> Dict[int
             step_height=mpc_cfg["default_step_height"],
             mu=mpc_cfg["friction_coefficient"],
             max_iterations=mpc_cfg["mpc_max_iterations"],
-            verbose=False,
+            verbose=bool(mpc_cfg.get("mpc_verbose", False)),
         )
     return controllers
 

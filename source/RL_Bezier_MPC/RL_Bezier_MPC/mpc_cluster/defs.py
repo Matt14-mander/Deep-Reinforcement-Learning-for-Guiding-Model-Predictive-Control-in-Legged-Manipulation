@@ -109,4 +109,5 @@ def mpc_cfg_to_dict(cfg) -> Dict:
         "default_step_height": float(cfg.default_step_height),
         "friction_coefficient": float(cfg.friction_coefficient),
         "mpc_max_iterations": int(cfg.mpc_max_iterations),
+        "mpc_verbose": bool(getattr(cfg, "mpc_verbose", False)),
     }
