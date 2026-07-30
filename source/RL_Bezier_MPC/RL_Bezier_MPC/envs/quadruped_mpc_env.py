@@ -35,6 +35,7 @@ import isaaclab.sim as sim_utils
 from isaaclab.assets import Articulation, ArticulationCfg
 from isaaclab.envs import DirectRLEnv
 from isaaclab.scene import InteractiveScene
+from isaaclab.sensors import ContactSensor, ContactSensorCfg
 
 from ..controllers.crocoddyl_quadruped_mpc import CrocoddylQuadrupedMPC, CROCODDYL_AVAILABLE
 from ..controllers.base_mpc import MPCSolution
@@ -167,8 +168,10 @@ class QuadrupedMPCEnv(DirectRLEnv):
         self._pin_to_isaac_joint_idx = None  # Pinocchio index → Isaac Lab index
 
         self._foot_body_indices = None
+        self._contact_sensor_foot_indices = None
         self._build_joint_mapping()
         self._build_foot_body_mapping()
+        self._build_contact_sensor_mapping()
 
         # Initialize CoM trajectory buffers
         # Shape: (num_envs, num_waypoints, 3)
@@ -380,6 +383,26 @@ class QuadrupedMPCEnv(DirectRLEnv):
         self._foot_body_indices = np.asarray(indices, dtype=np.int32)
         print(f"[FootMapping] Isaac foot body indices: {indices}")
 
+    def _build_contact_sensor_mapping(self):
+        """Map contact-sensor bodies to the policy order LF, RF, LH, RH."""
+        ordered_names = [
+            self.cfg.foot_frame_names[foot_key]
+            for foot_key in ("LF", "RF", "LH", "RH")
+        ]
+        indices, matched_names = self.foot_contact_sensor.find_bodies(
+            ordered_names, preserve_order=True
+        )
+        if len(indices) != 4 or list(matched_names) != ordered_names:
+            raise RuntimeError(
+                "Contact sensor must resolve exactly four feet in LF/RF/LH/RH "
+                f"order. Expected {ordered_names}, got {list(matched_names)}."
+            )
+        self._contact_sensor_foot_indices = indices
+        print(
+            "[FootContact] Sensor body order LF/RF/LH/RH: "
+            f"{matched_names} -> {indices}"
+        )
+
     def _setup_scene(self):
         """Set up the simulation scene with Go2 quadruped and ground plane."""
         from isaaclab_assets.robots.unitree import UNITREE_GO2_CFG
@@ -401,7 +424,20 @@ class QuadrupedMPCEnv(DirectRLEnv):
         robot_cfg = UNITREE_GO2_CFG.replace(
             prim_path="/World/envs/env_.*/Robot",
         )
+        # ContactSensor relies on PhysX ContactReporter being enabled on the
+        # spawned rigid bodies. Keep this explicit instead of depending on the
+        # asset's default setting.
+        robot_cfg.spawn.activate_contact_sensors = True
         self.robot = Articulation(robot_cfg)
+
+        foot_contact_cfg = ContactSensorCfg(
+            prim_path="/World/envs/env_.*/Robot/.*_foot",
+            update_period=0.0,
+            history_length=0,
+            debug_vis=self.cfg.visualize_contacts,
+            force_threshold=self.cfg.foot_contact_force_threshold,
+        )
+        self.foot_contact_sensor = ContactSensor(foot_contact_cfg)
 
         # Add lights
         light_cfg = sim_utils.DomeLightCfg(
@@ -415,6 +451,7 @@ class QuadrupedMPCEnv(DirectRLEnv):
 
         # Register articulation to scene AFTER cloning
         self.scene.articulations["robot"] = self.robot
+        self.scene.sensors["foot_contact"] = self.foot_contact_sensor
 
     def _pre_physics_step(self, actions: torch.Tensor):
         """Process RL actions before physics stepping.
@@ -821,10 +858,17 @@ class QuadrupedMPCEnv(DirectRLEnv):
         joint_pos = robot_data.joint_pos[:, :12]  # (num_envs, 12)
         joint_vel = robot_data.joint_vel[:, :12]  # (num_envs, 12)
 
-        # Foot contacts: estimate from foot height
-        # TODO: Add ContactSensorCfg for accurate contact detection
-        foot_contacts = (position[:, 2:3] < self.cfg.standing_height * 0.5).float()
-        foot_contacts = foot_contacts.expand(-1, 4)
+        # True per-foot contacts from the PhysX contact reporter. The explicit
+        # index mapping guarantees policy order LF, RF, LH, RH regardless of
+        # the USD/contact-view body order.
+        contact_forces = self.foot_contact_sensor.data.net_forces_w[
+            :, self._contact_sensor_foot_indices, :
+        ]
+        foot_contacts_bool = torch.linalg.vector_norm(contact_forces, dim=-1) > (
+            self.cfg.foot_contact_force_threshold
+        )
+        self.foot_contacts.copy_(foot_contacts_bool)
+        foot_contacts = foot_contacts_bool.to(dtype=position.dtype)
 
         # Target positions and phases
         phases = torch.zeros((self.num_envs, 1), device=self.device)

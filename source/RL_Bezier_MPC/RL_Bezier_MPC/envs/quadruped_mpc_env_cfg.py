@@ -229,6 +229,10 @@ class QuadrupedMPCEnvCfg(DirectRLEnvCfg):
     )
     max_joint_torque: float = 23.5  # N.m (Go2 HV motor peak torque)
 
+    # Minimum net normal force used to classify a foot as being in contact.
+    # A small non-zero threshold rejects PhysX contact-force numerical noise.
+    foot_contact_force_threshold: float = 1.0  # N
+
     # Friction coefficient for MPC
     friction_coefficient: float = 0.7
 
@@ -388,6 +392,9 @@ class QuadrupedMPCEnvCfg(DirectRLEnvCfg):
         assert self.decimation > 0, "Decimation must be positive"
         assert self.mpc_horizon_steps > 0, "MPC horizon must be positive"
         assert self.rl_policy_period > 0, "RL policy period must be positive"
+        assert self.foot_contact_force_threshold > 0.0, (
+            "Foot contact force threshold must be positive"
+        )
         assert self.num_bezier_waypoints > self.mpc_horizon_steps, (
             "Bezier horizon should be longer than MPC horizon"
         )
