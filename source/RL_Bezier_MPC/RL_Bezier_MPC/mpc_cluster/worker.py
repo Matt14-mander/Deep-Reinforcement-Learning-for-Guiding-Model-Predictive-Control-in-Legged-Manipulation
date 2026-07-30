@@ -85,6 +85,9 @@ def build_default_controllers(env_ids: Iterable[int], mpc_cfg: Dict) -> Dict[int
             use_demo_stabilization_weights=bool(
                 mpc_cfg.get("mpc_use_demo_stabilization_weights", False)
             ),
+            initial_full_support_duration=float(
+                mpc_cfg.get("mpc_initial_full_support_duration", 0.0)
+            ),
             enable_warm_start=bool(
                 mpc_cfg.get("mpc_enable_warm_start", True)
             ),

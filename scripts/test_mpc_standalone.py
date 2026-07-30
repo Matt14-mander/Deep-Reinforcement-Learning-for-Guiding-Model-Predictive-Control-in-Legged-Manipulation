@@ -349,6 +349,9 @@ def main():
         # Keep the validated Crocoddyl demo weights identical across the
         # controlled groups. warm_trot must change only the contact schedule.
         env_cfg.mpc_use_demo_stabilization_weights = True
+        env_cfg.mpc_initial_full_support_duration = (
+            0.10 if args_cli.debug_group == "warm_trot" else 0.0
+        )
         env_cfg.mpc_enable_warm_start = args_cli.debug_group not in (
             "static_fixed", "cold_fixed"
         )
@@ -373,6 +376,7 @@ def main():
             f"fixed_contacts={env_cfg.mpc_force_standing_contacts} | "
             f"warm_start={env_cfg.mpc_enable_warm_start} | "
             f"demo_weights={env_cfg.mpc_use_demo_stabilization_weights} | "
+            f"initial_support={env_cfg.mpc_initial_full_support_duration:.2f}s | "
             f"quasi_static={env_cfg.mpc_return_quasi_static_control} | "
             "torque_only=True | raw_state=True | root_reference=True | "
             f"root_height={args_cli.debug_root_height:.3f}"

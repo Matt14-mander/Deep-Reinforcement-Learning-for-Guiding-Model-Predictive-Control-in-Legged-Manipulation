@@ -88,6 +88,7 @@ class CrocoddylQuadrupedMPC(BaseMPC):
         verbose: bool = False,
         force_standing_contacts: bool = False,
         use_demo_stabilization_weights: bool = False,
+        initial_full_support_duration: float = 0.0,
         enable_warm_start: bool = True,
         reference_is_root_position: bool = False,
         return_quasi_static_control: bool = False,
@@ -137,6 +138,9 @@ class CrocoddylQuadrupedMPC(BaseMPC):
         self.verbose = verbose
         self.force_standing_contacts = force_standing_contacts
         self.use_demo_stabilization_weights = use_demo_stabilization_weights
+        self.initial_full_support_duration = max(
+            0.0, float(initial_full_support_duration)
+        )
         self.enable_warm_start = enable_warm_start
         self.reference_is_root_position = reference_is_root_position
         self.return_quasi_static_control = return_quasi_static_control
@@ -277,15 +281,31 @@ class CrocoddylQuadrupedMPC(BaseMPC):
                 1, int(np.ceil(self.horizon_steps * self.dt / cycle_duration))
             )
 
-            # Start the horizon at the current gait phase.
-            phase_offset = self._gait_clock % cycle_duration
-            contact_sequence = self.gait_scheduler.generate_from_phase_offset(
+            # Let the simulated robot establish real four-foot contact before
+            # entering the first two-foot swing phase. During this startup window
+            # the horizon still contains the upcoming gait, so the solver can
+            # anticipate liftoff instead of repeatedly solving a standing OCP.
+            gait_elapsed = max(
+                0.0, self._gait_clock - self.initial_full_support_duration
+            )
+            phase_offset = gait_elapsed % cycle_duration
+            gait_sequence = self.gait_scheduler.generate_from_phase_offset(
                 gait_type=self.gait_type,
                 step_duration=step_duration,
                 support_duration=support_duration,
                 num_cycles=num_cycles,
                 phase_offset=phase_offset,
             )
+            startup_remaining = self.initial_full_support_duration - self._gait_clock
+            if startup_remaining > 1e-9:
+                startup_sequence = self.gait_scheduler.generate_standing(
+                    duration=startup_remaining
+                )
+                contact_sequence = ContactSequence(
+                    phases=startup_sequence.phases + gait_sequence.phases
+                )
+            else:
+                contact_sequence = gait_sequence
 
         # Compute heading trajectory from CoM reference tangent
         heading_trajectory = self._compute_heading_trajectory(ocp_com_reference, self.dt)
@@ -349,7 +369,8 @@ class CrocoddylQuadrupedMPC(BaseMPC):
                 f"fixed_contacts={self.force_standing_contacts}, "
                 f"warm_start_enabled={self.enable_warm_start}, "
                 f"root_reference={self.reference_is_root_position}, "
-                f"demo_weights={self.use_demo_stabilization_weights}",
+                f"demo_weights={self.use_demo_stabilization_weights}, "
+                f"initial_support={self.initial_full_support_duration:.3f}s",
                 flush=True,
             )
             print(
@@ -362,7 +383,9 @@ class CrocoddylQuadrupedMPC(BaseMPC):
             print(
                 "  Contact phases: "
                 + ", ".join(
-                    f"{phase.phase_type}:{'/'.join(phase.support_feet)}"
+                    f"{phase.phase_type}[support="
+                    f"{'/'.join(phase.support_feet) or '-'},swing="
+                    f"{'/'.join(phase.swing_feet) or '-'}]"
                     for phase in contact_sequence.phases
                 ),
                 flush=True,
