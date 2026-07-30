@@ -637,14 +637,24 @@ class CrocoddylQuadrupedMPC(BaseMPC):
             totals: Dict[str, float] = {}
             node_costs: List[float] = []
 
+            def map_entries(mapping: Any) -> List[Any]:
+                """Normalize Boost.Python std::map wrappers across versions."""
+                if hasattr(mapping, "todict"):
+                    return list(mapping.todict().items())
+                if hasattr(mapping, "keys"):
+                    return [(key, mapping[key]) for key in mapping.keys()]
+                return [(key, mapping[key]) for key in mapping]
+
             def accumulate(model: Any, data: Any, prefix: str = "") -> None:
                 model_costs = model.differential.costs.costs
                 data_costs = data.differential.costs.costs
                 raw_contributions = []
-                for name, item in model_costs.items():
-                    if name not in data_costs:
+                for name, item in map_entries(model_costs):
+                    try:
+                        cost_data = data_costs[name]
+                    except (KeyError, TypeError):
                         continue
-                    value = float(item.weight) * float(data_costs[name].cost)
+                    value = float(item.weight) * float(cost_data.cost)
                     raw_contributions.append((str(name), value))
 
                 raw_total = sum(value for _, value in raw_contributions)
