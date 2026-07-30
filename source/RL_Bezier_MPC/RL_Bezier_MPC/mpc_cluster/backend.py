@@ -80,15 +80,50 @@ class EigenIPCTensorSet:
             )
             w.run()
             self._wrappers[spec.basename] = w
-            self.buf[spec.basename] = np.zeros(
-                (num_envs, spec.n_cols), dtype=np_dtypes[spec.dtype]
-            )
+            # Use EigenIPC's NumPy mirror as the staging buffer. EigenIPC 1.0.0
+            # has an upstream bug in SharedTWrapper.read(data=np_array): its
+            # bounds check dereferences _torch_view even when Torch support was
+            # not requested. Synchronizing the built-in mirror avoids that code
+            # path and also removes an unnecessary staging-array copy.
+            mirror = w.get_numpy_mirror()
+            expected_shape = (num_envs, spec.n_cols)
+            if mirror.shape != expected_shape:
+                raise RuntimeError(
+                    f"EigenIPC tensor {spec.basename!r} has shape {mirror.shape}, "
+                    f"expected {expected_shape}"
+                )
+            if mirror.dtype != np.dtype(np_dtypes[spec.dtype]):
+                raise RuntimeError(
+                    f"EigenIPC tensor {spec.basename!r} has dtype {mirror.dtype}, "
+                    f"expected {np.dtype(np_dtypes[spec.dtype])}"
+                )
+            self.buf[spec.basename] = mirror
 
     def push(self, name: str, start: int, end: int):
-        self._wrappers[name].write_retry(self.buf[name][start:end], start, 0)
+        if not 0 <= start <= end <= self.buf[name].shape[0]:
+            raise IndexError(f"Invalid EigenIPC row range [{start}, {end}) for {name}")
+        self._wrappers[name].synch_retry(
+            row_index=start,
+            col_index=0,
+            n_rows=end - start,
+            n_cols=self.buf[name].shape[1],
+            row_index_view=start,
+            col_index_view=0,
+            read=False,
+        )
 
     def pull(self, name: str, start: int, end: int):
-        self._wrappers[name].read_retry(start, 0, data=self.buf[name][start:end])
+        if not 0 <= start <= end <= self.buf[name].shape[0]:
+            raise IndexError(f"Invalid EigenIPC row range [{start}, {end}) for {name}")
+        self._wrappers[name].synch_retry(
+            row_index=start,
+            col_index=0,
+            n_rows=end - start,
+            n_cols=self.buf[name].shape[1],
+            row_index_view=start,
+            col_index_view=0,
+            read=True,
+        )
 
     def close(self):
         for w in self._wrappers.values():

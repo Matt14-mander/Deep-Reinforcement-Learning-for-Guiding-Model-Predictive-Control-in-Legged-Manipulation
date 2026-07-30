@@ -150,6 +150,12 @@ class MPCClusterClient:
                         self._cfg_path,
                         verbose,
                     ),
+                    env={
+                        **os.environ,
+                        "OMP_NUM_THREADS": "1",
+                        "MKL_NUM_THREADS": "1",
+                        "OPENBLAS_NUM_THREADS": "1",
+                    },
                 )
                 print(f"[MPCClusterClient] launched cluster pid={self._proc.pid} "
                       f"python={launcher_python} namespace={self.namespace} "
