@@ -482,14 +482,32 @@ class CrocoddylQuadrupedMPC(BaseMPC):
             and self._prev_us is not None
         ):
             # Shift previous solution by one step (xs stays near current state)
-            xs_init = self._shift_trajectory(self._prev_xs, current_state)
-            us_init = self._shift_controls(self._prev_us)
-            xs_init = self._adjust_length(xs_init, T + 1, current_state)
-            us_init = self._adjust_length(us_init, T, np.zeros(self.actuation.nu))
-            use_warm_start = True
-            if is_verbose_call:
-                print(f"  Warm-start: YES (shifted prev solution)", flush=True)
-        else:
+            candidate_xs = self._shift_trajectory(self._prev_xs, current_state)
+            candidate_us = self._shift_controls(self._prev_us)
+            candidate_xs = self._adjust_length(
+                candidate_xs, T + 1, current_state
+            )
+            candidate_us = self._adjust_length(
+                candidate_us, T, np.zeros(self.actuation.nu)
+            )
+            control_dims_match = all(
+                np.asarray(control).size == int(model.nu)
+                for control, model in zip(candidate_us, problem.runningModels)
+            )
+            if len(candidate_us) == T and control_dims_match:
+                xs_init = candidate_xs
+                us_init = candidate_us
+                use_warm_start = True
+                if is_verbose_call:
+                    print("  Warm-start: YES (shifted prev solution)", flush=True)
+            elif self.verbose:
+                print(
+                    "[MPC Warm-start] topology changed; using cold-start for "
+                    f"solve {self._solve_count}",
+                    flush=True,
+                )
+
+        if not use_warm_start:
             # Compute contact-consistent equilibrium controls. Taking only the
             # actuated tail of Pinocchio's free-body gravity vector ignores the
             # contact force distribution and is not a standing equilibrium.
@@ -610,11 +628,23 @@ class CrocoddylQuadrupedMPC(BaseMPC):
             self._gait_clock += self.dt
 
         # First control action
-        control = us[0] if len(us) > 0 else np.zeros(self.actuation.nu)
+        if len(us) > 0 and np.asarray(us[0]).size == self.actuation.nu:
+            control = us[0]
+        else:
+            # A prediction may contain nu=0 impulse controls, but the current
+            # real-time command must always stay in the actuated 12-D space.
+            control = np.zeros(self.actuation.nu)
 
         # Predicted trajectory
         predicted_states = np.array(xs)
-        predicted_controls = np.array(us) if len(us) > 0 else np.zeros((0, self.actuation.nu))
+        # Impulse nodes have nu=0.  IPC does not transmit the predicted control
+        # trajectory, but keep MPCSolution's public shape homogeneous by
+        # padding those zero-time controls to the actuated dimension.
+        predicted_controls = np.zeros((len(us), self.actuation.nu))
+        for index, predicted_control in enumerate(us):
+            predicted_control = np.asarray(predicted_control, dtype=float)
+            if predicted_control.size == self.actuation.nu:
+                predicted_controls[index] = predicted_control
 
         return MPCSolution(
             control=control,
@@ -646,8 +676,12 @@ class CrocoddylQuadrupedMPC(BaseMPC):
                 return [(key, mapping[key]) for key in mapping]
 
             def accumulate(model: Any, data: Any, prefix: str = "") -> None:
-                model_costs = model.differential.costs.costs
-                data_costs = data.differential.costs.costs
+                if hasattr(model, "differential"):
+                    model_costs = model.differential.costs.costs
+                    data_costs = data.differential.costs.costs
+                else:
+                    model_costs = model.costs.costs
+                    data_costs = data.costs.costs
                 raw_contributions = []
                 for name, item in map_entries(model_costs):
                     try:

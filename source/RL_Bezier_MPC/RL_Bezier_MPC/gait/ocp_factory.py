@@ -465,6 +465,22 @@ class OCPFactory:
             velocity_cost = crocoddyl.CostModelResidual(self.state, velocity_residual)
             cost_model.addCost(f"impactVel_{foot_id}", velocity_cost, 1e2)
 
+        # Keep the newly landed feet at their planned touchdown locations
+        # while the impulse model removes their pre-impact velocity.
+        if swing_foot_targets is not None:
+            for foot_id, target_pos in swing_foot_targets:
+                foot_residual = crocoddyl.ResidualModelFrameTranslation(
+                    self.state, foot_id, np.asarray(target_pos, dtype=float), 0
+                )
+                foot_cost = crocoddyl.CostModelResidual(
+                    self.state, foot_residual
+                )
+                cost_model.addCost(
+                    f"footTrack_{foot_id}",
+                    foot_cost,
+                    self.weights["foot_track"],
+                )
+
         # State regularization
         state_residual = crocoddyl.ResidualModelState(self.state, self.x0, 0)
         state_cost = crocoddyl.CostModelResidual(self.state, state_residual)
@@ -648,6 +664,29 @@ class OCPFactory:
         for phase_idx, phase in enumerate(contact_sequence.phases):
             if done:
                 break
+
+            # A swing-to-support transition changes velocity instantaneously.
+            # Adding the new holonomic contacts directly in a finite-time
+            # dynamics node makes the first support node fight the incoming
+            # foot velocity through enormous friction-cone penalties.  Insert
+            # a zero-time impulse node before that support phase instead.
+            if phase.phase_type == "support" and touchdown_targets:
+                support_ids = [
+                    self.foot_frame_ids[foot]
+                    for foot in phase.support_feet
+                    if foot in self.foot_frame_ids
+                ]
+                landed_targets = [
+                    (self.foot_frame_ids[foot], np.asarray(target, dtype=float))
+                    for foot, target in touchdown_targets.items()
+                    if foot in self.foot_frame_ids
+                ]
+                running_models.append(
+                    self.build_impulse_node(
+                        new_support_foot_ids=support_ids,
+                        swing_foot_targets=landed_targets,
+                    )
+                )
 
             # Discretize phase into knots
             num_knots = max(1, round(phase.duration / dt))
