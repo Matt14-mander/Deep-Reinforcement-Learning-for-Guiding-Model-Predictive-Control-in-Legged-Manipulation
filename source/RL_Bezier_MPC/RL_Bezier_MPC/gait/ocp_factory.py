@@ -197,7 +197,7 @@ class OCPFactory:
     def build_swing_node(
         self,
         dt: float,
-        support_foot_ids: List[int],
+        support_foot_targets: List[Tuple[int, np.ndarray]],
         com_target: Optional[np.ndarray] = None,
         swing_foot_targets: Optional[List[Tuple[int, np.ndarray]]] = None,
         body_yaw_target: Optional[float] = None,
@@ -220,7 +220,10 @@ class OCPFactory:
 
         Args:
             dt: Timestep in seconds.
-            support_foot_ids: List of Pinocchio frame IDs for feet in contact.
+            support_foot_targets: ``(frame_id, world_position)`` pairs for
+                feet in contact. Each contact must remain at its own stance
+                location; constraining every foot to the world origin makes
+                the multi-contact dynamics infeasible.
             com_target: Target CoM position, shape (3,). Optional.
             swing_foot_targets: List of (frame_id, target_pos) for swing feet.
             body_yaw_target: Target body yaw angle in radians. Optional.
@@ -231,11 +234,11 @@ class OCPFactory:
         # Create contact model
         contact_model = crocoddyl.ContactModelMultiple(self.state, self.nu)
 
-        for foot_id in support_foot_ids:
+        for foot_id, contact_position in support_foot_targets:
             contact = crocoddyl.ContactModel3D(
                 self.state,
                 foot_id,
-                np.array([0.0, 0.0, 0.0]),  # contact point offset
+                np.asarray(contact_position, dtype=float),
                 pinocchio.LOCAL_WORLD_ALIGNED,
                 self.nu,
                 np.array([0.0, 0.0]),  # gains
@@ -278,7 +281,7 @@ class OCPFactory:
         cost_model.addCost("ctrlReg", ctrl_cost, self.weights["ctrl_reg"])
 
         # Friction cone constraints for each support foot
-        for foot_id in support_foot_ids:
+        for foot_id, _ in support_foot_targets:
             # Create friction cone
             # FrictionCone expects a 3x3 rotation matrix (not a normal vector).
             # np.eye(3) means the cone normal is aligned with world z-axis (upward).
@@ -439,6 +442,7 @@ class OCPFactory:
         self,
         com_target: Optional[np.ndarray] = None,
         body_yaw_target: Optional[float] = None,
+        support_foot_targets: Optional[List[Tuple[int, np.ndarray]]] = None,
     ) -> Any:
         """Build terminal cost node for the OCP.
 
@@ -449,15 +453,20 @@ class OCPFactory:
         Returns:
             Crocoddyl IntegratedActionModel with zero time step.
         """
-        # All feet in contact for terminal state
-        all_foot_ids = list(self.foot_frame_ids.values())
+        # All feet are in contact at the terminal state, at their respective
+        # planned world positions rather than all at the world origin.
+        if support_foot_targets is None:
+            support_foot_targets = [
+                (frame_id, np.zeros(3))
+                for frame_id in self.foot_frame_ids.values()
+            ]
 
         contact_model = crocoddyl.ContactModelMultiple(self.state, self.nu)
-        for foot_id in all_foot_ids:
+        for foot_id, contact_position in support_foot_targets:
             contact = crocoddyl.ContactModel3D(
                 self.state,
                 foot_id,
-                np.array([0.0, 0.0, 0.0]),
+                np.asarray(contact_position, dtype=float),
                 pinocchio.LOCAL_WORLD_ALIGNED,
                 self.nu,
                 np.array([0.0, 0.0]),
@@ -538,6 +547,7 @@ class OCPFactory:
         contact_sequence: ContactSequence,
         com_trajectory: np.ndarray,
         foot_trajectories: Dict[str, List[FootholdPlan]],
+        current_foot_positions: Dict[str, np.ndarray],
         dt: float,
         heading_trajectory: Optional[np.ndarray] = None,
         max_nodes: Optional[int] = None,
@@ -559,6 +569,7 @@ class OCPFactory:
             contact_sequence: ContactSequence defining the gait.
             com_trajectory: Dense CoM waypoints, shape (T, 3).
             foot_trajectories: Dict from FootholdPlanner.
+            current_foot_positions: Current world-frame position of each foot.
             dt: OCP timestep in seconds.
             heading_trajectory: Target yaw angles, shape (T,). Optional.
             max_nodes: If set, cap the number of running nodes at this value.
@@ -573,6 +584,13 @@ class OCPFactory:
 
         # Track which swing is current for each foot
         foot_swing_indices = {foot: 0 for foot in self.foot_frame_ids.keys()}
+        stance_positions = {
+            foot: np.asarray(current_foot_positions[foot], dtype=float).copy()
+            for foot in self.foot_frame_ids.keys()
+        }
+        terminal_foot_positions = {
+            foot: position.copy() for foot, position in stance_positions.items()
+        }
 
         # Iterate through contact sequence phases
         done = False
@@ -583,9 +601,9 @@ class OCPFactory:
             # Discretize phase into knots
             num_knots = max(1, round(phase.duration / dt))
 
-            # Get support foot frame IDs for this phase
-            support_foot_ids = [
-                self.foot_frame_ids[foot]
+            # Keep every support contact at that foot's own stance location.
+            support_foot_targets = [
+                (self.foot_frame_ids[foot], stance_positions[foot])
                 for foot in phase.support_feet
                 if foot in self.foot_frame_ids
             ]
@@ -628,11 +646,14 @@ class OCPFactory:
                             target_pos = (1 - alpha) * plan.start_pos + alpha * plan.end_pos
 
                         swing_foot_targets.append((frame_id, target_pos))
+                        terminal_foot_positions[foot_name] = np.asarray(
+                            target_pos, dtype=float
+                        ).copy()
 
                 # Build the node
                 model = self.build_swing_node(
                     dt=dt,
-                    support_foot_ids=support_foot_ids,
+                    support_foot_targets=support_foot_targets,
                     com_target=com_target,
                     swing_foot_targets=swing_foot_targets if swing_foot_targets else None,
                     body_yaw_target=body_yaw_target,
@@ -644,6 +665,15 @@ class OCPFactory:
             if phase.phase_type == "swing" and not done:
                 for foot_name in phase.swing_feet:
                     if foot_name in foot_swing_indices:
+                        swing_idx = foot_swing_indices[foot_name]
+                        plans = foot_trajectories.get(foot_name, [])
+                        if swing_idx < len(plans):
+                            stance_positions[foot_name] = np.asarray(
+                                plans[swing_idx].end_pos, dtype=float
+                            ).copy()
+                            terminal_foot_positions[foot_name] = stance_positions[
+                                foot_name
+                            ].copy()
                         foot_swing_indices[foot_name] += 1
 
         # Terminal target: the waypoint at the end of the actual OCP horizon.
@@ -656,6 +686,10 @@ class OCPFactory:
         terminal_model = self.build_terminal_node(
             com_target=terminal_com,
             body_yaw_target=terminal_yaw,
+            support_foot_targets=[
+                (self.foot_frame_ids[foot], terminal_foot_positions[foot])
+                for foot in self.foot_frame_ids.keys()
+            ],
         )
 
         # Create shooting problem

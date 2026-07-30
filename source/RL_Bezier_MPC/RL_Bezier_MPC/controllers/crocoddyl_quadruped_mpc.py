@@ -271,6 +271,7 @@ class CrocoddylQuadrupedMPC(BaseMPC):
             contact_sequence=contact_sequence,
             com_trajectory=com_reference,
             foot_trajectories=foothold_plans,
+            current_foot_positions=current_foot_positions,
             dt=self.dt,
             heading_trajectory=heading_trajectory,
             max_nodes=self.horizon_steps,
@@ -526,10 +527,12 @@ class CrocoddylQuadrupedMPC(BaseMPC):
         if len(xs) <= 1:
             return [x0]
 
-        # BUG FIX: xs[2:] skipped xs[1] (2-step shift), inflating ||ffeas||.
-        # Correct 1-step shift: replace old x0 with new x0, keep x1 onward.
-        shifted = [x0] + list(xs[1:])
-        # Pad with last element if needed
+        # One MPC interval has already been executed: the measured ``x0`` now
+        # replaces the old predicted x1. The next predicted state must therefore
+        # start at old x2, matching the control shift u1, u2, ... below. Keeping
+        # old x1 here pairs it with old u1 and creates a one-tick dynamics gap.
+        shifted = [x0.copy()] + [x.copy() for x in xs[2:]]
+        # Preserve the original T+1 state count by extending the terminal state.
         while len(shifted) < len(xs):
             shifted.append(xs[-1].copy())
 
