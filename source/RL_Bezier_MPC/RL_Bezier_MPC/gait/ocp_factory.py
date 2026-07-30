@@ -85,6 +85,11 @@ class OCPFactory:
     # an isolation switch until the closed-loop standing test validates them.
     DEMO_STANDING_WEIGHTS = {
         "com_track": 1e6,
+        # Crocoddyl's official quadrupedal-gait helper gives swing-foot
+        # translation the same priority as CoM tracking. The previous 1e2
+        # weight let the solver hold the body while ignoring touchdown, so
+        # feet remained airborne when the contact schedule advanced.
+        "foot_track": 1e6,
         "state_reg": 1e1,
         "ctrl_reg": 1e-1,
     }

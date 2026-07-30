@@ -399,6 +399,7 @@ class CrocoddylQuadrupedMPC(BaseMPC):
             print(
                 "  OCP weights: "
                 f"com={self.ocp_factory.weights['com_track']:.1e}, "
+                f"foot={self.ocp_factory.weights['foot_track']:.1e}, "
                 f"state={self.ocp_factory.weights['state_reg']:.1e}, "
                 f"control={self.ocp_factory.weights['ctrl_reg']:.1e}",
                 flush=True,
