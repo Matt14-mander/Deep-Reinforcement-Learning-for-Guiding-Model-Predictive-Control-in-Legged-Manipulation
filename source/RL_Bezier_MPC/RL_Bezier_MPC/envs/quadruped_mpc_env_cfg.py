@@ -218,7 +218,9 @@ class QuadrupedMPCEnvCfg(DirectRLEnvCfg):
     # Gait timing defaults
     default_step_duration: float = 0.25  # seconds per swing phase
     default_support_duration: float = 0.10  # double support duration
-    default_step_height: float = 0.15  # meters
+    # Match GO2_CFG.  The previous 0.15 m value is the B1 default and makes
+    # Go2 lift each swing foot to roughly one third of its standing height.
+    default_step_height: float = 0.08  # meters
 
     # Gait modulation bounds (multipliers around 1.0)
     step_length_mod_range: tuple = (0.5, 2.0)

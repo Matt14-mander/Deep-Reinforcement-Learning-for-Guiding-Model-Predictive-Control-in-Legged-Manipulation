@@ -405,6 +405,14 @@ class CrocoddylQuadrupedMPC(BaseMPC):
                 flush=True,
             )
             print(
+                "  Effective gait: "
+                f"swing={step_duration:.3f}s, "
+                f"support={support_duration:.3f}s, "
+                f"step_height={step_height:.3f}m, "
+                f"phase_clock={self._gait_clock:.3f}s",
+                flush=True,
+            )
+            print(
                 "  Contact phases: "
                 + ", ".join(
                     f"{phase.phase_type}[support="
