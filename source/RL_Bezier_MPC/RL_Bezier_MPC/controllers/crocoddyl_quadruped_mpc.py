@@ -88,6 +88,7 @@ class CrocoddylQuadrupedMPC(BaseMPC):
         verbose: bool = False,
         force_standing_contacts: bool = False,
         enable_warm_start: bool = True,
+        reference_is_root_position: bool = False,
     ):
         """Initialize MPC with all sub-components.
 
@@ -107,6 +108,9 @@ class CrocoddylQuadrupedMPC(BaseMPC):
             max_iterations: Maximum FDDP solver iterations.
             convergence_threshold: Solver convergence threshold.
             verbose: If True, print detailed solver info for debugging.
+            reference_is_root_position: Interpret incoming Bezier positions as
+                floating-base/root positions and translate them to true model
+                CoM positions before constructing Crocoddyl costs.
         """
         if not CROCODDYL_AVAILABLE:
             raise ImportError(
@@ -129,6 +133,7 @@ class CrocoddylQuadrupedMPC(BaseMPC):
         self.verbose = verbose
         self.force_standing_contacts = force_standing_contacts
         self.enable_warm_start = enable_warm_start
+        self.reference_is_root_position = reference_is_root_position
         self._solve_count = 0  # Track solve calls for selective verbose
 
         # Get frame IDs from names
@@ -225,6 +230,25 @@ class CrocoddylQuadrupedMPC(BaseMPC):
         if current_foot_positions is None:
             current_foot_positions = self._compute_foot_positions(current_state)
 
+        # QuadrupedMPCEnv anchors its Bezier curve at Isaac's floating-base/root
+        # position. ResidualModelCoMPosition tracks the model's true centre of
+        # mass, so using the root height directly commands an artificial upward
+        # displacement. Preserve the desired root displacement while anchoring
+        # the OCP trajectory at Pinocchio's current CoM.
+        raw_reference = np.asarray(com_reference, dtype=float)
+        ocp_com_reference = raw_reference
+        current_model_com = None
+        root_to_com_offset = None
+        if self.reference_is_root_position:
+            q = np.asarray(current_state[: self.rmodel.nq], dtype=float)
+            current_model_com = np.asarray(
+                pinocchio.centerOfMass(self.rmodel, self.rdata, q), dtype=float
+            ).copy()
+            root_to_com_offset = current_model_com - np.asarray(
+                current_state[:3], dtype=float
+            )
+            ocp_com_reference = raw_reference + root_to_com_offset[None, :]
+
         # Compute current heading from state
         current_heading = self._extract_heading(current_state)
 
@@ -257,7 +281,7 @@ class CrocoddylQuadrupedMPC(BaseMPC):
             )
 
         # Compute heading trajectory from CoM reference tangent
-        heading_trajectory = self._compute_heading_trajectory(com_reference, self.dt)
+        heading_trajectory = self._compute_heading_trajectory(ocp_com_reference, self.dt)
 
         # Update ground height estimate from current foot positions (Fix: eliminates
         # foot_track cost explosion when feet are above ground at initialization)
@@ -268,7 +292,7 @@ class CrocoddylQuadrupedMPC(BaseMPC):
         # Plan footholds
         step_height = self.step_height * step_height_mod
         foothold_plans = self.foothold_planner.plan_footholds(
-            com_trajectory=com_reference,
+            com_trajectory=ocp_com_reference,
             contact_sequence=contact_sequence,
             current_foot_positions=current_foot_positions,
             dt=self.dt,
@@ -279,7 +303,7 @@ class CrocoddylQuadrupedMPC(BaseMPC):
         problem = self.ocp_factory.build_problem(
             x0=current_state,
             contact_sequence=contact_sequence,
-            com_trajectory=com_reference,
+            com_trajectory=ocp_com_reference,
             foot_trajectories=foothold_plans,
             current_foot_positions=current_foot_positions,
             dt=self.dt,
@@ -307,12 +331,17 @@ class CrocoddylQuadrupedMPC(BaseMPC):
             print(f"  x0 quat norm: {quat_norm:.6f} (should be 1.0)", flush=True)
             print(f"  x0 vel (body): [{current_state[self.rmodel.nq]:.3f}, {current_state[self.rmodel.nq+1]:.3f}, {current_state[self.rmodel.nq+2]:.3f}]", flush=True)
             print(f"  x0 joints[:6]: {current_state[7:13]}", flush=True)
-            print(f"  CoM ref[0]: {com_reference[0]}", flush=True)
-            print(f"  CoM ref[-1]: {com_reference[-1]}", flush=True)
+            if self.reference_is_root_position:
+                print(f"  Root ref[0]: {raw_reference[0]}", flush=True)
+                print(f"  Model CoM now: {current_model_com}", flush=True)
+                print(f"  Root->CoM offset: {root_to_com_offset}", flush=True)
+            print(f"  CoM ref[0]: {ocp_com_reference[0]}", flush=True)
+            print(f"  CoM ref[-1]: {ocp_com_reference[-1]}", flush=True)
             print(
                 "  Isolation: "
                 f"fixed_contacts={self.force_standing_contacts}, "
-                f"warm_start_enabled={self.enable_warm_start}",
+                f"warm_start_enabled={self.enable_warm_start}, "
+                f"root_reference={self.reference_is_root_position}",
                 flush=True,
             )
             print(

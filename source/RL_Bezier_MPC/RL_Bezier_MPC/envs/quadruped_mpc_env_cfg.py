@@ -144,6 +144,9 @@ class QuadrupedMPCEnvCfg(DirectRLEnvCfg):
     mpc_force_standing_contacts: bool = False
     mpc_enable_warm_start: bool = True
     mpc_use_raw_state_input: bool = False
+    # Diagnostic A/B switch. The current Bezier generator is anchored at the
+    # floating-base/root, while Crocoddyl's position residual tracks true CoM.
+    mpc_reference_is_root_position: bool = False
 
     # MPC verbose mode (print solver info for first 5 solves, for debugging)
     mpc_verbose: bool = False

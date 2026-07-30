@@ -85,6 +85,9 @@ def build_default_controllers(env_ids: Iterable[int], mpc_cfg: Dict) -> Dict[int
             enable_warm_start=bool(
                 mpc_cfg.get("mpc_enable_warm_start", True)
             ),
+            reference_is_root_position=bool(
+                mpc_cfg.get("mpc_reference_is_root_position", False)
+            ),
         )
     return controllers
 

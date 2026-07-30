@@ -116,4 +116,7 @@ def mpc_cfg_to_dict(cfg) -> Dict:
         "mpc_enable_warm_start": bool(
             getattr(cfg, "mpc_enable_warm_start", True)
         ),
+        "mpc_reference_is_root_position": bool(
+            getattr(cfg, "mpc_reference_is_root_position", False)
+        ),
     }

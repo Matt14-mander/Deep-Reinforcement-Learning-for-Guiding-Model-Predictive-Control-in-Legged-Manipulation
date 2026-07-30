@@ -349,6 +349,7 @@ def main():
         env_cfg.mpc_enable_warm_start = args_cli.debug_group != "cold_fixed"
         env_cfg.mpc_torque_control_only = True
         env_cfg.mpc_use_raw_state_input = True
+        env_cfg.mpc_reference_is_root_position = True
         env_cfg.initial_pos_range = (
             0.0,
             0.0,
@@ -363,7 +364,7 @@ def main():
             f"{args_cli.debug_group} | "
             f"fixed_contacts={env_cfg.mpc_force_standing_contacts} | "
             f"warm_start={env_cfg.mpc_enable_warm_start} | "
-            "torque_only=True | raw_state=True | "
+            "torque_only=True | raw_state=True | root_reference=True | "
             f"root_height={args_cli.debug_root_height:.3f}"
         )
 
