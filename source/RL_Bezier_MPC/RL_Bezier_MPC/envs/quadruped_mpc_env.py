@@ -271,6 +271,35 @@ class QuadrupedMPCEnv(DirectRLEnv):
             (self.num_envs, cfg.num_joints), device=self.device, dtype=torch.float32
         )
 
+        # Two-rate control state. One policy action is held for an entire
+        # 200 ms environment step while MPC is refreshed ten times at 50 Hz.
+        self._policy_bezier_params = np.zeros(
+            (self.num_envs, cfg.num_bezier_actions), dtype=np.float32
+        )
+        self._policy_gait_mods = np.ones(
+            (self.num_envs, cfg.num_gait_mod_actions), dtype=np.float32
+        )
+        self._physics_substep = 0
+        self._mpc_ticks_in_policy_step = 0
+        self._policy_reward_accum = torch.zeros(
+            self.num_envs, device=self.device, dtype=torch.float32
+        )
+        self._policy_guard_counts = torch.zeros(
+            self.num_envs, device=self.device, dtype=torch.long
+        )
+        self._policy_mpc_cost_sums = torch.zeros(
+            self.num_envs, device=self.device, dtype=torch.float32
+        )
+        self._policy_mpc_converged_counts = torch.zeros(
+            self.num_envs, device=self.device, dtype=torch.long
+        )
+        self._inner_terminated = torch.zeros(
+            self.num_envs, device=self.device, dtype=torch.bool
+        )
+        self._mpc_tick_reward_mask = torch.ones(
+            self.num_envs, device=self.device, dtype=torch.bool
+        )
+
     def _build_joint_mapping(self):
         """Build joint index mapping between Isaac Lab and Pinocchio.
 
@@ -493,6 +522,24 @@ class QuadrupedMPCEnv(DirectRLEnv):
             _v_fwd * _hz, 0.0, 0.0,
         ], dtype=np.float32)
         bezier_params = bezier_params + _fwd_bias[np.newaxis, :]
+
+        # Hold this action for the complete 5 Hz policy interval. MPC consumes
+        # the cached trajectory/gait parameters ten times from _apply_action.
+        self._policy_bezier_params[:] = bezier_params
+        self._policy_gait_mods[:] = gait_mods
+        self._physics_substep = 0
+        self._mpc_ticks_in_policy_step = 0
+        self._policy_reward_accum.zero_()
+        self._policy_guard_counts.zero_()
+        self._policy_mpc_cost_sums.zero_()
+        self._policy_mpc_converged_counts.zero_()
+        self._inner_terminated.zero_()
+        self._mpc_tick_reward_mask.fill_(True)
+
+    def _solve_mpc_control_step(self):
+        """Refresh joint targets once at the 50 Hz MPC rate."""
+        bezier_params = self._policy_bezier_params
+        gait_mods = self._policy_gait_mods
 
         # Get current robot states
         robot_states = self._get_robot_states_numpy()
@@ -788,11 +835,82 @@ class QuadrupedMPCEnv(DirectRLEnv):
             self._mpc_timing_accum_ms = 0.0
 
     def _apply_action(self):
-        """Apply both accumulated joint position targets and feedforward efforts."""
+        """Refresh MPC at 50 Hz and apply its control at the 200 Hz physics rate."""
+        if self._physics_substep % self.cfg.mpc_decimation == 0:
+            # At every boundary after the first, the current simulator state is
+            # the result of the preceding 20 ms MPC interval.
+            if self._mpc_ticks_in_policy_step > 0:
+                tick_rewards = self._compute_mpc_tick_rewards()
+                self._policy_reward_accum += tick_rewards * (
+                    self._mpc_tick_reward_mask.to(dtype=tick_rewards.dtype)
+                )
+
+            tick_active = ~self._inner_terminated
+            self._solve_mpc_control_step()
+            self._mpc_ticks_in_policy_step += 1
+            self._mpc_tick_reward_mask.copy_(tick_active)
+            self._update_mpc_tick_accounting()
+            self._apply_safe_control_to_terminated_envs()
         # 让 IsaacLab 底层同时接受目标位置和前馈力矩
         # 物理引擎底层公式：tau_总 = tau_前馈 + Kp*(q_目标 - q) + Kd*(dq_目标 - dq)
         self.robot.set_joint_position_target(self._pending_joint_positions)
         self.robot.set_joint_effort_target(self._pending_joint_efforts)
+        self._physics_substep += 1
+
+    def _update_mpc_tick_accounting(self):
+        """Update 50 Hz MPC statistics and safety counters."""
+        active = ~self._inner_terminated
+        guard = self.guard_triggered & active
+
+        self._policy_guard_counts += guard.to(dtype=torch.long)
+        self._policy_mpc_cost_sums += torch.as_tensor(
+            self._last_mpc_costs, device=self.device, dtype=torch.float32
+        )
+        self._policy_mpc_converged_counts += torch.as_tensor(
+            self._last_mpc_converged,
+            device=self.device,
+            dtype=torch.long,
+        )
+
+        self.consecutive_mpc_failures = torch.where(
+            active,
+            torch.where(
+                self.guard_triggered,
+                self.consecutive_mpc_failures + 1,
+                torch.zeros_like(self.consecutive_mpc_failures),
+            ),
+            self.consecutive_mpc_failures,
+        )
+
+        position = self.robot.data.root_pos_w
+        orientation = self.robot.data.root_quat_w
+        currently_low = (position[:, 2] < self.cfg.min_body_height) & active
+        self._too_low_counter[currently_low] += 1
+        self._too_low_counter[(~currently_low) & active] = 0
+
+        too_low = self._too_low_counter >= self.cfg.min_body_height_consecutive_steps
+        too_high = position[:, 2] > self.cfg.max_body_height
+        up_world_z = 1.0 - 2.0 * (
+            orientation[:, 1].square() + orientation[:, 2].square()
+        )
+        flipped = up_world_z < 0.5
+        out_of_bounds = (
+            torch.linalg.vector_norm(position[:, :2], dim=1)
+            > self.cfg.max_distance_from_start
+        )
+        too_many_failures = self.consecutive_mpc_failures >= 5
+        self._inner_terminated |= (
+            too_low | too_high | flipped | out_of_bounds | too_many_failures
+        )
+
+    def _apply_safe_control_to_terminated_envs(self):
+        """Hold latched environments safely until the policy step ends."""
+        if not torch.any(self._inner_terminated):
+            return
+        self._pending_joint_efforts[self._inner_terminated] = 0.0
+        self._pending_joint_positions[self._inner_terminated] = (
+            self.robot.data.default_joint_pos[self._inner_terminated]
+        )
 
     def _apply_control(self, env_idx: int, joint_positions: np.ndarray, joint_torques: np.ndarray):
         """Apply joint position and feedforward torque control."""
@@ -893,8 +1011,8 @@ class QuadrupedMPCEnv(DirectRLEnv):
 
         return {"policy": obs}
 
-    def _get_rewards(self) -> torch.Tensor:
-        """Compute rewards for locomotion task.
+    def _compute_mpc_tick_rewards(self) -> torch.Tensor:
+        """Compute one 50 Hz reward sample for the held policy action.
 
         Returns:
             Reward tensor. Shape: (num_envs,)
@@ -1019,6 +1137,19 @@ class QuadrupedMPCEnv(DirectRLEnv):
 
         return rewards
 
+    def _get_rewards(self) -> torch.Tensor:
+        """Return the sum of ten 50 Hz rewards for one 5 Hz policy step."""
+        if self._mpc_ticks_in_policy_step != self.cfg.rl_policy_period:
+            raise RuntimeError(
+                "Expected exactly "
+                f"{self.cfg.rl_policy_period} MPC ticks per policy step, got "
+                f"{self._mpc_ticks_in_policy_step}. Check DirectRLEnv decimation."
+            )
+        final_tick_reward = self._compute_mpc_tick_rewards()
+        return self._policy_reward_accum + final_tick_reward * (
+            self._mpc_tick_reward_mask.to(dtype=final_tick_reward.dtype)
+        )
+
     def _get_dones(self) -> Tuple[torch.Tensor, torch.Tensor]:
         """Determine episode termination conditions.
 
@@ -1032,20 +1163,12 @@ class QuadrupedMPCEnv(DirectRLEnv):
         terminated = torch.zeros(self.num_envs, dtype=torch.bool, device=self.device)
         truncated = torch.zeros(self.num_envs, dtype=torch.bool, device=self.device)
 
-        # Height check with grace period: only terminate after N consecutive steps below threshold
-        # Prevents normal trot-gait body oscillations from prematurely killing the episode
-        currently_low = position[:, 2] < self.cfg.min_body_height
-        self._too_low_counter[currently_low] += 1
-        self._too_low_counter[~currently_low] = 0
+        # The 50 Hz counters are updated inside _apply_action. Here we only
+        # consume their latched result at the 5 Hz policy boundary.
         too_low = self._too_low_counter >= self.cfg.min_body_height_consecutive_steps
         too_high = position[:, 2] > self.cfg.max_body_height
 
-        # Consecutive MPC failures: terminate after 5 consecutive guard fires (~1s of fallback)
-        self.consecutive_mpc_failures = torch.where(
-            self.guard_triggered,
-            self.consecutive_mpc_failures + 1,
-            torch.zeros_like(self.consecutive_mpc_failures)
-        )
+        # Consecutive failures are counted at the 50 Hz MPC rate.
         too_many_failures = self.consecutive_mpc_failures >= 5
 
         # Orientation check (flipped)
@@ -1063,7 +1186,14 @@ class QuadrupedMPCEnv(DirectRLEnv):
         out_of_bounds = distance > self.cfg.max_distance_from_start
 
         # Termination
-        terminated = too_low | too_high | flipped | out_of_bounds | too_many_failures
+        terminated = (
+            self._inner_terminated
+            | too_low
+            | too_high
+            | flipped
+            | out_of_bounds
+            | too_many_failures
+        )
 
         # Truncation (timeout)
         time_out = self.episode_length_buf >= self.max_episode_length
@@ -1184,11 +1314,19 @@ class QuadrupedMPCEnv(DirectRLEnv):
             # Reset guard state
             self.guard_triggered[env_idx] = False
             self.consecutive_mpc_failures[env_idx] = 0
+            self._inner_terminated[env_idx] = False
+            self._policy_reward_accum[env_idx] = 0.0
+            self._policy_guard_counts[env_idx] = 0
+            self._policy_mpc_cost_sums[env_idx] = 0.0
+            self._policy_mpc_converged_counts[env_idx] = 0
+            self._mpc_tick_reward_mask[env_idx] = True
 
             # Reset stored params
             self.prev_bezier_params[env_idx] = initial_params
             self.prev_gait_mods[env_idx] = np.ones(self.cfg.num_gait_mod_actions)
             self._prev_bezier_params_last[env_idx] = initial_params.copy()
+            self._policy_bezier_params[env_idx] = initial_params
+            self._policy_gait_mods[env_idx] = 1.0
 
     def _generate_initial_bezier_params(
         self,

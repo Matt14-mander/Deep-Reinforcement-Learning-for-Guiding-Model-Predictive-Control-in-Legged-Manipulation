@@ -69,8 +69,13 @@ class QuadrupedMPCEnvCfg(DirectRLEnvCfg):
         gravity=(0.0, 0.0, -9.81),
     )
 
-    # Control decimation: 200 Hz / 4 = 50 Hz MPC rate
-    decimation: int = 4
+    # One RL environment step spans 40 physics steps:
+    #   200 Hz physics / 4 = 50 Hz MPC
+    #   50 Hz MPC / 10 = 5 Hz policy
+    # The environment refreshes MPC control from _apply_action every
+    # mpc_decimation physics steps while holding one policy action throughout.
+    mpc_decimation: int = 4
+    decimation: int = 40
 
     # Episode settings (longer for quadruped locomotion)
     episode_length_s: float = 15.0
@@ -390,8 +395,16 @@ class QuadrupedMPCEnvCfg(DirectRLEnvCfg):
 
         # Validate configuration
         assert self.decimation > 0, "Decimation must be positive"
+        assert self.mpc_decimation > 0, "MPC decimation must be positive"
         assert self.mpc_horizon_steps > 0, "MPC horizon must be positive"
         assert self.rl_policy_period > 0, "RL policy period must be positive"
+        assert self.decimation == self.mpc_decimation * self.rl_policy_period, (
+            "Environment decimation must equal MPC decimation times the number "
+            "of MPC steps per policy step"
+        )
+        assert abs(self.mpc_dt - self.sim.dt * self.mpc_decimation) < 1.0e-9, (
+            "MPC dt must equal physics dt times MPC decimation"
+        )
         assert self.foot_contact_force_threshold > 0.0, (
             "Foot contact force threshold must be positive"
         )
