@@ -16,9 +16,9 @@ If the robot FALLS in this test → problem is (A), fix MPC integration.
 If the robot WALKS stably → problem is (B), focus on RL training.
 
 Usage:
-    python scripts/test_mpc_standalone.py --num_envs 1 --headless
-    python scripts/test_mpc_standalone.py --num_envs 1 --headless --max_steps 500
-    python scripts/test_mpc_standalone.py --num_envs 1 --headless --mode stand
+    python scripts/test_mpc_standalone.py --num_envs 1 --headless --mode stand \
+        --use_mpc_cluster --cluster_workers 1 --mpc_python /path/to/mpc/python \
+        --robot_urdf /path/to/go2.urdf
 """
 
 import argparse
@@ -34,8 +34,8 @@ parser.add_argument(
     help="Number of parallel environments (default: 1)",
 )
 parser.add_argument(
-    "--max_steps", type=int, default=500,
-    help="Maximum MPC steps to run (default: 500, = 10 seconds at 50Hz)",
+    "--max_steps", type=int, default=50,
+    help="Maximum 5 Hz policy steps (default: 50, = 10 simulated seconds)",
 )
 parser.add_argument(
     "--mode", type=str, default="walk",
@@ -45,6 +45,22 @@ parser.add_argument(
 parser.add_argument(
     "--plot_dir", type=str, default="plots/mpc_diagnostic",
     help="Directory to save diagnostic plots",
+)
+parser.add_argument(
+    "--use_mpc_cluster", action="store_true",
+    help="Run Crocoddyl in the separate EigenIPC MPC environment",
+)
+parser.add_argument(
+    "--cluster_workers", type=int, default=1,
+    help="Number of MPC worker processes (default: 1)",
+)
+parser.add_argument(
+    "--mpc_python", type=str, default="",
+    help="Absolute path to the rlbmpc_mpc environment Python executable",
+)
+parser.add_argument(
+    "--robot_urdf", type=str, default="",
+    help="Absolute path to the Go2 URDF used by MPC workers",
 )
 
 # AppLauncher arguments (adds --headless, --device, --livestream, etc.)
@@ -86,28 +102,23 @@ def generate_fixed_bezier_params(mode: str = "walk") -> np.ndarray:
         Values are in the DENORMALIZED action space (meters offset).
     """
     if mode == "stand":
-        # P0 = [0,0,0], P1-P3 = very small offsets → robot stays in place
-        params = np.array([
-            0.0, 0.0, 0.0,    # P0: start offset (always zero)
-            0.05, 0.0, 0.0,   # P1: tiny forward
-            0.05, 0.0, 0.0,   # P2: tiny forward
-            0.05, 0.0, 0.0,   # P3: end (barely moves)
-        ])
+        # True zero-displacement reference.
+        params = np.zeros(12, dtype=np.float32)
     elif mode == "walk":
-        # Gentle forward trajectory (~0.5m over 1.5s = 0.33 m/s)
+        # Gentle forward trajectory (0.15m over 3s = 0.05 m/s)
+        params = np.array([
+            0.0, 0.0, 0.0,     # P0: start
+            0.05, 0.0, 0.0,    # P1: control point
+            0.10, 0.0, 0.0,    # P2: control point
+            0.15, 0.0, 0.0,    # P3: end
+        ])
+    elif mode == "walk_fast":
+        # Current training bias (0.45m over 3s = 0.15 m/s)
         params = np.array([
             0.0, 0.0, 0.0,     # P0: start
             0.15, 0.0, 0.0,    # P1: control point
-            0.35, 0.0, 0.0,    # P2: control point
-            0.50, 0.0, 0.0,    # P3: end (~0.5m forward)
-        ])
-    elif mode == "walk_fast":
-        # Moderate forward trajectory (~1.0m over 1.5s = 0.67 m/s)
-        params = np.array([
-            0.0, 0.0, 0.0,     # P0: start
-            0.30, 0.0, 0.0,    # P1: control point
-            0.70, 0.0, 0.0,    # P2: control point
-            1.00, 0.0, 0.0,    # P3: end (~1.0m forward)
+            0.30, 0.0, 0.0,    # P2: control point
+            0.45, 0.0, 0.0,    # P3: end
         ])
     else:
         raise ValueError(f"Unknown mode: {mode}")
@@ -158,11 +169,12 @@ def plot_diagnostic(positions, orientations, target_pos, rewards,
     """
     os.makedirs(save_dir, exist_ok=True)
     T = len(positions)
-    time_steps = np.arange(T) * 0.02  # MPC dt = 0.02s
+    policy_dt = 0.2
+    time_steps = np.arange(T) * policy_dt
 
     fig, axes = plt.subplots(3, 2, figsize=(16, 14))
     fig.suptitle(
-        f"MPC Standalone Diagnostic | Mode: {mode} | {T} steps ({T*0.02:.1f}s)\n"
+        f"MPC Standalone Diagnostic | Mode: {mode} | {T} policy steps ({T*policy_dt:.1f}s)\n"
         f"Final height: {positions[-1, 2]:.3f}m | "
         f"Total reward: {np.sum(rewards):.2f} | "
         f"MPC convergence: {np.mean(mpc_converged_log)*100:.0f}%",
@@ -231,7 +243,7 @@ def plot_diagnostic(positions, orientations, target_pos, rewards,
                      "RR_hip", "RR_thigh", "RR_calf",
                      "RL_hip", "RL_thigh", "RL_calf"]
         # Plot by leg (average of 3 joints per leg)
-        t_torques = np.arange(len(torques)) * 0.02
+        t_torques = np.arange(len(torques)) * policy_dt
         colors = ["red", "blue", "green", "orange"]
         for leg_idx, (leg_name, color) in enumerate(
             zip(["FR", "FL", "RR", "RL"], colors)):
@@ -248,7 +260,7 @@ def plot_diagnostic(positions, orientations, target_pos, rewards,
     ax = axes[2, 0]
     if len(joint_positions_log) > 0:
         jpos = np.array(joint_positions_log)
-        t_jpos = np.arange(len(jpos)) * 0.02
+        t_jpos = np.arange(len(jpos)) * policy_dt
         # Isaac Lab joint order: FR_hip, FL_hip, RR_hip, RL_hip, FR_thigh, ...
         # Plot hip, thigh, calf averages across legs
         for j in range(min(12, jpos.shape[1])):
@@ -261,7 +273,7 @@ def plot_diagnostic(positions, orientations, target_pos, rewards,
     # --- Panel 6: MPC Cost & Convergence ---
     ax = axes[2, 1]
     if len(mpc_costs_log) > 0:
-        t_mpc = np.arange(len(mpc_costs_log)) * 0.02
+        t_mpc = np.arange(len(mpc_costs_log)) * policy_dt
         ax.semilogy(t_mpc, np.clip(mpc_costs_log, 1e-6, None),
                     "b-", linewidth=1, label="MPC cost")
         ax.set_xlabel("Time (s)")
@@ -283,7 +295,8 @@ def main():
     print("MPC STANDALONE DIAGNOSTIC TEST")
     print("=" * 70)
     print(f"Mode: {args_cli.mode}")
-    print(f"Max steps: {args_cli.max_steps} ({args_cli.max_steps * 0.02:.1f}s)")
+    policy_dt = 0.2
+    print(f"Max policy steps: {args_cli.max_steps} ({args_cli.max_steps * policy_dt:.1f}s)")
     print(f"Purpose: Test if MPC can control Go2 in Isaac Lab WITHOUT RL")
     print("=" * 70)
 
@@ -292,6 +305,17 @@ def main():
     env_cfg.scene.num_envs = args_cli.num_envs
     env_cfg.fix_gait_params = True  # Fixed gait for diagnostic
     env_cfg.mpc_verbose = True  # Enable verbose MPC debugging (first 5 solves)
+    env_cfg.forward_velocity_bias = 0.0  # test exactly the trajectory selected above
+    env_cfg.use_mpc_cluster = args_cli.use_mpc_cluster
+    env_cfg.cluster_num_workers = args_cli.cluster_workers
+    env_cfg.cluster_python_executable = args_cli.mpc_python
+    env_cfg.robot_urdf_path = args_cli.robot_urdf
+
+    if env_cfg.use_mpc_cluster:
+        if not env_cfg.cluster_python_executable:
+            parser.error("--use_mpc_cluster requires --mpc_python")
+        if not env_cfg.robot_urdf_path:
+            parser.error("--use_mpc_cluster requires --robot_urdf")
 
     # Force target to be straight ahead (simple test)
     env_cfg.target_pos_range = (2.0, 2.0, 0.0, 0.0, 0.0, 0.0)  # Fixed at x=2.0
@@ -332,6 +356,11 @@ def main():
     print("RUNNING SIMULATION")
     print("=" * 70)
     obs, _ = env.reset()
+    initial_tick_count = int(env._lifetime_mpc_tick_counts.sum().item())
+    initial_guard_count = int(env._lifetime_guard_counts.sum().item())
+    initial_converged_count = int(
+        env._lifetime_mpc_converged_counts.sum().item()
+    )
 
     # Print initial state
     robot_data = env.robot.data
@@ -348,11 +377,27 @@ def main():
     joint_positions_log = []
     mpc_converged_log = []
     mpc_costs_log = []
+    guard_count = 0
+    mpc_tick_count = 0
+    converged_tick_count = 0
 
     # Run simulation
     for step in range(args_cli.max_steps):
         # Apply FIXED actions (bypassing RL)
         obs, rewards, terminated, truncated, info = env.step(action_tensor)
+
+        # One policy step contains rl_policy_period MPC ticks. The environment
+        # accumulates these before returning from env.step().
+        guard_count = (
+            int(env._lifetime_guard_counts.sum().item()) - initial_guard_count
+        )
+        converged_tick_count = (
+            int(env._lifetime_mpc_converged_counts.sum().item())
+            - initial_converged_count
+        )
+        mpc_tick_count = (
+            int(env._lifetime_mpc_tick_counts.sum().item()) - initial_tick_count
+        )
 
         # Print detailed MPC info for first 3 steps
         if step < 3 and hasattr(env, 'last_mpc_solutions') and env.last_mpc_solutions[0] is not None:
@@ -383,7 +428,7 @@ def main():
             mpc_costs_log.append(env._last_mpc_costs[0])
 
         # Print progress every 50 steps
-        if (step + 1) % 50 == 0:
+        if (step + 1) % 5 == 0:
             height = pos[2]
             # Compute pitch from quaternion
             w, x, y, z = quat
@@ -391,12 +436,13 @@ def main():
             sinp = np.clip(sinp, -1.0, 1.0)
             pitch = np.degrees(np.arcsin(sinp))
 
-            conv_rate = np.mean(mpc_converged_log[-50:]) * 100 if mpc_converged_log else 0
+            conv_rate = 100.0 * converged_tick_count / max(mpc_tick_count, 1)
+            guard_rate = 100.0 * guard_count / max(mpc_tick_count, 1)
             print(f"  Step {step+1:4d}/{args_cli.max_steps}: "
                   f"pos=[{pos[0]:+.3f}, {pos[1]:+.3f}, {pos[2]:.3f}], "
                   f"pitch={pitch:+.1f}°, "
                   f"reward={rewards[0].item():+.3f}, "
-                  f"MPC conv={conv_rate:.0f}%")
+                  f"MPC conv={conv_rate:.1f}%, Guard={guard_rate:.1f}%")
 
         # Check termination
         dones = terminated | truncated
@@ -435,7 +481,7 @@ def main():
     pitches = np.array(pitches)
 
     print(f"Test mode:         {args_cli.mode}")
-    print(f"Steps completed:   {T} / {args_cli.max_steps} ({T * 0.02:.1f}s)")
+    print(f"Policy steps:      {T} / {args_cli.max_steps} ({T * policy_dt:.1f}s)")
     print(f"Final position:    [{positions_arr[-1, 0]:+.3f}, {positions_arr[-1, 1]:+.3f}, {positions_arr[-1, 2]:.3f}]")
     print(f"Target position:   [{target_pos[0]:.3f}, {target_pos[1]:.3f}, {target_pos[2]:.3f}]")
     print(f"Height range:      [{min_height:.3f}, {max_height:.3f}]m (standing: 0.40m)")
@@ -444,6 +490,9 @@ def main():
 
     if len(mpc_converged_arr) > 0:
         print(f"MPC convergence:   {np.mean(mpc_converged_arr)*100:.1f}%")
+    print(f"MPC tick count:    {mpc_tick_count}")
+    print(f"Guard rate:        {100.0 * guard_count / max(mpc_tick_count, 1):.1f}%")
+    print(f"Tick convergence:  {100.0 * converged_tick_count / max(mpc_tick_count, 1):.1f}%")
 
     # Distance traveled
     x_traveled = positions_arr[-1, 0] - positions_arr[0, 0]
@@ -490,7 +539,7 @@ def main():
         print("   → MPC is partially working but orientation control is weak.")
     elif T < args_cli.max_steps * 0.8:
         print("🟡 EARLY TERMINATION — Robot survived but terminated early")
-        print(f"   → Lasted {T * 0.02:.1f}s out of {args_cli.max_steps * 0.02:.1f}s")
+        print(f"   → Lasted {T * policy_dt:.1f}s out of {args_cli.max_steps * policy_dt:.1f}s")
     else:
         if args_cli.mode == "stand":
             if abs(x_traveled) < 0.3 and abs(y_traveled) < 0.3:
@@ -500,7 +549,7 @@ def main():
         else:
             if x_traveled > 0.2:
                 print("🟢 ROBOT IS WALKING FORWARD — MPC works in Isaac Lab!")
-                print(f"   → Traveled {x_traveled:.2f}m forward in {T*0.02:.1f}s")
+                print(f"   → Traveled {x_traveled:.2f}m forward in {T*policy_dt:.1f}s")
                 print("   → Problem is in RL training, not MPC integration.")
             elif x_traveled < -0.2:
                 print("🟡 ROBOT WALKED BACKWARD — MPC has direction issue")

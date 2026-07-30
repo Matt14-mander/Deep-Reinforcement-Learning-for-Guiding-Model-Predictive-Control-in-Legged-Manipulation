@@ -187,6 +187,11 @@ class QuadrupedMPCEnvCfg(DirectRLEnvCfg):
     # and max-negative action gives P3_x=0.4m (0.13 m/s, still forward). Robot CANNOT go backward.
     max_bezier_displacement: float = 0.5  # meters
 
+    # Nominal forward velocity added to the policy's Bezier control points.
+    # Keep this configurable so standalone MPC diagnostics can test a true
+    # zero-velocity reference without changing the training action space.
+    forward_velocity_bias: float = 0.15  # m/s
+
     # Trajectory blending steps when updating
     trajectory_blend_steps: int = 5
 

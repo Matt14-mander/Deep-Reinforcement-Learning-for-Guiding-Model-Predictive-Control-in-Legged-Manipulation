@@ -293,6 +293,18 @@ class QuadrupedMPCEnv(DirectRLEnv):
         self._policy_mpc_converged_counts = torch.zeros(
             self.num_envs, device=self.device, dtype=torch.long
         )
+        # Monotonic diagnostic counters survive automatic episode resets. This
+        # lets standalone tests measure failures from the step that terminated
+        # an episode instead of losing them in _reset_idx().
+        self._lifetime_mpc_tick_counts = torch.zeros(
+            self.num_envs, device=self.device, dtype=torch.long
+        )
+        self._lifetime_guard_counts = torch.zeros(
+            self.num_envs, device=self.device, dtype=torch.long
+        )
+        self._lifetime_mpc_converged_counts = torch.zeros(
+            self.num_envs, device=self.device, dtype=torch.long
+        )
         self._inner_terminated = torch.zeros(
             self.num_envs, device=self.device, dtype=torch.bool
         )
@@ -514,7 +526,7 @@ class QuadrupedMPCEnv(DirectRLEnv):
         # 0.3 m/s caused too many MPC Guard failures (model_1900 tuned for near-stationary).
         # Once reward > 150 and Guard failures < 1/iter, increase to _v_fwd=0.3.
         _hz = float(self.cfg.bezier_horizon)
-        _v_fwd = 0.15  # m/s — curriculum step 2 of 3 (was 0.05, target 0.30)
+        _v_fwd = float(self.cfg.forward_velocity_bias)
         _fwd_bias = np.array([
             0.0, 0.0, 0.0,
             _v_fwd * _hz / 3, 0.0, 0.0,
@@ -861,6 +873,16 @@ class QuadrupedMPCEnv(DirectRLEnv):
         """Update 50 Hz MPC statistics and safety counters."""
         active = ~self._inner_terminated
         guard = self.guard_triggered & active
+
+        converged = torch.as_tensor(
+            self._last_mpc_converged,
+            device=self.device,
+            dtype=torch.bool,
+        ) & active
+
+        self._lifetime_mpc_tick_counts += active.to(dtype=torch.long)
+        self._lifetime_guard_counts += guard.to(dtype=torch.long)
+        self._lifetime_mpc_converged_counts += converged.to(dtype=torch.long)
 
         self._policy_guard_counts += guard.to(dtype=torch.long)
         self._policy_mpc_cost_sums += torch.as_tensor(
