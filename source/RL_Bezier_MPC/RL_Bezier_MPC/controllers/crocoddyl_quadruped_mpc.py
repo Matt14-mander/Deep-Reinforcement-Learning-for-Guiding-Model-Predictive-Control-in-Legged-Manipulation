@@ -362,6 +362,7 @@ class CrocoddylQuadrupedMPC(BaseMPC):
         # setCandidate() internally, so these trajectories must be passed to
         # solve() rather than installed before a later solve([], []) call.
         use_warm_start = False
+        rollout_is_finite = False
         if (
             warm_start
             and self.enable_warm_start
@@ -377,20 +378,48 @@ class CrocoddylQuadrupedMPC(BaseMPC):
             if is_verbose_call:
                 print(f"  Warm-start: YES (shifted prev solution)", flush=True)
         else:
-            # A rollout from the current problem is dynamically feasible.
-            u_grav = self._compute_gravity_compensation(current_state)
-            us_init = [u_grav.copy() for _ in range(T)]
+            # Compute contact-consistent equilibrium controls. Taking only the
+            # actuated tail of Pinocchio's free-body gravity vector ignores the
+            # contact force distribution and is not a standing equilibrium.
+            x_static = np.asarray(current_state, dtype=float).copy()
+            x_static[self.rmodel.nq :] = 0.0
+            us_init = list(problem.quasiStatic([x_static.copy() for _ in range(T)]))
             xs_init = list(problem.rollout(us_init))
+            rollout_array = np.asarray(xs_init)
+            rollout_is_finite = bool(np.all(np.isfinite(rollout_array)))
             if is_verbose_call:
-                print(f"  Cold-start: gravity compensation |u|={np.linalg.norm(u_grav):.3f}", flush=True)
-                print(f"  u_grav: [{', '.join(f'{v:.2f}' for v in u_grav)}]", flush=True)
+                u0_static = np.asarray(us_init[0])
+                print(
+                    "  Cold-start: contact quasi-static "
+                    f"|u[0]|={np.linalg.norm(u0_static):.3f}",
+                    flush=True,
+                )
+                print(
+                    f"  u_static[0]: [{', '.join(f'{v:.2f}' for v in u0_static)}]",
+                    flush=True,
+                )
+                print(f"  Rollout finite: {rollout_is_finite}", flush=True)
+                if not rollout_is_finite:
+                    bad_index = np.argwhere(~np.isfinite(rollout_array))[0]
+                    print(
+                        "  First non-finite rollout entry: "
+                        f"node={int(bad_index[0])}, state_index={int(bad_index[1])}",
+                        flush=True,
+                    )
+            if not rollout_is_finite:
+                # Keep FDDP inputs finite so it can handle the dynamics gaps,
+                # while the diagnostic above still exposes the failed rollout.
+                xs_init = [
+                    np.asarray(current_state, dtype=float).copy()
+                    for _ in range(T + 1)
+                ]
 
         # Solve.
         # A shifted warm-start can contain dynamics gaps after replacing x0,
         # while the cold rollout is feasible by construction.
         COLD_START_ITERS = 100
         n_iters = self.max_iterations if use_warm_start else COLD_START_ITERS
-        initial_guess_feasible = not use_warm_start
+        initial_guess_feasible = not use_warm_start and rollout_is_finite
         if is_verbose_call:
             print(
                 f"  Initial guess: xs={len(xs_init)}, us={len(us_init)}, "
