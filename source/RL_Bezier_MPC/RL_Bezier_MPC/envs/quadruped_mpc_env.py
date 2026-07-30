@@ -473,6 +473,14 @@ class QuadrupedMPCEnv(DirectRLEnv):
         robot_cfg = UNITREE_GO2_CFG.replace(
             prim_path="/World/envs/env_.*/Robot",
         )
+        if self.cfg.mpc_torque_control_only:
+            for actuator_cfg in robot_cfg.actuators.values():
+                actuator_cfg.stiffness = 0.0
+                actuator_cfg.damping = 0.0
+            print(
+                "[Actuation] Crocoddyl torque-only mode: "
+                "disabled Isaac actuator Kp/Kd terms."
+            )
         # ContactSensor relies on PhysX ContactReporter being enabled on the
         # spawned rigid bodies. Keep this explicit instead of depending on the
         # asset's default setting.
@@ -873,7 +881,8 @@ class QuadrupedMPCEnv(DirectRLEnv):
             self._apply_safe_control_to_terminated_envs()
         # 让 IsaacLab 底层同时接受目标位置和前馈力矩
         # 物理引擎底层公式：tau_总 = tau_前馈 + Kp*(q_目标 - q) + Kd*(dq_目标 - dq)
-        self.robot.set_joint_position_target(self._pending_joint_positions)
+        if not self.cfg.mpc_torque_control_only:
+            self.robot.set_joint_position_target(self._pending_joint_positions)
         self.robot.set_joint_effort_target(self._pending_joint_efforts)
         self._physics_substep += 1
 

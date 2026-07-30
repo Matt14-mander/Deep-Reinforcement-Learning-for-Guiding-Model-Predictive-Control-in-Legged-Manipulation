@@ -239,6 +239,12 @@ class QuadrupedMPCEnvCfg(DirectRLEnvCfg):
     )
     max_joint_torque: float = 23.5  # N.m (Go2 HV motor peak torque)
 
+    # Crocoddyl's control variable is joint torque. The stock Isaac Lab Go2
+    # actuator adds Kp/Kd position tracking to the requested feed-forward
+    # effort, which changes the dynamics that MPC optimized. Disable those
+    # extra PD terms so simulated actuation matches the MPC model.
+    mpc_torque_control_only: bool = True
+
     # Minimum net normal force used to classify a foot as being in contact.
     # A small non-zero threshold rejects PhysX contact-force numerical noise.
     foot_contact_force_threshold: float = 1.0  # N
