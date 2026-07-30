@@ -139,6 +139,7 @@ class QuadrupedMPCEnv(DirectRLEnv):
                     force_standing_contacts=cfg.mpc_force_standing_contacts,
                     enable_warm_start=cfg.mpc_enable_warm_start,
                     reference_is_root_position=cfg.mpc_reference_is_root_position,
+                    return_quasi_static_control=cfg.mpc_return_quasi_static_control,
                 )
             else:
                 mpc = None  # Dummy mode / cluster mode

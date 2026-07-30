@@ -69,10 +69,10 @@ parser.add_argument(
 )
 parser.add_argument(
     "--debug_group",
-    choices=["cold_fixed", "warm_fixed", "warm_trot"],
+    choices=["static_fixed", "cold_fixed", "warm_fixed", "warm_trot"],
     default=None,
     help=(
-        "Controlled isolation experiment: cold/fixed contacts, "
+        "Controlled isolation experiment: quasi-static/fixed contacts, cold/fixed contacts, "
         "warm/fixed contacts, or warm/trot contacts"
     ),
 )
@@ -344,9 +344,14 @@ def main():
 
     if args_cli.debug_group is not None:
         env_cfg.mpc_force_standing_contacts = (
-            args_cli.debug_group in ("cold_fixed", "warm_fixed")
+            args_cli.debug_group in ("static_fixed", "cold_fixed", "warm_fixed")
         )
-        env_cfg.mpc_enable_warm_start = args_cli.debug_group != "cold_fixed"
+        env_cfg.mpc_enable_warm_start = args_cli.debug_group not in (
+            "static_fixed", "cold_fixed"
+        )
+        env_cfg.mpc_return_quasi_static_control = (
+            args_cli.debug_group == "static_fixed"
+        )
         env_cfg.mpc_torque_control_only = True
         env_cfg.mpc_use_raw_state_input = True
         env_cfg.mpc_reference_is_root_position = True
@@ -364,6 +369,7 @@ def main():
             f"{args_cli.debug_group} | "
             f"fixed_contacts={env_cfg.mpc_force_standing_contacts} | "
             f"warm_start={env_cfg.mpc_enable_warm_start} | "
+            f"quasi_static={env_cfg.mpc_return_quasi_static_control} | "
             "torque_only=True | raw_state=True | root_reference=True | "
             f"root_height={args_cli.debug_root_height:.3f}"
         )

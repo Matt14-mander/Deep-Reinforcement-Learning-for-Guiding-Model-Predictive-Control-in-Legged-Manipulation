@@ -119,4 +119,7 @@ def mpc_cfg_to_dict(cfg) -> Dict:
         "mpc_reference_is_root_position": bool(
             getattr(cfg, "mpc_reference_is_root_position", False)
         ),
+        "mpc_return_quasi_static_control": bool(
+            getattr(cfg, "mpc_return_quasi_static_control", False)
+        ),
     }

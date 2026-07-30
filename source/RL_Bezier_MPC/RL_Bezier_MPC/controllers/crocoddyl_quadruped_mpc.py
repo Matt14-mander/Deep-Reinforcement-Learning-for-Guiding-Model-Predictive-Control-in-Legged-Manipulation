@@ -89,6 +89,7 @@ class CrocoddylQuadrupedMPC(BaseMPC):
         force_standing_contacts: bool = False,
         enable_warm_start: bool = True,
         reference_is_root_position: bool = False,
+        return_quasi_static_control: bool = False,
     ):
         """Initialize MPC with all sub-components.
 
@@ -111,6 +112,8 @@ class CrocoddylQuadrupedMPC(BaseMPC):
             reference_is_root_position: Interpret incoming Bezier positions as
                 floating-base/root positions and translate them to true model
                 CoM positions before constructing Crocoddyl costs.
+            return_quasi_static_control: Diagnostic mode that bypasses FDDP and
+                returns the contact-consistent quasi-static control directly.
         """
         if not CROCODDYL_AVAILABLE:
             raise ImportError(
@@ -134,6 +137,7 @@ class CrocoddylQuadrupedMPC(BaseMPC):
         self.force_standing_contacts = force_standing_contacts
         self.enable_warm_start = enable_warm_start
         self.reference_is_root_position = reference_is_root_position
+        self.return_quasi_static_control = return_quasi_static_control
         self._solve_count = 0  # Track solve calls for selective verbose
 
         # Get frame IDs from names
@@ -413,6 +417,26 @@ class CrocoddylQuadrupedMPC(BaseMPC):
                     np.asarray(current_state, dtype=float).copy()
                     for _ in range(T + 1)
                 ]
+
+            if self.return_quasi_static_control:
+                if is_verbose_call:
+                    print(
+                        "  Diagnostic bypass: returning quasi-static control "
+                        "without FDDP",
+                        flush=True,
+                    )
+                solve_time = time.time() - start_time
+                return MPCSolution(
+                    control=np.asarray(us_init[0]).copy(),
+                    predicted_states=np.asarray(xs_init),
+                    predicted_controls=np.asarray(us_init),
+                    solve_time=solve_time,
+                    converged=rollout_is_finite,
+                    # Keep the environment guard out of this controlled test;
+                    # rollout validity is reported separately above.
+                    cost=0.0 if rollout_is_finite else float("inf"),
+                    iterations=0,
+                )
 
         # Solve.
         # A shifted warm-start can contain dynamics gaps after replacing x0,

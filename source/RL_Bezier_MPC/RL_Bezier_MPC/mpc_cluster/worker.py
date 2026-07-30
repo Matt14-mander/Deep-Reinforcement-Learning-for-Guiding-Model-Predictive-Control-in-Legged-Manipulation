@@ -88,6 +88,9 @@ def build_default_controllers(env_ids: Iterable[int], mpc_cfg: Dict) -> Dict[int
             reference_is_root_position=bool(
                 mpc_cfg.get("mpc_reference_is_root_position", False)
             ),
+            return_quasi_static_control=bool(
+                mpc_cfg.get("mpc_return_quasi_static_control", False)
+            ),
         )
     return controllers
 
