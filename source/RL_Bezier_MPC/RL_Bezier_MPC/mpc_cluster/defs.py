@@ -113,6 +113,9 @@ def mpc_cfg_to_dict(cfg) -> Dict:
         "mpc_force_standing_contacts": bool(
             getattr(cfg, "mpc_force_standing_contacts", False)
         ),
+        "mpc_use_demo_stabilization_weights": bool(
+            getattr(cfg, "mpc_use_demo_stabilization_weights", False)
+        ),
         "mpc_enable_warm_start": bool(
             getattr(cfg, "mpc_enable_warm_start", True)
         ),

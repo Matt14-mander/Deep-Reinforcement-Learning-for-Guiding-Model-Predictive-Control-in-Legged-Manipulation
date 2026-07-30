@@ -82,6 +82,9 @@ def build_default_controllers(env_ids: Iterable[int], mpc_cfg: Dict) -> Dict[int
             force_standing_contacts=bool(
                 mpc_cfg.get("mpc_force_standing_contacts", False)
             ),
+            use_demo_stabilization_weights=bool(
+                mpc_cfg.get("mpc_use_demo_stabilization_weights", False)
+            ),
             enable_warm_start=bool(
                 mpc_cfg.get("mpc_enable_warm_start", True)
             ),

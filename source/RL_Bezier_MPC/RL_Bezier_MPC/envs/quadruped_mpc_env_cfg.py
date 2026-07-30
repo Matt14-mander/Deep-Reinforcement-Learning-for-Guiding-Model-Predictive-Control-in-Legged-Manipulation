@@ -142,6 +142,7 @@ class QuadrupedMPCEnvCfg(DirectRLEnvCfg):
     # Diagnostic switches. Production training keeps the existing behaviour;
     # the standalone diagnostic overrides one dimension at a time.
     mpc_force_standing_contacts: bool = False
+    mpc_use_demo_stabilization_weights: bool = False
     mpc_enable_warm_start: bool = True
     mpc_use_raw_state_input: bool = False
     # Diagnostic A/B switch. The current Bezier generator is anchored at the

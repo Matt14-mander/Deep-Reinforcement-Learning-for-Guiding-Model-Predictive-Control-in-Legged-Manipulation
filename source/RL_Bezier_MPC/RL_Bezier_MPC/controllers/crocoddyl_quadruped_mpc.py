@@ -87,6 +87,7 @@ class CrocoddylQuadrupedMPC(BaseMPC):
         convergence_threshold: float = 1e-4,
         verbose: bool = False,
         force_standing_contacts: bool = False,
+        use_demo_stabilization_weights: bool = False,
         enable_warm_start: bool = True,
         reference_is_root_position: bool = False,
         return_quasi_static_control: bool = False,
@@ -135,6 +136,7 @@ class CrocoddylQuadrupedMPC(BaseMPC):
         self.convergence_threshold = convergence_threshold
         self.verbose = verbose
         self.force_standing_contacts = force_standing_contacts
+        self.use_demo_stabilization_weights = use_demo_stabilization_weights
         self.enable_warm_start = enable_warm_start
         self.reference_is_root_position = reference_is_root_position
         self.return_quasi_static_control = return_quasi_static_control
@@ -162,7 +164,7 @@ class CrocoddylQuadrupedMPC(BaseMPC):
             rmodel=rmodel,
             foot_frame_ids=self.foot_frame_ids,
             mu=mu,
-            use_demo_stabilization_weights=force_standing_contacts,
+            use_demo_stabilization_weights=use_demo_stabilization_weights,
         )
 
         # State and actuation from factory
@@ -347,7 +349,7 @@ class CrocoddylQuadrupedMPC(BaseMPC):
                 f"fixed_contacts={self.force_standing_contacts}, "
                 f"warm_start_enabled={self.enable_warm_start}, "
                 f"root_reference={self.reference_is_root_position}, "
-                f"demo_weights={self.force_standing_contacts}",
+                f"demo_weights={self.use_demo_stabilization_weights}",
                 flush=True,
             )
             print(
