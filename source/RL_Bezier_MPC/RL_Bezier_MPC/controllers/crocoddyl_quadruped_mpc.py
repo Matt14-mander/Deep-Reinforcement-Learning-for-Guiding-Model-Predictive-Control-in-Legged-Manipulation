@@ -587,6 +587,9 @@ class CrocoddylQuadrupedMPC(BaseMPC):
             import sys
             sys.stdout.flush()
 
+        if self.verbose and solver.cost >= 1e4:
+            self._print_cost_breakdown(problem, solver)
+
         solve_time = time.time() - start_time
 
         # Extract solution
@@ -622,6 +625,63 @@ class CrocoddylQuadrupedMPC(BaseMPC):
             cost=float(solver.cost),
             iterations=int(solver.iter),
         )
+
+    def _print_cost_breakdown(self, problem: Any, solver: Any) -> None:
+        """Print weighted residual contributions for an abnormally costly solve.
+
+        This diagnostic is guarded against Crocoddyl API differences so a
+        failed inspection can never interrupt MPC control.
+        """
+        try:
+            problem.calc(solver.xs, solver.us)
+            totals: Dict[str, float] = {}
+            node_costs: List[float] = []
+
+            def accumulate(model: Any, data: Any, prefix: str = "") -> None:
+                model_costs = model.differential.costs.costs
+                data_costs = data.differential.costs.costs
+                raw_contributions = []
+                for name, item in model_costs.items():
+                    if name not in data_costs:
+                        continue
+                    value = float(item.weight) * float(data_costs[name].cost)
+                    raw_contributions.append((str(name), value))
+
+                raw_total = sum(value for _, value in raw_contributions)
+                integrated_total = float(data.cost)
+                scale = integrated_total / raw_total if raw_total > 0.0 else 0.0
+                for name, value in raw_contributions:
+                    key = f"{prefix}{name}"
+                    totals[key] = totals.get(key, 0.0) + value * scale
+
+            for model, data in zip(problem.runningModels, problem.runningDatas):
+                node_costs.append(float(data.cost))
+                accumulate(model, data)
+
+            terminal_cost = float(problem.terminalData.cost)
+            accumulate(problem.terminalModel, problem.terminalData, "terminal/")
+            ranked = sorted(totals.items(), key=lambda item: item[1], reverse=True)
+            max_node = int(np.argmax(node_costs)) if node_costs else -1
+            max_node_cost = node_costs[max_node] if node_costs else 0.0
+
+            print(
+                f"[MPC Cost Breakdown] solve={self._solve_count} "
+                f"total={float(solver.cost):.1f} max_running_node={max_node} "
+                f"node_cost={max_node_cost:.1f} terminal={terminal_cost:.1f}",
+                flush=True,
+            )
+            print(
+                "  "
+                + ", ".join(
+                    f"{name}={value:.1f}" for name, value in ranked[:10]
+                ),
+                flush=True,
+            )
+        except Exception as exc:
+            print(
+                f"[MPC Cost Breakdown] unavailable: {type(exc).__name__}: {exc}",
+                flush=True,
+            )
 
     def _compute_gravity_compensation(self, state: np.ndarray) -> np.ndarray:
         """Compute gravity compensation torques for the current configuration.
