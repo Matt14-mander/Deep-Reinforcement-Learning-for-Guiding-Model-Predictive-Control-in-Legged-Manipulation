@@ -144,6 +144,7 @@ class QuadrupedMPCEnvCfg(DirectRLEnvCfg):
     mpc_force_standing_contacts: bool = False
     mpc_use_demo_stabilization_weights: bool = False
     mpc_initial_full_support_duration: float = 0.0
+    mpc_use_feasible_cold_start_rollout: bool = True
     mpc_enable_warm_start: bool = True
     mpc_use_raw_state_input: bool = False
     # Diagnostic A/B switch. The current Bezier generator is anchored at the

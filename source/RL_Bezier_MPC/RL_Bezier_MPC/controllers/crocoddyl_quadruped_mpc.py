@@ -89,6 +89,7 @@ class CrocoddylQuadrupedMPC(BaseMPC):
         force_standing_contacts: bool = False,
         use_demo_stabilization_weights: bool = False,
         initial_full_support_duration: float = 0.0,
+        use_feasible_cold_start_rollout: bool = True,
         enable_warm_start: bool = True,
         reference_is_root_position: bool = False,
         return_quasi_static_control: bool = False,
@@ -141,6 +142,7 @@ class CrocoddylQuadrupedMPC(BaseMPC):
         self.initial_full_support_duration = max(
             0.0, float(initial_full_support_duration)
         )
+        self.use_feasible_cold_start_rollout = use_feasible_cold_start_rollout
         self.enable_warm_start = enable_warm_start
         self.reference_is_root_position = reference_is_root_position
         self.return_quasi_static_control = return_quasi_static_control
@@ -370,7 +372,8 @@ class CrocoddylQuadrupedMPC(BaseMPC):
                 f"warm_start_enabled={self.enable_warm_start}, "
                 f"root_reference={self.reference_is_root_position}, "
                 f"demo_weights={self.use_demo_stabilization_weights}, "
-                f"initial_support={self.initial_full_support_duration:.3f}s",
+                f"initial_support={self.initial_full_support_duration:.3f}s, "
+                f"feasible_cold_start={self.use_feasible_cold_start_rollout}",
                 flush=True,
             )
             print(
@@ -422,9 +425,25 @@ class CrocoddylQuadrupedMPC(BaseMPC):
             x_static = np.asarray(current_state, dtype=float).copy()
             x_static[self.rmodel.nq :] = 0.0
             us_init = list(problem.quasiStatic([x_static.copy() for _ in range(T)]))
-            xs_init = list(problem.rollout(us_init))
-            rollout_array = np.asarray(xs_init)
+            rollout_xs = list(problem.rollout(us_init))
+            rollout_array = np.asarray(rollout_xs)
             rollout_is_finite = bool(np.all(np.isfinite(rollout_array)))
+            if self.use_feasible_cold_start_rollout and rollout_is_finite:
+                xs_init = rollout_xs
+                cold_start_is_feasible = True
+                cold_start_mode = "feasible rollout"
+            else:
+                # Crocoddyl's locomotion examples initialize switching-contact
+                # problems with repeated states and quasi-static controls, then
+                # let FDDP close the dynamics gaps. A feasible rollout can fall
+                # far away from the task before the first touchdown and create
+                # a catastrophically poor initial candidate.
+                xs_init = [
+                    np.asarray(current_state, dtype=float).copy()
+                    for _ in range(T + 1)
+                ]
+                cold_start_is_feasible = False
+                cold_start_mode = "repeated state (FDDP infeasible guess)"
             if is_verbose_call:
                 u0_static = np.asarray(us_init[0])
                 print(
@@ -437,6 +456,7 @@ class CrocoddylQuadrupedMPC(BaseMPC):
                     flush=True,
                 )
                 print(f"  Rollout finite: {rollout_is_finite}", flush=True)
+                print(f"  Cold-start state guess: {cold_start_mode}", flush=True)
                 if not rollout_is_finite:
                     bad_index = np.argwhere(~np.isfinite(rollout_array))[0]
                     print(
@@ -444,14 +464,6 @@ class CrocoddylQuadrupedMPC(BaseMPC):
                         f"node={int(bad_index[0])}, state_index={int(bad_index[1])}",
                         flush=True,
                     )
-            if not rollout_is_finite:
-                # Keep FDDP inputs finite so it can handle the dynamics gaps,
-                # while the diagnostic above still exposes the failed rollout.
-                xs_init = [
-                    np.asarray(current_state, dtype=float).copy()
-                    for _ in range(T + 1)
-                ]
-
             if self.return_quasi_static_control:
                 if is_verbose_call:
                     print(
@@ -477,7 +489,9 @@ class CrocoddylQuadrupedMPC(BaseMPC):
         # while the cold rollout is feasible by construction.
         COLD_START_ITERS = 100
         n_iters = self.max_iterations if use_warm_start else COLD_START_ITERS
-        initial_guess_feasible = not use_warm_start and rollout_is_finite
+        initial_guess_feasible = (
+            False if use_warm_start else cold_start_is_feasible
+        )
         if is_verbose_call:
             print(
                 f"  Initial guess: xs={len(xs_init)}, us={len(us_init)}, "

@@ -69,7 +69,13 @@ parser.add_argument(
 )
 parser.add_argument(
     "--debug_group",
-    choices=["static_fixed", "cold_fixed", "warm_fixed", "warm_trot"],
+    choices=[
+        "static_fixed",
+        "cold_fixed",
+        "warm_fixed",
+        "warm_trot",
+        "warm_trot_infeasible_init",
+    ],
     default=None,
     help=(
         "Controlled isolation experiment: quasi-static/fixed contacts, cold/fixed contacts, "
@@ -349,8 +355,11 @@ def main():
         # Keep the validated Crocoddyl demo weights identical across the
         # controlled groups. warm_trot must change only the contact schedule.
         env_cfg.mpc_use_demo_stabilization_weights = True
-        env_cfg.mpc_initial_full_support_duration = (
-            0.10 if args_cli.debug_group == "warm_trot" else 0.0
+        env_cfg.mpc_initial_full_support_duration = 0.10 if args_cli.debug_group in (
+            "warm_trot", "warm_trot_infeasible_init"
+        ) else 0.0
+        env_cfg.mpc_use_feasible_cold_start_rollout = (
+            args_cli.debug_group != "warm_trot_infeasible_init"
         )
         env_cfg.mpc_enable_warm_start = args_cli.debug_group not in (
             "static_fixed", "cold_fixed"
@@ -377,6 +386,7 @@ def main():
             f"warm_start={env_cfg.mpc_enable_warm_start} | "
             f"demo_weights={env_cfg.mpc_use_demo_stabilization_weights} | "
             f"initial_support={env_cfg.mpc_initial_full_support_duration:.2f}s | "
+            f"feasible_cold_start={env_cfg.mpc_use_feasible_cold_start_rollout} | "
             f"quasi_static={env_cfg.mpc_return_quasi_static_control} | "
             "torque_only=True | raw_state=True | root_reference=True | "
             f"root_height={args_cli.debug_root_height:.3f}"

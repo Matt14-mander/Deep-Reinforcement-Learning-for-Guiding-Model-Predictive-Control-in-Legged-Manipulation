@@ -139,6 +139,7 @@ class QuadrupedMPCEnv(DirectRLEnv):
                     force_standing_contacts=cfg.mpc_force_standing_contacts,
                     use_demo_stabilization_weights=cfg.mpc_use_demo_stabilization_weights,
                     initial_full_support_duration=cfg.mpc_initial_full_support_duration,
+                    use_feasible_cold_start_rollout=cfg.mpc_use_feasible_cold_start_rollout,
                     enable_warm_start=cfg.mpc_enable_warm_start,
                     reference_is_root_position=cfg.mpc_reference_is_root_position,
                     return_quasi_static_control=cfg.mpc_return_quasi_static_control,
