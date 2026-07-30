@@ -76,6 +76,15 @@ parser.add_argument(
         "warm/fixed contacts, or warm/trot contacts"
     ),
 )
+parser.add_argument(
+    "--debug_root_height",
+    type=float,
+    default=0.31,
+    help=(
+        "Initial Go2 root height for isolation groups. 0.31 m places the "
+        "foot-frame origins near the approximately 0.02 m contact radius."
+    ),
+)
 
 # AppLauncher arguments (adds --headless, --device, --livestream, etc.)
 AppLauncher.add_app_launcher_args(parser)
@@ -340,12 +349,22 @@ def main():
         env_cfg.mpc_enable_warm_start = args_cli.debug_group != "cold_fixed"
         env_cfg.mpc_torque_control_only = True
         env_cfg.mpc_use_raw_state_input = True
+        env_cfg.initial_pos_range = (
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            args_cli.debug_root_height,
+            args_cli.debug_root_height,
+        )
+        env_cfg.initial_yaw_range = (0.0, 0.0)
         print(
             "Isolation group: "
             f"{args_cli.debug_group} | "
             f"fixed_contacts={env_cfg.mpc_force_standing_contacts} | "
             f"warm_start={env_cfg.mpc_enable_warm_start} | "
-            "torque_only=True | raw_state=True"
+            "torque_only=True | raw_state=True | "
+            f"root_height={args_cli.debug_root_height:.3f}"
         )
 
     if env_cfg.use_mpc_cluster:

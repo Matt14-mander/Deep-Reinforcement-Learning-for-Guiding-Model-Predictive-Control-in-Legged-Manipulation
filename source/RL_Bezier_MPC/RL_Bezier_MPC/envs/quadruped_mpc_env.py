@@ -812,10 +812,21 @@ class QuadrupedMPCEnv(DirectRLEnv):
             raw_torque = out["torques"][0]
             q_target_pin = out["qpos"][0]
             q_current_pin = robot_states[0, 7:19]
+            foot_z = foot_pos[0].reshape(4, 3)[:, 2]
+            contact_forces = self.foot_contact_sensor.data.net_forces_w[
+                0, self._contact_sensor_foot_indices, :
+            ]
+            physical_contacts = (
+                torch.linalg.vector_norm(contact_forces, dim=-1)
+                > self.cfg.foot_contact_force_threshold
+            ).to(device="cpu").numpy()
+            contact_bits = "".join("1" if value else "0" for value in physical_contacts)
             print(
                 f"[MPC Tick {self._mpc_debug_tick:02d}] "
                 f"z={robot_states[0, 2]:.3f} "
                 f"vz={robot_states[0, 21]:+.3f} "
+                f"foot_z=[{','.join(f'{value:.3f}' for value in foot_z)}] "
+                f"phys_contact={contact_bits} "
                 f"cost={float(out['cost'][0]):.1f} "
                 f"status={int(out['status'][0])} "
                 f"conv={bool(out['converged'][0])} "
