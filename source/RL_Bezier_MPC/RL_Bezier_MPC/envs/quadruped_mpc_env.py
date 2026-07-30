@@ -813,7 +813,8 @@ class QuadrupedMPCEnv(DirectRLEnv):
             gait=gait_mods,
         )
 
-        if self.cfg.mpc_verbose and self._mpc_debug_tick < 20:
+        # Cover both diagonal swing transitions during standalone diagnostics.
+        if self.cfg.mpc_verbose and self._mpc_debug_tick < 50:
             raw_torque = out["torques"][0]
             q_target_pin = out["qpos"][0]
             q_current_pin = robot_states[0, 7:19]
