@@ -116,6 +116,9 @@ def mpc_cfg_to_dict(cfg) -> Dict:
         "mpc_use_demo_stabilization_weights": bool(
             getattr(cfg, "mpc_use_demo_stabilization_weights", False)
         ),
+        "mpc_friction_cone_weight": float(
+            getattr(cfg, "mpc_friction_cone_weight", -1.0)
+        ),
         "mpc_initial_full_support_duration": float(
             getattr(cfg, "mpc_initial_full_support_duration", 0.0)
         ),

@@ -92,6 +92,15 @@ parser.add_argument(
         "foot-frame origins near the approximately 0.02 m contact radius."
     ),
 )
+parser.add_argument(
+    "--debug_friction_cone_weight",
+    type=float,
+    default=None,
+    help=(
+        "Override only the Crocoddyl friction-cone barrier weight for a "
+        "controlled A/B test (official quadrupedal-gait reference: 1e1)."
+    ),
+)
 
 # AppLauncher arguments (adds --headless, --device, --livestream, etc.)
 AppLauncher.add_app_launcher_args(parser)
@@ -356,6 +365,8 @@ def main():
         # Keep the validated Crocoddyl demo weights identical across the
         # controlled groups. warm_trot must change only the contact schedule.
         env_cfg.mpc_use_demo_stabilization_weights = True
+        if args_cli.debug_friction_cone_weight is not None:
+            env_cfg.mpc_friction_cone_weight = args_cli.debug_friction_cone_weight
         env_cfg.mpc_initial_full_support_duration = 0.10 if args_cli.debug_group in (
             "warm_trot",
             "cold_trot_infeasible_init",
@@ -389,6 +400,7 @@ def main():
             f"fixed_contacts={env_cfg.mpc_force_standing_contacts} | "
             f"warm_start={env_cfg.mpc_enable_warm_start} | "
             f"demo_weights={env_cfg.mpc_use_demo_stabilization_weights} | "
+            f"friction_weight={env_cfg.mpc_friction_cone_weight:.1e} | "
             f"initial_support={env_cfg.mpc_initial_full_support_duration:.2f}s | "
             f"feasible_cold_start={env_cfg.mpc_use_feasible_cold_start_rollout} | "
             f"quasi_static={env_cfg.mpc_return_quasi_static_control} | "

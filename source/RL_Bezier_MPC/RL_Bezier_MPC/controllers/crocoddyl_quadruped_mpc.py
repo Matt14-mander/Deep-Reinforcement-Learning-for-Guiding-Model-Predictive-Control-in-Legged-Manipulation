@@ -88,6 +88,7 @@ class CrocoddylQuadrupedMPC(BaseMPC):
         verbose: bool = False,
         force_standing_contacts: bool = False,
         use_demo_stabilization_weights: bool = False,
+        friction_cone_weight: Optional[float] = None,
         initial_full_support_duration: float = 0.0,
         use_feasible_cold_start_rollout: bool = False,
         enable_warm_start: bool = True,
@@ -112,6 +113,9 @@ class CrocoddylQuadrupedMPC(BaseMPC):
             max_iterations: Maximum FDDP solver iterations.
             convergence_threshold: Solver convergence threshold.
             verbose: If True, print detailed solver info for debugging.
+            friction_cone_weight: Optional override for the weighted friction-cone
+                barrier. This is exposed for controlled diagnostics; ``None``
+                preserves the factory default.
             reference_is_root_position: Interpret incoming Bezier positions as
                 floating-base/root positions and translate them to true model
                 CoM positions before constructing Crocoddyl costs.
@@ -139,6 +143,7 @@ class CrocoddylQuadrupedMPC(BaseMPC):
         self.verbose = verbose
         self.force_standing_contacts = force_standing_contacts
         self.use_demo_stabilization_weights = use_demo_stabilization_weights
+        self.friction_cone_weight = friction_cone_weight
         self.initial_full_support_duration = max(
             0.0, float(initial_full_support_duration)
         )
@@ -170,6 +175,11 @@ class CrocoddylQuadrupedMPC(BaseMPC):
             rmodel=rmodel,
             foot_frame_ids=self.foot_frame_ids,
             mu=mu,
+            weights=(
+                {"friction_cone": float(friction_cone_weight)}
+                if friction_cone_weight is not None
+                else None
+            ),
             use_demo_stabilization_weights=use_demo_stabilization_weights,
         )
 
@@ -435,7 +445,8 @@ class CrocoddylQuadrupedMPC(BaseMPC):
                 f"com={self.ocp_factory.weights['com_track']:.1e}, "
                 f"foot={self.ocp_factory.weights['foot_track']:.1e}, "
                 f"state={self.ocp_factory.weights['state_reg']:.1e}, "
-                f"control={self.ocp_factory.weights['ctrl_reg']:.1e}",
+                f"control={self.ocp_factory.weights['ctrl_reg']:.1e}, "
+                f"friction={self.ocp_factory.weights['friction_cone']:.1e}",
                 flush=True,
             )
             print(

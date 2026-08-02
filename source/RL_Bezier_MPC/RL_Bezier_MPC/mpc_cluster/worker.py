@@ -85,6 +85,11 @@ def build_default_controllers(env_ids: Iterable[int], mpc_cfg: Dict) -> Dict[int
             use_demo_stabilization_weights=bool(
                 mpc_cfg.get("mpc_use_demo_stabilization_weights", False)
             ),
+            friction_cone_weight=(
+                float(mpc_cfg["mpc_friction_cone_weight"])
+                if float(mpc_cfg.get("mpc_friction_cone_weight", -1.0)) >= 0.0
+                else None
+            ),
             initial_full_support_duration=float(
                 mpc_cfg.get("mpc_initial_full_support_duration", 0.0)
             ),

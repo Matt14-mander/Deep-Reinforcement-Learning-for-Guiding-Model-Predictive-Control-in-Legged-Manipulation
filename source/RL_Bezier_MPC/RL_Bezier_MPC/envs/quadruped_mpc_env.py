@@ -138,6 +138,11 @@ class QuadrupedMPCEnv(DirectRLEnv):
                     verbose=(cfg.mpc_verbose and _ == 0),  # Only verbose for env 0
                     force_standing_contacts=cfg.mpc_force_standing_contacts,
                     use_demo_stabilization_weights=cfg.mpc_use_demo_stabilization_weights,
+                    friction_cone_weight=(
+                        cfg.mpc_friction_cone_weight
+                        if cfg.mpc_friction_cone_weight >= 0.0
+                        else None
+                    ),
                     initial_full_support_duration=cfg.mpc_initial_full_support_duration,
                     use_feasible_cold_start_rollout=cfg.mpc_use_feasible_cold_start_rollout,
                     enable_warm_start=cfg.mpc_enable_warm_start,
