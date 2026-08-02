@@ -842,6 +842,14 @@ class QuadrupedMPCEnv(DirectRLEnv):
                 torch.linalg.vector_norm(contact_forces, dim=-1)
                 > self.cfg.foot_contact_force_threshold
             ).to(device="cpu").numpy()
+            contact_force_z = contact_forces[:, 2].to(device="cpu").numpy()
+            # Both arrays below are already in Pinocchio's by-leg order
+            # LF/RF/LH/RH, three joints per leg. Per-leg diagnostics expose a
+            # rear-leg tracking or torque asymmetry hidden by the global norm.
+            q_error_by_leg = np.linalg.norm(
+                (q_target_pin - q_current_pin).reshape(4, 3), axis=1
+            )
+            torque_by_leg = np.linalg.norm(raw_torque.reshape(4, 3), axis=1)
             contact_bits = "".join("1" if value else "0" for value in physical_contacts)
             print(
                 f"[MPC Tick {self._mpc_debug_tick:02d}] "
@@ -850,12 +858,14 @@ class QuadrupedMPCEnv(DirectRLEnv):
                 f"vz={robot_states[0, 21]:+.3f} "
                 f"foot_z=[{','.join(f'{value:.3f}' for value in foot_z)}] "
                 f"phys_contact={contact_bits} "
+                f"fz=[{','.join(f'{value:.1f}' for value in contact_force_z)}] "
                 f"cost={float(out['cost'][0]):.1f} "
                 f"status={int(out['status'][0])} "
                 f"conv={bool(out['converged'][0])} "
                 f"|u|={np.linalg.norm(raw_torque):.2f} "
                 f"max|u|={np.max(np.abs(raw_torque)):.2f} "
-                f"|q_target-q|={np.linalg.norm(q_target_pin - q_current_pin):.3f}",
+                f"leg_qerr=[{','.join(f'{value:.3f}' for value in q_error_by_leg)}] "
+                f"leg_u=[{','.join(f'{value:.2f}' for value in torque_by_leg)}]",
                 flush=True,
             )
         self._mpc_debug_tick += 1
