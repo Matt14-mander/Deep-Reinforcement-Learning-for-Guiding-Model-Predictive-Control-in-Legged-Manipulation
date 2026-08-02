@@ -493,6 +493,77 @@ class OCPFactory:
 
         return model
 
+    def build_pseudo_impulse_node(
+        self,
+        support_foot_targets: List[Tuple[int, np.ndarray]],
+        landed_foot_targets: List[Tuple[int, np.ndarray]],
+    ) -> Any:
+        """Build a zero-time, fixed-control-dimension touchdown node.
+
+        A true impulse action has ``nu=0``.  That is valid for an offline
+        shooting problem, but it breaks the one-node receding-horizon shift
+        used by this controller whenever an impulse enters or leaves the
+        horizon.  The pseudo-impulse keeps ``nu=self.nu`` while imposing the
+        post-touchdown contacts and strongly damping the newly landed feet.
+        """
+        contact_model = crocoddyl.ContactModelMultiple(self.state, self.nu)
+        for foot_id, contact_position in support_foot_targets:
+            contact = crocoddyl.ContactModel3D(
+                self.state,
+                foot_id,
+                np.asarray(contact_position, dtype=float),
+                pinocchio.LOCAL_WORLD_ALIGNED,
+                self.nu,
+                self.CONTACT_GAINS.copy(),
+            )
+            contact_model.addContact(f"contact_{foot_id}", contact)
+
+        cost_model = crocoddyl.CostModelSum(self.state, self.nu)
+
+        for foot_id, target_pos in landed_foot_targets:
+            position_residual = crocoddyl.ResidualModelFrameTranslation(
+                self.state, foot_id, np.asarray(target_pos, dtype=float), self.nu
+            )
+            position_cost = crocoddyl.CostModelResidual(
+                self.state, position_residual
+            )
+            cost_model.addCost(
+                f"footTrack_{foot_id}",
+                position_cost,
+                self.weights["foot_track"],
+            )
+
+            velocity_residual = crocoddyl.ResidualModelFrameVelocity(
+                self.state,
+                foot_id,
+                pinocchio.Motion.Zero(),
+                pinocchio.LOCAL_WORLD_ALIGNED,
+                self.nu,
+            )
+            velocity_cost = crocoddyl.CostModelResidual(
+                self.state, velocity_residual
+            )
+            cost_model.addCost(
+                f"impactVel_{foot_id}", velocity_cost, 1e4
+            )
+
+        state_residual = crocoddyl.ResidualModelState(
+            self.state, self.x0, self.nu
+        )
+        state_cost = crocoddyl.CostModelResidual(self.state, state_residual)
+        cost_model.addCost("stateReg", state_cost, self.weights["state_reg"])
+
+        control_residual = crocoddyl.ResidualModelControl(self.state, self.nu)
+        control_cost = crocoddyl.CostModelResidual(
+            self.state, control_residual
+        )
+        cost_model.addCost("ctrlReg", control_cost, self.weights["ctrl_reg"])
+
+        differential_model = crocoddyl.DifferentialActionModelContactFwdDynamics(
+            self.state, self.actuation, contact_model, cost_model
+        )
+        return crocoddyl.IntegratedActionModelEuler(differential_model, 0.0)
+
     def build_terminal_node(
         self,
         com_target: Optional[np.ndarray] = None,
@@ -671,8 +742,11 @@ class OCPFactory:
             # foot velocity through enormous friction-cone penalties.  Insert
             # a zero-time impulse node before that support phase instead.
             if phase.phase_type == "support" and touchdown_targets:
-                support_ids = [
-                    self.foot_frame_ids[foot]
+                support_targets = [
+                    (
+                        self.foot_frame_ids[foot],
+                        np.asarray(stance_positions[foot], dtype=float),
+                    )
                     for foot in phase.support_feet
                     if foot in self.foot_frame_ids
                 ]
@@ -682,9 +756,9 @@ class OCPFactory:
                     if foot in self.foot_frame_ids
                 ]
                 running_models.append(
-                    self.build_impulse_node(
-                        new_support_foot_ids=support_ids,
-                        swing_foot_targets=landed_targets,
+                    self.build_pseudo_impulse_node(
+                        support_foot_targets=support_targets,
+                        landed_foot_targets=landed_targets,
                     )
                 )
 
