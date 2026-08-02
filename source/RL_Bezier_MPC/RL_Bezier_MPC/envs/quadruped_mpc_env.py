@@ -194,6 +194,13 @@ class QuadrupedMPCEnv(DirectRLEnv):
             (self.num_envs, cfg.num_bezier_waypoints, 3)
         )
 
+        # Keep the vertical trajectory origin fixed for the whole episode.
+        # Re-anchoring z to the measured root height at every 5 Hz policy
+        # refresh turns accumulated tracking error into the next reference and
+        # causes a slow, irreversible body-height drift. Horizontal references
+        # remain receding-horizon and continue to start at the current x/y.
+        self._trajectory_anchor_heights = np.zeros(self.num_envs, dtype=float)
+
         # Trajectory phase (current timestep within trajectory)
         self.trajectory_phases = np.zeros(self.num_envs, dtype=np.int32)
 
@@ -724,7 +731,8 @@ class QuadrupedMPCEnv(DirectRLEnv):
         # Check if time to update trajectory
         if self.mpc_step_counter[env_idx] % self.cfg.rl_policy_period == 0:
             # Generate new CoM trajectory from Bezier parameters
-            current_pos = robot_states[env_idx, :3]
+            current_pos = np.asarray(robot_states[env_idx, :3], dtype=float).copy()
+            current_pos[2] = self._trajectory_anchor_heights[env_idx]
             new_trajectory = self.trajectory_generator.params_to_waypoints(
                 params=bezier_params[env_idx],
                 dt=self.cfg.mpc_dt,
@@ -837,6 +845,7 @@ class QuadrupedMPCEnv(DirectRLEnv):
             print(
                 f"[MPC Tick {self._mpc_debug_tick:02d}] "
                 f"z={robot_states[0, 2]:.3f} "
+                f"ref_z0={com_refs[0, 0, 2]:.3f} "
                 f"vz={robot_states[0, 21]:+.3f} "
                 f"foot_z=[{','.join(f'{value:.3f}' for value in foot_z)}] "
                 f"phys_contact={contact_bits} "
@@ -1380,6 +1389,7 @@ class QuadrupedMPCEnv(DirectRLEnv):
 
             # Initialize trajectory towards target
             start_pos = random_pos[idx].cpu().numpy()
+            self._trajectory_anchor_heights[env_idx] = float(start_pos[2])
             initial_params = self._generate_initial_bezier_params(
                 start_pos, target
             )
