@@ -107,6 +107,7 @@ class OCPFactory:
         fwddyn: bool = True,
         weights: Optional[Dict[str, float]] = None,
         use_demo_stabilization_weights: bool = False,
+        use_pseudo_impulse: bool = True,
     ):
         """Initialize factory with robot model and cost weights.
 
@@ -133,6 +134,7 @@ class OCPFactory:
         self.integrator = integrator
         self.fwddyn = fwddyn
         self.use_demo_stabilization_weights = use_demo_stabilization_weights
+        self.use_pseudo_impulse = use_pseudo_impulse
 
         # Merge weights with defaults
         self.weights = self.DEFAULT_WEIGHTS.copy()
@@ -741,7 +743,11 @@ class OCPFactory:
             # dynamics node makes the first support node fight the incoming
             # foot velocity through enormous friction-cone penalties.  Insert
             # a zero-time impulse node before that support phase instead.
-            if phase.phase_type == "support" and touchdown_targets:
+            if (
+                self.use_pseudo_impulse
+                and phase.phase_type == "support"
+                and touchdown_targets
+            ):
                 support_targets = [
                     (
                         self.foot_frame_ids[foot],

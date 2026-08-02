@@ -90,6 +90,9 @@ def build_default_controllers(env_ids: Iterable[int], mpc_cfg: Dict) -> Dict[int
                 if float(mpc_cfg.get("mpc_friction_cone_weight", -1.0)) >= 0.0
                 else None
             ),
+            use_pseudo_impulse=bool(
+                mpc_cfg.get("mpc_use_pseudo_impulse", True)
+            ),
             initial_full_support_duration=float(
                 mpc_cfg.get("mpc_initial_full_support_duration", 0.0)
             ),

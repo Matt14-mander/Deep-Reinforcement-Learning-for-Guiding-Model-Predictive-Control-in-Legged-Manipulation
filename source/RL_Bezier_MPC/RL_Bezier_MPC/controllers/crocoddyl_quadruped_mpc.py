@@ -89,6 +89,7 @@ class CrocoddylQuadrupedMPC(BaseMPC):
         force_standing_contacts: bool = False,
         use_demo_stabilization_weights: bool = False,
         friction_cone_weight: Optional[float] = None,
+        use_pseudo_impulse: bool = True,
         initial_full_support_duration: float = 0.0,
         use_feasible_cold_start_rollout: bool = False,
         enable_warm_start: bool = True,
@@ -116,6 +117,8 @@ class CrocoddylQuadrupedMPC(BaseMPC):
             friction_cone_weight: Optional override for the weighted friction-cone
                 barrier. This is exposed for controlled diagnostics; ``None``
                 preserves the factory default.
+            use_pseudo_impulse: Insert the legacy zero-time touchdown node.
+                Exposed so diagnostics can isolate its timing effect.
             reference_is_root_position: Interpret incoming Bezier positions as
                 floating-base/root positions and translate them to true model
                 CoM positions before constructing Crocoddyl costs.
@@ -144,6 +147,7 @@ class CrocoddylQuadrupedMPC(BaseMPC):
         self.force_standing_contacts = force_standing_contacts
         self.use_demo_stabilization_weights = use_demo_stabilization_weights
         self.friction_cone_weight = friction_cone_weight
+        self.use_pseudo_impulse = use_pseudo_impulse
         self.initial_full_support_duration = max(
             0.0, float(initial_full_support_duration)
         )
@@ -181,6 +185,7 @@ class CrocoddylQuadrupedMPC(BaseMPC):
                 else None
             ),
             use_demo_stabilization_weights=use_demo_stabilization_weights,
+            use_pseudo_impulse=use_pseudo_impulse,
         )
 
         # State and actuation from factory
@@ -436,6 +441,7 @@ class CrocoddylQuadrupedMPC(BaseMPC):
                 f"warm_start_enabled={self.enable_warm_start}, "
                 f"root_reference={self.reference_is_root_position}, "
                 f"demo_weights={self.use_demo_stabilization_weights}, "
+                f"pseudo_impulse={self.use_pseudo_impulse}, "
                 f"initial_support={self.initial_full_support_duration:.3f}s, "
                 f"feasible_cold_start={self.use_feasible_cold_start_rollout}",
                 flush=True,

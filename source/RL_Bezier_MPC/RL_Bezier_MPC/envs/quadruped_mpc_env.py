@@ -143,6 +143,7 @@ class QuadrupedMPCEnv(DirectRLEnv):
                         if cfg.mpc_friction_cone_weight >= 0.0
                         else None
                     ),
+                    use_pseudo_impulse=cfg.mpc_use_pseudo_impulse,
                     initial_full_support_duration=cfg.mpc_initial_full_support_duration,
                     use_feasible_cold_start_rollout=cfg.mpc_use_feasible_cold_start_rollout,
                     enable_warm_start=cfg.mpc_enable_warm_start,
