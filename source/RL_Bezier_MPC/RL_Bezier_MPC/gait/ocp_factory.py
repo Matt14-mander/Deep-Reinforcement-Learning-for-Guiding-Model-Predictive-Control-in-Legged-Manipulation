@@ -238,6 +238,7 @@ class OCPFactory:
         support_foot_targets: List[Tuple[int, np.ndarray]],
         com_target: Optional[np.ndarray] = None,
         swing_foot_targets: Optional[List[Tuple[int, np.ndarray]]] = None,
+        touchdown_foot_targets: Optional[List[Tuple[int, np.ndarray]]] = None,
         body_yaw_target: Optional[float] = None,
     ) -> Any:
         """Build a single OCP node for a swing phase timestep.
@@ -264,6 +265,9 @@ class OCPFactory:
                 the multi-contact dynamics infeasible.
             com_target: Target CoM position, shape (3,). Optional.
             swing_foot_targets: List of (frame_id, target_pos) for swing feet.
+            touchdown_foot_targets: Newly landed feet on the first finite-time
+                support node. Their linear velocity is damped to zero so the
+                preceding swing controls prepare a low-speed touchdown.
             body_yaw_target: Target body yaw angle in radians. Optional.
 
         Returns:
@@ -306,6 +310,32 @@ class OCPFactory:
                 foot_cost = crocoddyl.CostModelResidual(self.state, foot_residual)
                 cost_model.addCost(
                     f"footTrack_{frame_id}", foot_cost, self.weights["foot_track"]
+                )
+
+        # The first real support node is evaluated at the touchdown state. A
+        # velocity residual here is therefore optimized through the preceding
+        # swing controls. This replaces the ineffective residual that used to
+        # live inside a dt=0 pseudo-impulse node. Point feet only require zero
+        # linear velocity; leave angular frame velocity unconstrained.
+        if touchdown_foot_targets is not None:
+            linear_velocity_activation = crocoddyl.ActivationModelWeightedQuad(
+                np.array([1.0, 1.0, 1.0, 0.0, 0.0, 0.0])
+            )
+            for frame_id, _ in touchdown_foot_targets:
+                velocity_residual = crocoddyl.ResidualModelFrameVelocity(
+                    self.state,
+                    frame_id,
+                    pinocchio.Motion.Zero(),
+                    pinocchio.LOCAL_WORLD_ALIGNED,
+                    self.nu,
+                )
+                velocity_cost = crocoddyl.CostModelResidual(
+                    self.state,
+                    linear_velocity_activation,
+                    velocity_residual,
+                )
+                cost_model.addCost(
+                    f"touchdownVel_{frame_id}", velocity_cost, 1e4
                 )
 
         # State regularization cost (weighted)
@@ -796,15 +826,16 @@ class OCPFactory:
 
                 # Get swing foot targets
                 swing_foot_targets = []
+                touchdown_foot_targets = []
                 if phase.phase_type == "support" and knot == 0:
                     for foot_name, target_pos in touchdown_targets.items():
                         if foot_name in self.foot_frame_ids:
-                            swing_foot_targets.append(
-                                (
-                                    self.foot_frame_ids[foot_name],
-                                    np.asarray(target_pos, dtype=float),
-                                )
+                            touchdown_target = (
+                                self.foot_frame_ids[foot_name],
+                                np.asarray(target_pos, dtype=float),
                             )
+                            swing_foot_targets.append(touchdown_target)
+                            touchdown_foot_targets.append(touchdown_target)
                 for foot_name in phase.swing_feet:
                     if foot_name not in self.foot_frame_ids:
                         continue
@@ -835,6 +866,9 @@ class OCPFactory:
                     support_foot_targets=support_foot_targets,
                     com_target=com_target,
                     swing_foot_targets=swing_foot_targets if swing_foot_targets else None,
+                    touchdown_foot_targets=(
+                        touchdown_foot_targets if touchdown_foot_targets else None
+                    ),
                     body_yaw_target=body_yaw_target,
                 )
                 running_models.append(model)
