@@ -109,6 +109,14 @@ parser.add_argument(
         "finite-time support node still tracks touchdown and damps contact."
     ),
 )
+parser.add_argument(
+    "--debug_hybrid_control",
+    action="store_true",
+    help=(
+        "Apply both Crocoddyl feedforward torque and predicted joint-position "
+        "targets, matching the production Stage 1 execution path."
+    ),
+)
 
 # AppLauncher arguments (adds --headless, --device, --livestream, etc.)
 AppLauncher.add_app_launcher_args(parser)
@@ -392,7 +400,7 @@ def main():
         env_cfg.mpc_return_quasi_static_control = (
             args_cli.debug_group == "static_fixed"
         )
-        env_cfg.mpc_torque_control_only = True
+        env_cfg.mpc_torque_control_only = not args_cli.debug_hybrid_control
         env_cfg.mpc_use_raw_state_input = True
         env_cfg.mpc_reference_is_root_position = True
         env_cfg.initial_pos_range = (
@@ -415,7 +423,8 @@ def main():
             f"initial_support={env_cfg.mpc_initial_full_support_duration:.2f}s | "
             f"feasible_cold_start={env_cfg.mpc_use_feasible_cold_start_rollout} | "
             f"quasi_static={env_cfg.mpc_return_quasi_static_control} | "
-            "torque_only=True | raw_state=True | root_reference=True | "
+            f"torque_only={env_cfg.mpc_torque_control_only} | "
+            "raw_state=True | root_reference=True | "
             f"root_height={args_cli.debug_root_height:.3f}"
         )
 
