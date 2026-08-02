@@ -330,17 +330,34 @@ class CrocoddylQuadrupedMPC(BaseMPC):
         # Compute heading trajectory from CoM reference tangent
         heading_trajectory = self._compute_heading_trajectory(ocp_com_reference, self.dt)
 
-        # Update ground height estimate from current foot positions (Fix: eliminates
-        # foot_track cost explosion when feet are above ground at initialization)
-        if current_foot_positions:
-            ground_z = min(pos[2] for pos in current_foot_positions.values())
-            self.foothold_planner.default_ground_height = 0.02
-
-        # Plan footholds
-        step_height = self.step_height * step_height_mod
         current_phase = (
             contact_sequence.phases[0] if contact_sequence.phases else None
         )
+
+        # Estimate the collision-foot centre height from the feet that the
+        # current gait phase treats as support.  The previous code computed an
+        # estimate and then discarded it in favour of a hard-coded 0.02 m.
+        # Isaac settles the Go2 foot centres near 0.023 m; with a 1e6 tracking
+        # weight, even that small mismatch can drive a touchdown rebound.
+        if current_foot_positions:
+            support_feet = (
+                current_phase.support_feet
+                if current_phase is not None and current_phase.support_feet
+                else list(current_foot_positions.keys())
+            )
+            support_heights = [
+                float(current_foot_positions[foot][2])
+                for foot in support_feet
+                if foot in current_foot_positions
+                and np.isfinite(current_foot_positions[foot][2])
+            ]
+            if support_heights:
+                self.foothold_planner.default_ground_height = float(
+                    np.median(support_heights)
+                )
+
+        # Plan footholds
+        step_height = self.step_height * step_height_mod
         if current_phase is not None and current_phase.phase_type == "swing":
             active_feet = set(current_phase.swing_feet)
             self._active_swing_start_positions = {
@@ -426,6 +443,7 @@ class CrocoddylQuadrupedMPC(BaseMPC):
                 f"swing={step_duration:.3f}s, "
                 f"support={support_duration:.3f}s, "
                 f"step_height={step_height:.3f}m, "
+                f"ground_z={self.foothold_planner.default_ground_height:.4f}m, "
                 f"phase_clock={self._gait_clock:.3f}s, "
                 f"contact_gains={self.ocp_factory.CONTACT_GAINS.tolist()}",
                 flush=True,
@@ -605,7 +623,7 @@ class CrocoddylQuadrupedMPC(BaseMPC):
             import sys
             sys.stdout.flush()
 
-        if self.verbose and solver.cost >= 1e4:
+        if self.verbose and solver.cost >= 5e3:
             self._print_cost_breakdown(problem, solver)
 
         solve_time = time.time() - start_time
