@@ -140,4 +140,7 @@ def mpc_cfg_to_dict(cfg) -> Dict:
         "mpc_touchdown_hold_steps": int(
             getattr(cfg, "mpc_touchdown_hold_steps", 0)
         ),
+        "mpc_swing_landing_height_ratio": float(
+            getattr(cfg, "mpc_swing_landing_height_ratio", 0.8)
+        ),
     }

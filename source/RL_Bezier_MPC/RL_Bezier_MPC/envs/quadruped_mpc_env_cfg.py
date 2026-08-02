@@ -160,6 +160,9 @@ class QuadrupedMPCEnvCfg(DirectRLEnvCfg):
     # Extra swing nodes held at the landing target before contact activation.
     # Keep zero for the production baseline; diagnostics can test 1-2 nodes.
     mpc_touchdown_hold_steps: int = 0
+    # P2 vertical height ratio for the swing-foot Bezier. 0.8 preserves the
+    # legacy symmetric arc; diagnostics can lower it to begin descent earlier.
+    mpc_swing_landing_height_ratio: float = 0.8
 
     # MPC verbose mode (print solver info for first 5 solves, for debugging)
     mpc_verbose: bool = False

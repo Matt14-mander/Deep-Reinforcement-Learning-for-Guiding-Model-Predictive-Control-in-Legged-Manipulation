@@ -53,6 +53,7 @@ class BezierFootTrajectory:
         lift_ratio: float = 0.25,
         land_ratio: float = 0.75,
         height_ratio: float = 0.8,
+        landing_height_ratio: Optional[float] = None,
     ):
         """Initialize foot trajectory generator.
 
@@ -60,12 +61,19 @@ class BezierFootTrajectory:
             step_height: Default swing height in meters. Default 0.05 (5cm).
             lift_ratio: P1 at this fraction of step length. Default 0.25.
             land_ratio: P2 at this fraction of step length. Default 0.75.
-            height_ratio: P1,P2 height as fraction of step_height. Default 0.8.
+            height_ratio: P1 height as fraction of step_height. Default 0.8.
+            landing_height_ratio: P2 height as fraction of step_height. If
+                None, uses ``height_ratio`` for the legacy symmetric arc.
         """
         self.step_height = step_height
         self.lift_ratio = lift_ratio
         self.land_ratio = land_ratio
         self.height_ratio = height_ratio
+        self.landing_height_ratio = (
+            height_ratio
+            if landing_height_ratio is None
+            else float(landing_height_ratio)
+        )
 
     def generate(
         self,
@@ -101,12 +109,17 @@ class BezierFootTrajectory:
         step_vector = end_pos - start_pos
 
         # Height offset vector (always in z direction)
-        height_offset = np.array([0.0, 0.0, step_height * self.height_ratio])
+        lift_height_offset = np.array(
+            [0.0, 0.0, step_height * self.height_ratio]
+        )
+        landing_height_offset = np.array(
+            [0.0, 0.0, step_height * self.landing_height_ratio]
+        )
 
         # Compute control points
         P0 = start_pos
-        P1 = start_pos + step_vector * self.lift_ratio + height_offset
-        P2 = start_pos + step_vector * self.land_ratio + height_offset
+        P1 = start_pos + step_vector * self.lift_ratio + lift_height_offset
+        P2 = start_pos + step_vector * self.land_ratio + landing_height_offset
         P3 = end_pos
 
         control_points = np.array([P0, P1, P2, P3])
@@ -197,11 +210,16 @@ class BezierFootTrajectory:
 
         # Default control points
         step_vector = end_pos - start_pos
-        height_offset = np.array([0.0, 0.0, self.step_height * self.height_ratio])
+        lift_height_offset = np.array(
+            [0.0, 0.0, self.step_height * self.height_ratio]
+        )
+        landing_height_offset = np.array(
+            [0.0, 0.0, self.step_height * self.landing_height_ratio]
+        )
 
         P0 = start_pos
-        P1_default = start_pos + step_vector * self.lift_ratio + height_offset
-        P2_default = start_pos + step_vector * self.land_ratio + height_offset
+        P1_default = start_pos + step_vector * self.lift_ratio + lift_height_offset
+        P2_default = start_pos + step_vector * self.land_ratio + landing_height_offset
         P3 = end_pos
 
         # Apply RL offsets
@@ -238,11 +256,16 @@ class BezierFootTrajectory:
             step_height = self.step_height
 
         step_vector = end_pos - start_pos
-        height_offset = np.array([0.0, 0.0, step_height * self.height_ratio])
+        lift_height_offset = np.array(
+            [0.0, 0.0, step_height * self.height_ratio]
+        )
+        landing_height_offset = np.array(
+            [0.0, 0.0, step_height * self.landing_height_ratio]
+        )
 
         P0 = start_pos
-        P1 = start_pos + step_vector * self.lift_ratio + height_offset
-        P2 = start_pos + step_vector * self.land_ratio + height_offset
+        P1 = start_pos + step_vector * self.lift_ratio + lift_height_offset
+        P2 = start_pos + step_vector * self.land_ratio + landing_height_offset
         P3 = end_pos
 
         return np.array([P0, P1, P2, P3])

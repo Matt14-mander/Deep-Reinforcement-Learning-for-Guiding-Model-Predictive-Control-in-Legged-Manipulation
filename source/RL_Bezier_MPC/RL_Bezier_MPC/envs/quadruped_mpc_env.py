@@ -150,6 +150,7 @@ class QuadrupedMPCEnv(DirectRLEnv):
                     reference_is_root_position=cfg.mpc_reference_is_root_position,
                     return_quasi_static_control=cfg.mpc_return_quasi_static_control,
                     touchdown_hold_steps=cfg.mpc_touchdown_hold_steps,
+                    swing_landing_height_ratio=cfg.mpc_swing_landing_height_ratio,
                 )
             else:
                 mpc = None  # Dummy mode / cluster mode

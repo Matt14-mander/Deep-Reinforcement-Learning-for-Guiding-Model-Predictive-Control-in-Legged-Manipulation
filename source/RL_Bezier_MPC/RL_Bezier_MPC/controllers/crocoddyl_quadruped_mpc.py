@@ -96,6 +96,7 @@ class CrocoddylQuadrupedMPC(BaseMPC):
         reference_is_root_position: bool = False,
         return_quasi_static_control: bool = False,
         touchdown_hold_steps: int = 0,
+        swing_landing_height_ratio: float = 0.8,
     ):
         """Initialize MPC with all sub-components.
 
@@ -127,6 +128,8 @@ class CrocoddylQuadrupedMPC(BaseMPC):
                 returns the contact-consistent quasi-static control directly.
             touchdown_hold_steps: Extra final swing nodes held at the planned
                 landing position before switching that foot to support.
+            swing_landing_height_ratio: P2 vertical control-point height as a
+                fraction of swing height; lower values begin descent earlier.
         """
         if not CROCODDYL_AVAILABLE:
             raise ImportError(
@@ -159,6 +162,7 @@ class CrocoddylQuadrupedMPC(BaseMPC):
         self.reference_is_root_position = reference_is_root_position
         self.return_quasi_static_control = return_quasi_static_control
         self.touchdown_hold_steps = max(0, int(touchdown_hold_steps))
+        self.swing_landing_height_ratio = float(swing_landing_height_ratio)
         self._solve_count = 0  # Track solve calls for selective verbose
 
         # Get frame IDs from names
@@ -178,8 +182,12 @@ class CrocoddylQuadrupedMPC(BaseMPC):
             step_height=step_height,
             default_ground_height=0.02,  # foot sphere radius; updated dynamically in solve()
             touchdown_hold_steps=self.touchdown_hold_steps,
+            swing_landing_height_ratio=self.swing_landing_height_ratio,
         )
-        self.foot_trajectory_gen = BezierFootTrajectory(step_height=step_height)
+        self.foot_trajectory_gen = BezierFootTrajectory(
+            step_height=step_height,
+            landing_height_ratio=self.swing_landing_height_ratio,
+        )
         self.ocp_factory = OCPFactory(
             rmodel=rmodel,
             foot_frame_ids=self.foot_frame_ids,

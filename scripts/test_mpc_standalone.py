@@ -126,6 +126,15 @@ parser.add_argument(
         "nodes before the contact schedule switches to support."
     ),
 )
+parser.add_argument(
+    "--debug_swing_landing_height_ratio",
+    type=float,
+    default=0.8,
+    help=(
+        "Swing-foot P2 vertical control-point ratio. Lower than the legacy "
+        "0.8 value starts descent earlier without compressing swing time."
+    ),
+)
 
 # AppLauncher arguments (adds --headless, --device, --livestream, etc.)
 AppLauncher.add_app_launcher_args(parser)
@@ -413,6 +422,9 @@ def main():
         env_cfg.mpc_touchdown_hold_steps = max(
             0, args_cli.debug_touchdown_hold_steps
         )
+        env_cfg.mpc_swing_landing_height_ratio = max(
+            0.0, args_cli.debug_swing_landing_height_ratio
+        )
         env_cfg.mpc_use_raw_state_input = True
         env_cfg.mpc_reference_is_root_position = True
         env_cfg.initial_pos_range = (
@@ -437,6 +449,7 @@ def main():
             f"quasi_static={env_cfg.mpc_return_quasi_static_control} | "
             f"torque_only={env_cfg.mpc_torque_control_only} | "
             f"touchdown_hold={env_cfg.mpc_touchdown_hold_steps} | "
+            f"landing_height_ratio={env_cfg.mpc_swing_landing_height_ratio:.2f} | "
             "raw_state=True | root_reference=True | "
             f"root_height={args_cli.debug_root_height:.3f}"
         )

@@ -83,6 +83,7 @@ class FootholdPlanner:
         default_ground_height: float = 0.0,
         step_height: float = 0.05,
         touchdown_hold_steps: int = 0,
+        swing_landing_height_ratio: float = 0.8,
     ):
         """Initialize the foothold planner.
 
@@ -95,6 +96,9 @@ class FootholdPlanner:
                 the first touchdown node, that remain at the landing target.
                 This lets the physical tracking controller settle the foot
                 before the contact schedule changes to support.
+            swing_landing_height_ratio: P2 vertical control-point height as a
+                fraction of step height. Values below the 0.8 legacy value
+                start the descent earlier without shortening the swing.
         """
         if hip_offsets is None:
             self.hip_offsets = {k: v.copy() for k, v in self.DEFAULT_HIP_OFFSETS.items()}
@@ -102,7 +106,10 @@ class FootholdPlanner:
             self.hip_offsets = {k: np.asarray(v) for k, v in hip_offsets.items()}
 
         self.default_ground_height = default_ground_height
-        self.foot_trajectory_gen = BezierFootTrajectory(step_height=step_height)
+        self.foot_trajectory_gen = BezierFootTrajectory(
+            step_height=step_height,
+            landing_height_ratio=swing_landing_height_ratio,
+        )
         self.touchdown_hold_steps = max(0, int(touchdown_hold_steps))
 
     def _generate_swing_trajectory(
