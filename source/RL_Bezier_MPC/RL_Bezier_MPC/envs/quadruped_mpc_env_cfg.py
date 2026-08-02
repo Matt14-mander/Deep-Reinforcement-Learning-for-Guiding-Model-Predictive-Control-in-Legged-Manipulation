@@ -146,7 +146,9 @@ class QuadrupedMPCEnvCfg(DirectRLEnvCfg):
     # Negative preserves OCPFactory's production default. Standalone A/B tests
     # can set Crocoddyl's quadrupedal-gait reference value (1e1) explicitly.
     mpc_friction_cone_weight: float = -1.0
-    mpc_use_pseudo_impulse: bool = True
+    # The legacy dt=0 Euler pseudo-impulse cannot create an impact state jump
+    # and inserts an extra model outside the MPC time grid.
+    mpc_use_pseudo_impulse: bool = False
     mpc_initial_full_support_duration: float = 0.0
     mpc_use_feasible_cold_start_rollout: bool = False
     mpc_enable_warm_start: bool = True

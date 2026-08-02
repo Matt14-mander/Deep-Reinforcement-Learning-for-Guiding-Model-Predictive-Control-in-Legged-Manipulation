@@ -91,7 +91,7 @@ def build_default_controllers(env_ids: Iterable[int], mpc_cfg: Dict) -> Dict[int
                 else None
             ),
             use_pseudo_impulse=bool(
-                mpc_cfg.get("mpc_use_pseudo_impulse", True)
+                mpc_cfg.get("mpc_use_pseudo_impulse", False)
             ),
             initial_full_support_duration=float(
                 mpc_cfg.get("mpc_initial_full_support_duration", 0.0)

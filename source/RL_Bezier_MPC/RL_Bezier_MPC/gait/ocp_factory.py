@@ -107,7 +107,7 @@ class OCPFactory:
         fwddyn: bool = True,
         weights: Optional[Dict[str, float]] = None,
         use_demo_stabilization_weights: bool = False,
-        use_pseudo_impulse: bool = True,
+        use_pseudo_impulse: bool = False,
     ):
         """Initialize factory with robot model and cost weights.
 

@@ -120,7 +120,7 @@ def mpc_cfg_to_dict(cfg) -> Dict:
             getattr(cfg, "mpc_friction_cone_weight", -1.0)
         ),
         "mpc_use_pseudo_impulse": bool(
-            getattr(cfg, "mpc_use_pseudo_impulse", True)
+            getattr(cfg, "mpc_use_pseudo_impulse", False)
         ),
         "mpc_initial_full_support_duration": float(
             getattr(cfg, "mpc_initial_full_support_duration", 0.0)

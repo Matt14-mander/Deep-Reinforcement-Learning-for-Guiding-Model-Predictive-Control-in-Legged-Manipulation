@@ -89,7 +89,7 @@ class CrocoddylQuadrupedMPC(BaseMPC):
         force_standing_contacts: bool = False,
         use_demo_stabilization_weights: bool = False,
         friction_cone_weight: Optional[float] = None,
-        use_pseudo_impulse: bool = True,
+        use_pseudo_impulse: bool = False,
         initial_full_support_duration: float = 0.0,
         use_feasible_cold_start_rollout: bool = False,
         enable_warm_start: bool = True,
@@ -299,8 +299,22 @@ class CrocoddylQuadrupedMPC(BaseMPC):
             }
 
         # Generate contact sequence
-        step_duration = self.step_duration / step_frequency_mod
-        support_duration = self.support_duration / step_frequency_mod
+        requested_step_duration = self.step_duration / step_frequency_mod
+        requested_support_duration = self.support_duration / step_frequency_mod
+
+        # Contact phases must live on the same integer time grid as the OCP.
+        # For example, 0.25 / 0.02 = 12.5; repeatedly rounding the remaining
+        # duration can remove two nodes on one MPC call while warm-start shifts
+        # by exactly one. Quantize once before scheduling so every receding-
+        # horizon update advances one model for one 20 ms control tick.
+        step_knots = max(
+            1, int(np.floor(requested_step_duration / self.dt + 0.5))
+        )
+        support_knots = max(
+            1, int(np.floor(requested_support_duration / self.dt + 0.5))
+        )
+        step_duration = step_knots * self.dt
+        support_duration = support_knots * self.dt
 
         if self.force_standing_contacts:
             # Isolation groups 1 and 2 keep exactly the same four-foot support
@@ -457,8 +471,10 @@ class CrocoddylQuadrupedMPC(BaseMPC):
             )
             print(
                 "  Effective gait: "
-                f"swing={step_duration:.3f}s, "
-                f"support={support_duration:.3f}s, "
+                f"swing={step_duration:.3f}s/{step_knots}ticks "
+                f"(requested={requested_step_duration:.3f}s), "
+                f"support={support_duration:.3f}s/{support_knots}ticks "
+                f"(requested={requested_support_duration:.3f}s), "
                 f"step_height={step_height:.3f}m, "
                 f"ground_z={self.foothold_planner.default_ground_height:.4f}m, "
                 f"phase_clock={self._gait_clock:.3f}s, "
