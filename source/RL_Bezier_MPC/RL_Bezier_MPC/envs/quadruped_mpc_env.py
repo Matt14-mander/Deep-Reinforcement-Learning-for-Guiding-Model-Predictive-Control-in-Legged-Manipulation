@@ -151,6 +151,10 @@ class QuadrupedMPCEnv(DirectRLEnv):
                     return_quasi_static_control=cfg.mpc_return_quasi_static_control,
                     touchdown_hold_steps=cfg.mpc_touchdown_hold_steps,
                     swing_landing_height_ratio=cfg.mpc_swing_landing_height_ratio,
+                    touchdown_gate_height_tolerance=(
+                        cfg.mpc_touchdown_gate_height_tolerance
+                    ),
+                    touchdown_gate_max_steps=cfg.mpc_touchdown_gate_max_steps,
                 )
             else:
                 mpc = None  # Dummy mode / cluster mode

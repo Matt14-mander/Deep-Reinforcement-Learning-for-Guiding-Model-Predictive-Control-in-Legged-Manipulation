@@ -163,6 +163,10 @@ class QuadrupedMPCEnvCfg(DirectRLEnvCfg):
     # P2 vertical height ratio for the swing-foot Bezier. 0.8 preserves the
     # legacy symmetric arc; diagnostics can lower it to begin descent earlier.
     mpc_swing_landing_height_ratio: float = 0.8
+    # Event-based contact activation diagnostic. Disabled by default until the
+    # standalone test validates it against Isaac's physical touchdown timing.
+    mpc_touchdown_gate_height_tolerance: float = 0.0
+    mpc_touchdown_gate_max_steps: int = 0
 
     # MPC verbose mode (print solver info for first 5 solves, for debugging)
     mpc_verbose: bool = False

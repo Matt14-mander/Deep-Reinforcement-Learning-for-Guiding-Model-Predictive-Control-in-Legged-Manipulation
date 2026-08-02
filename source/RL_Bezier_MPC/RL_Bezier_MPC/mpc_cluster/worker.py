@@ -114,6 +114,12 @@ def build_default_controllers(env_ids: Iterable[int], mpc_cfg: Dict) -> Dict[int
             swing_landing_height_ratio=float(
                 mpc_cfg.get("mpc_swing_landing_height_ratio", 0.8)
             ),
+            touchdown_gate_height_tolerance=float(
+                mpc_cfg.get("mpc_touchdown_gate_height_tolerance", 0.0)
+            ),
+            touchdown_gate_max_steps=int(
+                mpc_cfg.get("mpc_touchdown_gate_max_steps", 0)
+            ),
         )
     return controllers
 

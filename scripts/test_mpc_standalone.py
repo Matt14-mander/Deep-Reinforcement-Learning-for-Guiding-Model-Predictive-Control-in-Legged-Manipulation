@@ -135,6 +135,21 @@ parser.add_argument(
         "0.8 value starts descent earlier without compressing swing time."
     ),
 )
+parser.add_argument(
+    "--debug_touchdown_gate_tolerance",
+    type=float,
+    default=0.0,
+    help=(
+        "Delay the swing-to-support clock transition while a swing foot is "
+        "more than this many metres above its locked landing target."
+    ),
+)
+parser.add_argument(
+    "--debug_touchdown_gate_max_steps",
+    type=int,
+    default=0,
+    help="Maximum extra MPC ticks permitted by touchdown gating.",
+)
 
 # AppLauncher arguments (adds --headless, --device, --livestream, etc.)
 AppLauncher.add_app_launcher_args(parser)
@@ -425,6 +440,12 @@ def main():
         env_cfg.mpc_swing_landing_height_ratio = max(
             0.0, args_cli.debug_swing_landing_height_ratio
         )
+        env_cfg.mpc_touchdown_gate_height_tolerance = max(
+            0.0, args_cli.debug_touchdown_gate_tolerance
+        )
+        env_cfg.mpc_touchdown_gate_max_steps = max(
+            0, args_cli.debug_touchdown_gate_max_steps
+        )
         env_cfg.mpc_use_raw_state_input = True
         env_cfg.mpc_reference_is_root_position = True
         env_cfg.initial_pos_range = (
@@ -450,6 +471,8 @@ def main():
             f"torque_only={env_cfg.mpc_torque_control_only} | "
             f"touchdown_hold={env_cfg.mpc_touchdown_hold_steps} | "
             f"landing_height_ratio={env_cfg.mpc_swing_landing_height_ratio:.2f} | "
+            f"touchdown_gate={env_cfg.mpc_touchdown_gate_height_tolerance:.3f}m/"
+            f"{env_cfg.mpc_touchdown_gate_max_steps}steps | "
             "raw_state=True | root_reference=True | "
             f"root_height={args_cli.debug_root_height:.3f}"
         )

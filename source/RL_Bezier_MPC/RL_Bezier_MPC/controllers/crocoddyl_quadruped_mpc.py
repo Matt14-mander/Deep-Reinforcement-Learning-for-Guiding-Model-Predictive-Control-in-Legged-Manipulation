@@ -97,6 +97,8 @@ class CrocoddylQuadrupedMPC(BaseMPC):
         return_quasi_static_control: bool = False,
         touchdown_hold_steps: int = 0,
         swing_landing_height_ratio: float = 0.8,
+        touchdown_gate_height_tolerance: float = 0.0,
+        touchdown_gate_max_steps: int = 0,
     ):
         """Initialize MPC with all sub-components.
 
@@ -130,6 +132,11 @@ class CrocoddylQuadrupedMPC(BaseMPC):
                 landing position before switching that foot to support.
             swing_landing_height_ratio: P2 vertical control-point height as a
                 fraction of swing height; lower values begin descent earlier.
+            touchdown_gate_height_tolerance: At the final swing node, delay
+                contact-phase activation while a foot is more than this many
+                metres above its locked landing target. Zero disables gating.
+            touchdown_gate_max_steps: Maximum extra MPC ticks allowed for the
+                physical foot to reach the landing target.
         """
         if not CROCODDYL_AVAILABLE:
             raise ImportError(
@@ -163,6 +170,11 @@ class CrocoddylQuadrupedMPC(BaseMPC):
         self.return_quasi_static_control = return_quasi_static_control
         self.touchdown_hold_steps = max(0, int(touchdown_hold_steps))
         self.swing_landing_height_ratio = float(swing_landing_height_ratio)
+        self.touchdown_gate_height_tolerance = max(
+            0.0, float(touchdown_gate_height_tolerance)
+        )
+        self.touchdown_gate_max_steps = max(0, int(touchdown_gate_max_steps))
+        self._touchdown_gate_steps = 0
         self._solve_count = 0  # Track solve calls for selective verbose
 
         # Get frame IDs from names
@@ -720,9 +732,61 @@ class CrocoddylQuadrupedMPC(BaseMPC):
         # else: keep previous _prev_xs intact (last good solution)
 
         # Advance the gait phase clock so the next solve starts from the correct
-        # position in the gait cycle (fixes the "Groundhog Day" bug).
+        # position in the gait cycle (fixes the "Groundhog Day" bug). At the
+        # last swing node, however, Crocoddyl must not activate a contact that
+        # is still physically above its landing target in Isaac. Hold the clock
+        # for a bounded number of ticks so the endpoint remains a swing-foot
+        # tracking target instead of becoming a fictitious support contact.
         if not self.force_standing_contacts:
-            self._gait_clock += self.dt
+            hold_gait_clock = False
+            at_swing_boundary = (
+                self.touchdown_gate_height_tolerance > 0.0
+                and self.touchdown_gate_max_steps > 0
+                and current_phase is not None
+                and current_phase.phase_type == "swing"
+                and current_phase.duration <= self.dt + 1e-9
+            )
+            if at_swing_boundary:
+                delayed_feet = []
+                for foot in current_phase.swing_feet:
+                    target = self._active_swing_end_positions.get(foot)
+                    measured = current_foot_positions.get(foot)
+                    if target is None or measured is None:
+                        continue
+                    height_error = float(measured[2] - target[2])
+                    if height_error > self.touchdown_gate_height_tolerance:
+                        delayed_feet.append((foot, height_error))
+
+                if (
+                    delayed_feet
+                    and self._touchdown_gate_steps < self.touchdown_gate_max_steps
+                ):
+                    self._touchdown_gate_steps += 1
+                    hold_gait_clock = True
+                    if self.verbose:
+                        delayed_text = ", ".join(
+                            f"{foot}=+{error * 1000.0:.1f}mm"
+                            for foot, error in delayed_feet
+                        )
+                        print(
+                            f"[MPC Touchdown Gate] solve={self._solve_count} "
+                            f"hold={self._touchdown_gate_steps}/"
+                            f"{self.touchdown_gate_max_steps} {delayed_text}",
+                            flush=True,
+                        )
+                else:
+                    if delayed_feet and self.verbose:
+                        print(
+                            f"[MPC Touchdown Gate] solve={self._solve_count} "
+                            "maximum hold reached; advancing contact schedule",
+                            flush=True,
+                        )
+                    self._touchdown_gate_steps = 0
+            else:
+                self._touchdown_gate_steps = 0
+
+            if not hold_gait_clock:
+                self._gait_clock += self.dt
 
         # First control action
         if len(us) > 0 and np.asarray(us[0]).size == self.actuation.nu:
@@ -1035,6 +1099,7 @@ class CrocoddylQuadrupedMPC(BaseMPC):
         self._gait_clock = 0.0
         self._active_swing_start_positions.clear()
         self._active_swing_end_positions.clear()
+        self._touchdown_gate_steps = 0
         self._nominal_foot_offsets = None
 
     def set_gait_type(self, gait_type: str):
