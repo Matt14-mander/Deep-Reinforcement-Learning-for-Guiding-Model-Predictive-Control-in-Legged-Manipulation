@@ -364,26 +364,27 @@ class CrocoddylQuadrupedMPC(BaseMPC):
             contact_sequence.phases[0] if contact_sequence.phases else None
         )
 
-        # Estimate the collision-foot centre height from the feet that the
-        # current gait phase treats as support.  The previous code computed an
-        # estimate and then discarded it in favour of a hard-coded 0.02 m.
-        # Isaac settles the Go2 foot centres near 0.023 m; with a 1e6 tracking
-        # weight, even that small mismatch can drive a touchdown rebound.
+        # Estimate the collision-foot centre ground height from the lowest
+        # finite scheduled support foot.  Using the median of two support feet
+        # is unsafe: if one is still rebounding, the two-value median is their
+        # average and can lift the next touchdown target several centimetres
+        # above ground.  Excluding swing feet also prevents a descending or
+        # penetrating swing measurement from lowering the estimate.
         if current_foot_positions:
-            support_feet = (
+            ground_candidate_feet = (
                 current_phase.support_feet
                 if current_phase is not None and current_phase.support_feet
                 else list(current_foot_positions.keys())
             )
-            support_heights = [
+            finite_support_heights = [
                 float(current_foot_positions[foot][2])
-                for foot in support_feet
+                for foot in ground_candidate_feet
                 if foot in current_foot_positions
                 and np.isfinite(current_foot_positions[foot][2])
             ]
-            if support_heights:
+            if finite_support_heights:
                 self.foothold_planner.default_ground_height = float(
-                    np.median(support_heights)
+                    np.min(finite_support_heights)
                 )
 
         # Plan footholds
