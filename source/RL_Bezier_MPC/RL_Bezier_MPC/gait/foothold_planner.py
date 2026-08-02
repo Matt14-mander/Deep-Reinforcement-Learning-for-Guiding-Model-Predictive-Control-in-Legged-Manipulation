@@ -108,6 +108,7 @@ class FootholdPlanner:
         terrain_height_fn: Optional[Callable[[float, float], float]] = None,
         step_height: Optional[float] = None,
         active_swing_start_positions: Optional[Dict[str, np.ndarray]] = None,
+        active_swing_end_positions: Optional[Dict[str, np.ndarray]] = None,
     ) -> Dict[str, List[FootholdPlan]]:
         """Compute foot landing positions for each swing phase.
 
@@ -125,6 +126,9 @@ class FootholdPlanner:
                 the first, already-active swing phase. These keep receding-horizon
                 replanning on the same Bezier curve instead of restarting the
                 swing from the current elevated foot position.
+            active_swing_end_positions: Cached touchdown positions for feet in
+                the first, already-active swing phase. These prevent a 5 Hz
+                reference refresh from moving the target during one swing.
 
         Returns:
             Dict mapping foot name → list of FootholdPlan for each swing event.
@@ -172,6 +176,11 @@ class FootholdPlanner:
                     hip_offset=self.hip_offsets[foot_name],
                     terrain_height_fn=terrain_height_fn,
                 )
+
+                if phase_index == 0 and active_swing_end_positions is not None:
+                    cached_end = active_swing_end_positions.get(foot_name)
+                    if cached_end is not None:
+                        landing_pos = np.asarray(cached_end, dtype=float).copy()
 
                 cached_start = None
                 if phase_index == 0 and active_swing_start_positions is not None:

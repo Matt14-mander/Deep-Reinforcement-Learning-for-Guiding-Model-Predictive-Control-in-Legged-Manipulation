@@ -207,6 +207,7 @@ class CrocoddylQuadrupedMPC(BaseMPC):
         # never reaches the swing phases — the "Groundhog Day" bug.
         self._gait_clock: float = 0.0
         self._active_swing_start_positions: Dict[str, np.ndarray] = {}
+        self._active_swing_end_positions: Dict[str, np.ndarray] = {}
         self._nominal_foot_offsets: Optional[Dict[str, np.ndarray]] = None
 
 
@@ -394,13 +395,25 @@ class CrocoddylQuadrupedMPC(BaseMPC):
                 for foot, start in self._active_swing_start_positions.items()
                 if foot in active_feet
             }
+            self._active_swing_end_positions = {
+                foot: end
+                for foot, end in self._active_swing_end_positions.items()
+                if foot in active_feet
+            }
             for foot in active_feet:
                 if foot not in self._active_swing_start_positions:
                     self._active_swing_start_positions[foot] = np.asarray(
                         current_foot_positions[foot], dtype=float
                     ).copy()
         else:
+            had_locked_swing = bool(self._active_swing_end_positions)
             self._active_swing_start_positions.clear()
+            self._active_swing_end_positions.clear()
+            if self.verbose and had_locked_swing:
+                print(
+                    f"[MPC Swing Lock] solve={self._solve_count + 1} released at support",
+                    flush=True,
+                )
 
         foothold_plans = self.foothold_planner.plan_footholds(
             com_trajectory=ocp_com_reference,
@@ -409,7 +422,26 @@ class CrocoddylQuadrupedMPC(BaseMPC):
             dt=self.dt,
             step_height=step_height,
             active_swing_start_positions=self._active_swing_start_positions,
+            active_swing_end_positions=self._active_swing_end_positions,
         )
+        if current_phase is not None and current_phase.phase_type == "swing":
+            newly_locked_targets = {}
+            for foot in current_phase.swing_feet:
+                plans = foothold_plans.get(foot, [])
+                if foot not in self._active_swing_end_positions and plans:
+                    self._active_swing_end_positions[foot] = np.asarray(
+                        plans[0].end_pos, dtype=float
+                    ).copy()
+                    newly_locked_targets[foot] = self._active_swing_end_positions[foot]
+            if self.verbose and newly_locked_targets:
+                targets_text = ", ".join(
+                    f"{foot}=[{target[0]:.3f},{target[1]:.3f},{target[2]:.3f}]"
+                    for foot, target in newly_locked_targets.items()
+                )
+                print(
+                    f"[MPC Swing Lock] solve={self._solve_count + 1} locked {targets_text}",
+                    flush=True,
+                )
 
         # Build OCP (cap at horizon_steps to prevent node overflow from long contact sequences)
         problem = self.ocp_factory.build_problem(
@@ -988,6 +1020,7 @@ class CrocoddylQuadrupedMPC(BaseMPC):
         self._cached_contact_sequence = None
         self._gait_clock = 0.0
         self._active_swing_start_positions.clear()
+        self._active_swing_end_positions.clear()
         self._nominal_foot_offsets = None
 
     def set_gait_type(self, gait_type: str):
@@ -1001,3 +1034,4 @@ class CrocoddylQuadrupedMPC(BaseMPC):
         self.gait_type = gait_type
         self._cached_contact_sequence = None
         self._active_swing_start_positions.clear()
+        self._active_swing_end_positions.clear()
