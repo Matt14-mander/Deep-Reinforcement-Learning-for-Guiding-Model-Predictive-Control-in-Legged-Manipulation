@@ -137,4 +137,7 @@ def mpc_cfg_to_dict(cfg) -> Dict:
         "mpc_return_quasi_static_control": bool(
             getattr(cfg, "mpc_return_quasi_static_control", False)
         ),
+        "mpc_touchdown_hold_steps": int(
+            getattr(cfg, "mpc_touchdown_hold_steps", 0)
+        ),
     }

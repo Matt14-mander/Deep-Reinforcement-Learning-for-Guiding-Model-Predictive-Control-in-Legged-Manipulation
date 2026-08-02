@@ -108,6 +108,9 @@ def build_default_controllers(env_ids: Iterable[int], mpc_cfg: Dict) -> Dict[int
             return_quasi_static_control=bool(
                 mpc_cfg.get("mpc_return_quasi_static_control", False)
             ),
+            touchdown_hold_steps=int(
+                mpc_cfg.get("mpc_touchdown_hold_steps", 0)
+            ),
         )
     return controllers
 

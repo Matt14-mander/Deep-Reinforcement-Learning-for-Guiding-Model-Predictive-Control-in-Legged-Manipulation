@@ -82,6 +82,7 @@ class FootholdPlanner:
         hip_offsets: Optional[Dict[str, np.ndarray]] = None,
         default_ground_height: float = 0.0,
         step_height: float = 0.05,
+        touchdown_hold_steps: int = 0,
     ):
         """Initialize the foothold planner.
 
@@ -90,6 +91,10 @@ class FootholdPlanner:
                 If None, uses DEFAULT_HIP_OFFSETS.
             default_ground_height: Ground height when no terrain function.
             step_height: Default foot swing height for trajectory generation.
+            touchdown_hold_steps: Number of final swing nodes, in addition to
+                the first touchdown node, that remain at the landing target.
+                This lets the physical tracking controller settle the foot
+                before the contact schedule changes to support.
         """
         if hip_offsets is None:
             self.hip_offsets = {k: v.copy() for k, v in self.DEFAULT_HIP_OFFSETS.items()}
@@ -98,6 +103,37 @@ class FootholdPlanner:
 
         self.default_ground_height = default_ground_height
         self.foot_trajectory_gen = BezierFootTrajectory(step_height=step_height)
+        self.touchdown_hold_steps = max(0, int(touchdown_hold_steps))
+
+    def _generate_swing_trajectory(
+        self,
+        start_pos: np.ndarray,
+        end_pos: np.ndarray,
+        num_nodes: int,
+        step_height: Optional[float],
+    ) -> np.ndarray:
+        """Generate exactly one target per finite-time swing node.
+
+        ``BezierFootTrajectory.generate`` includes both endpoints.  Therefore
+        a swing containing N OCP nodes needs N samples, not N + 1.  Optional
+        touchdown hold nodes compress the moving part of the curve and append
+        repeated landing targets without changing the contact timing.
+        """
+        num_nodes = max(2, int(num_nodes))
+        hold_steps = min(self.touchdown_hold_steps, num_nodes - 2)
+        moving_nodes = num_nodes - hold_steps
+        trajectory = self.foot_trajectory_gen.generate(
+            start_pos=start_pos,
+            end_pos=end_pos,
+            num_samples=moving_nodes,
+            step_height=step_height,
+        )
+        if hold_steps:
+            touchdown_hold = np.repeat(
+                np.asarray(end_pos, dtype=float)[None, :], hold_steps, axis=0
+            )
+            trajectory = np.vstack((trajectory, touchdown_hold))
+        return trajectory
 
     def plan_footholds(
         self,
@@ -192,11 +228,14 @@ class FootholdPlanner:
                     # prevents a fresh step-height offset being added at every
                     # MPC tick while the foot is already airborne.
                     full_duration = phase.elapsed + phase.duration
-                    num_full_samples = max(2, round(full_duration / dt) + 1)
-                    full_trajectory = self.foot_trajectory_gen.generate(
+                    # OCPFactory creates round(duration / dt) finite-time
+                    # nodes. Generate the same number of targets so the final
+                    # swing node actually receives the touchdown endpoint.
+                    num_full_samples = max(2, round(full_duration / dt))
+                    full_trajectory = self._generate_swing_trajectory(
                         start_pos=np.asarray(cached_start, dtype=float),
                         end_pos=landing_pos,
-                        num_samples=num_full_samples,
+                        num_nodes=num_full_samples,
                         step_height=step_height,
                     )
                     elapsed_samples = min(
@@ -205,14 +244,12 @@ class FootholdPlanner:
                     swing_trajectory = full_trajectory[elapsed_samples:]
                     trajectory_start = np.asarray(cached_start, dtype=float)
                 else:
-                    num_swing_samples = max(
-                        2, phase_end_idx - phase_start_idx + 1
-                    )
+                    num_swing_samples = max(2, round(phase.duration / dt))
                     trajectory_start = foot_positions[foot_name]
-                    swing_trajectory = self.foot_trajectory_gen.generate(
+                    swing_trajectory = self._generate_swing_trajectory(
                         start_pos=trajectory_start,
                         end_pos=landing_pos,
-                        num_samples=num_swing_samples,
+                        num_nodes=num_swing_samples,
                         step_height=step_height,
                     )
 

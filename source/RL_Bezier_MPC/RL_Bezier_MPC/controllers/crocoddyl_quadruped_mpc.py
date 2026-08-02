@@ -95,6 +95,7 @@ class CrocoddylQuadrupedMPC(BaseMPC):
         enable_warm_start: bool = True,
         reference_is_root_position: bool = False,
         return_quasi_static_control: bool = False,
+        touchdown_hold_steps: int = 0,
     ):
         """Initialize MPC with all sub-components.
 
@@ -124,6 +125,8 @@ class CrocoddylQuadrupedMPC(BaseMPC):
                 CoM positions before constructing Crocoddyl costs.
             return_quasi_static_control: Diagnostic mode that bypasses FDDP and
                 returns the contact-consistent quasi-static control directly.
+            touchdown_hold_steps: Extra final swing nodes held at the planned
+                landing position before switching that foot to support.
         """
         if not CROCODDYL_AVAILABLE:
             raise ImportError(
@@ -155,6 +158,7 @@ class CrocoddylQuadrupedMPC(BaseMPC):
         self.enable_warm_start = enable_warm_start
         self.reference_is_root_position = reference_is_root_position
         self.return_quasi_static_control = return_quasi_static_control
+        self.touchdown_hold_steps = max(0, int(touchdown_hold_steps))
         self._solve_count = 0  # Track solve calls for selective verbose
 
         # Get frame IDs from names
@@ -173,6 +177,7 @@ class CrocoddylQuadrupedMPC(BaseMPC):
             hip_offsets=hip_offsets,
             step_height=step_height,
             default_ground_height=0.02,  # foot sphere radius; updated dynamically in solve()
+            touchdown_hold_steps=self.touchdown_hold_steps,
         )
         self.foot_trajectory_gen = BezierFootTrajectory(step_height=step_height)
         self.ocp_factory = OCPFactory(

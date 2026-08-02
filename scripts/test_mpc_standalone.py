@@ -117,6 +117,15 @@ parser.add_argument(
         "targets, matching the production Stage 1 execution path."
     ),
 )
+parser.add_argument(
+    "--debug_touchdown_hold_steps",
+    type=int,
+    default=0,
+    help=(
+        "Hold each swing foot at its landing target for this many extra MPC "
+        "nodes before the contact schedule switches to support."
+    ),
+)
 
 # AppLauncher arguments (adds --headless, --device, --livestream, etc.)
 AppLauncher.add_app_launcher_args(parser)
@@ -401,6 +410,9 @@ def main():
             args_cli.debug_group == "static_fixed"
         )
         env_cfg.mpc_torque_control_only = not args_cli.debug_hybrid_control
+        env_cfg.mpc_touchdown_hold_steps = max(
+            0, args_cli.debug_touchdown_hold_steps
+        )
         env_cfg.mpc_use_raw_state_input = True
         env_cfg.mpc_reference_is_root_position = True
         env_cfg.initial_pos_range = (
@@ -424,6 +436,7 @@ def main():
             f"feasible_cold_start={env_cfg.mpc_use_feasible_cold_start_rollout} | "
             f"quasi_static={env_cfg.mpc_return_quasi_static_control} | "
             f"torque_only={env_cfg.mpc_torque_control_only} | "
+            f"touchdown_hold={env_cfg.mpc_touchdown_hold_steps} | "
             "raw_state=True | root_reference=True | "
             f"root_height={args_cli.debug_root_height:.3f}"
         )

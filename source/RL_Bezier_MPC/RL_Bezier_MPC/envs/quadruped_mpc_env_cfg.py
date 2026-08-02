@@ -157,6 +157,9 @@ class QuadrupedMPCEnvCfg(DirectRLEnvCfg):
     # floating-base/root, while Crocoddyl's position residual tracks true CoM.
     mpc_reference_is_root_position: bool = False
     mpc_return_quasi_static_control: bool = False
+    # Extra swing nodes held at the landing target before contact activation.
+    # Keep zero for the production baseline; diagnostics can test 1-2 nodes.
+    mpc_touchdown_hold_steps: int = 0
 
     # MPC verbose mode (print solver info for first 5 solves, for debugging)
     mpc_verbose: bool = False
