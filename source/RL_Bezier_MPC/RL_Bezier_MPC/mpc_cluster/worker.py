@@ -26,15 +26,28 @@ from .defs import (
     CMD_SHUTDOWN,
     CMD_SOLVE,
     CTRL_QPOS,
+    CTRL_QVEL,
     CTRL_TORQUE,
     FOOT_ORDER,
     INPUT_TENSORS,
     META_CONVERGED,
+    META_CONSTRAINT_VIOLATION,
     META_COST,
+    META_DYNAMICS_GAP,
+    META_ITERATIONS,
+    META_SOLVE_TIME,
     META_STATUS,
+    OUT_ID_RESET_GENERATION,
+    OUT_ID_SOLUTION,
+    OUT_ID_SOURCE_STATE,
+    OUTPUT_TENSORS,
+    PROTOCOL_VERSION,
+    STATE_ID_PHYSICS_STEP,
+    STATE_ID_RESET_GENERATION,
     STANDING_JOINTS,
     STATUS_EXCEPTION,
     STATUS_OK,
+    STATUS_PROTOCOL_MISMATCH,
 )
 
 
@@ -141,6 +154,7 @@ def worker_loop(
     env_ids = list(env_ids)
     lo, hi = min(env_ids), max(env_ids) + 1
     shutdown = False
+    solution_ids = {i: 0 for i in env_ids}
 
     while not shutdown:
         if not consumer.wait(ms_timeout=-1):
@@ -159,6 +173,31 @@ def worker_loop(
                 except Exception:
                     traceback.print_exc()
             if not (cmd & CMD_SOLVE):
+                continue
+
+            source_state_id = int(
+                tensors.buf["mpc_state_ids"][i, STATE_ID_PHYSICS_STEP]
+            )
+            reset_generation = int(
+                tensors.buf["mpc_state_ids"][i, STATE_ID_RESET_GENERATION]
+            )
+            solution_ids[i] += 1
+            out_ids = tensors.buf["mpc_out_ids"][i]
+            out_ids[OUT_ID_SOURCE_STATE] = source_state_id
+            out_ids[OUT_ID_SOLUTION] = solution_ids[i]
+            out_ids[OUT_ID_RESET_GENERATION] = reset_generation
+
+            received_version = int(tensors.buf["mpc_protocol"][i, 0])
+            if received_version != PROTOCOL_VERSION:
+                out = tensors.buf["mpc_out_ctrl"][i]
+                out[CTRL_TORQUE] = 0.0
+                out[CTRL_QPOS] = STANDING_JOINTS
+                out[CTRL_QVEL] = 0.0
+                meta = tensors.buf["mpc_out_meta"][i]
+                meta[:] = np.nan
+                meta[META_COST] = 1e6
+                meta[META_CONVERGED] = 0.0
+                meta[META_STATUS] = STATUS_PROTOCOL_MISMATCH
                 continue
 
             try:
@@ -181,24 +220,39 @@ def worker_loop(
                 if getattr(solution, "predicted_states", None) is not None \
                         and len(solution.predicted_states) > 1:
                     out[CTRL_QPOS] = solution.predicted_states[1][7:19]
+                    out[CTRL_QVEL] = solution.predicted_states[1][25:37]
                 else:
                     out[CTRL_QPOS] = STANDING_JOINTS
+                    out[CTRL_QVEL] = 0.0
                 meta = tensors.buf["mpc_out_meta"][i]
                 meta[META_COST] = float(solution.cost)
                 meta[META_CONVERGED] = 1.0 if solution.converged else 0.0
                 meta[META_STATUS] = STATUS_OK
+                meta[META_SOLVE_TIME] = float(getattr(solution, "solve_time", np.nan))
+                meta[META_ITERATIONS] = float(getattr(solution, "iterations", np.nan))
+                meta[META_DYNAMICS_GAP] = float(
+                    getattr(solution, "dynamics_gap", np.nan)
+                )
+                meta[META_CONSTRAINT_VIOLATION] = float(
+                    getattr(solution, "constraint_violation", np.nan)
+                )
             except Exception:
                 traceback.print_exc()
                 out = tensors.buf["mpc_out_ctrl"][i]
                 out[CTRL_TORQUE] = 0.0
                 out[CTRL_QPOS] = STANDING_JOINTS
+                out[CTRL_QVEL] = 0.0
                 meta = tensors.buf["mpc_out_meta"][i]
                 meta[META_COST] = 1e6
                 meta[META_CONVERGED] = 0.0
                 meta[META_STATUS] = STATUS_EXCEPTION
+                meta[META_SOLVE_TIME] = np.nan
+                meta[META_ITERATIONS] = np.nan
+                meta[META_DYNAMICS_GAP] = np.nan
+                meta[META_CONSTRAINT_VIOLATION] = np.nan
 
-        tensors.push("mpc_out_ctrl", lo, hi)
-        tensors.push("mpc_out_meta", lo, hi)
+        for name in OUTPUT_TENSORS:
+            tensors.push(name, lo, hi)
 
         if on_cycle is not None:
             on_cycle()

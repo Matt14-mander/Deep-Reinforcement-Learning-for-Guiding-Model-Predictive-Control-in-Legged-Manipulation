@@ -866,6 +866,11 @@ class QuadrupedMPCEnv(DirectRLEnv):
                 f"cost={float(out['cost'][0]):.1f} "
                 f"status={int(out['status'][0])} "
                 f"conv={bool(out['converged'][0])} "
+                f"fresh={bool(out['fresh'][0])} "
+                f"state_id={int(out['source_state_id'][0])} "
+                f"solution_id={int(out['solution_id'][0])} "
+                f"solve_ms={float(out['solve_time'][0]) * 1e3:.1f} "
+                f"iter={float(out['iterations'][0]):.0f} "
                 f"|u|={np.linalg.norm(raw_torque):.2f} "
                 f"max|u|={np.max(np.abs(raw_torque)):.2f} "
                 f"leg_qerr=[{','.join(f'{value:.3f}' for value in q_error_by_leg)}] "
@@ -886,7 +891,8 @@ class QuadrupedMPCEnv(DirectRLEnv):
         for env_idx in range(E):
             cost = float(out["cost"][env_idx])
             failed = (
-                out["status"][env_idx] != STATUS_OK
+                not bool(out["fresh"][env_idx])
+                or out["status"][env_idx] != STATUS_OK
                 or np.isnan(cost)
                 or cost > _COST_THRESHOLD
             )
@@ -897,8 +903,11 @@ class QuadrupedMPCEnv(DirectRLEnv):
                 self._last_mpc_converged[env_idx] = False
                 if self._last_good_valid[env_idx]:
                     if env_idx == 0:
-                        print(f"[MPC Guard] env 0: FAILED cost={cost:.0f} "
-                              "-> fallback", flush=True)
+                        reason = "stale" if not out["fresh"][env_idx] else "solver"
+                        print(
+                            f"[MPC Guard] env 0: FAILED reason={reason} "
+                            f"cost={cost:.0f} -> fallback", flush=True
+                        )
                     joint_torques = self._last_good_ctrl[env_idx, :12].copy()
                     joint_positions = self._last_good_ctrl[env_idx, 12:].copy()
                 else:

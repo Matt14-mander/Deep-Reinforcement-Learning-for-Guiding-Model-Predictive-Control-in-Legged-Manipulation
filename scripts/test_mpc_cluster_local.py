@@ -37,12 +37,14 @@ from RL_Bezier_MPC.mpc_cluster.client import (  # noqa: E402
     resolve_python_executable,
 )
 from RL_Bezier_MPC.mpc_cluster.defs import (  # noqa: E402
+    PROTOCOL_VERSION,
     STANDING_JOINTS,
     STATE_DIM,
     STATUS_EXCEPTION,
     STATUS_OK,
     mpc_cfg_to_dict,
 )
+from RL_Bezier_MPC.interfaces import MPCCommandBatch, RobotStateBatch  # noqa: E402
 
 NUM_ENVS = 8
 NUM_WORKERS = 3
@@ -52,9 +54,15 @@ HORIZON = 25
 class DummySolution:
     def __init__(self, control, qpos, cost, converged):
         self.control = control
-        self.predicted_states = [np.zeros(37), np.concatenate([np.zeros(7), qpos, np.zeros(18)])]
+        qvel = qpos + 0.5
+        self.predicted_states = [
+            np.zeros(37),
+            np.concatenate([np.zeros(7), qpos, np.zeros(6), qvel]),
+        ]
         self.cost = cost
         self.converged = converged
+        self.solve_time = 0.001 + cost * 1e-6
+        self.iterations = 4
 
 
 class DummyController:
@@ -124,7 +132,7 @@ def main():
     )
     serialized = mpc_cfg_to_dict(cfg)
     assert serialized["robot_urdf_path"] == "/models/go2.urdf"
-    print("[0/5] external Python launcher and URDF config serialization OK")
+    print("[0/6] external Python launcher and URDF config serialization OK")
 
     mpc_cfg = {"mpc_horizon_steps": HORIZON}
     client = MPCClusterClient(
@@ -145,22 +153,31 @@ def main():
         assert np.allclose(out["torques"][i], expected_torque), \
             f"env {i}: torque routing broken: {out['torques'][i][0]} != {expected_torque}"
         assert np.allclose(out["qpos"][i], i * 0.01)
+        assert np.allclose(out["qvel"][i], i * 0.01 + 0.5)
         assert out["cost"][i] == i * 10.0
         assert out["converged"][i] == (i % 2 == 0)
         assert out["status"][i] == STATUS_OK
-    print("[1/5] routing OK: every env solved by its own controller with its own inputs")
+        assert out["source_state_id"][i] == 0
+        assert out["solution_id"][i] == 1
+        assert out["reset_generation"][i] == 0
+        assert out["fresh"][i]
+        assert out["iterations"][i] == 4
+    print("[1/6] routing and response provenance IDs OK")
 
     # --- cycle 2: RESET forwarding ------------------------------------------
     client.mark_reset([2, 5])
-    client.solve_all(states, com_ref, foot_pos, gait)
+    reset_out = client.solve_all(states, com_ref, foot_pos, gait)
     for i in range(NUM_ENVS):
         expected = 1 if i in (2, 5) else 0
         assert controllers_by_env[i].reset_count == expected, \
             f"env {i}: reset_count={controllers_by_env[i].reset_count}, want {expected}"
+        expected_generation = 1 if i in (2, 5) else 0
+        assert reset_out["reset_generation"][i] == expected_generation
+        assert reset_out["fresh"][i]
     # reset must be one-shot
     client.solve_all(states, com_ref, foot_pos, gait)
     assert controllers_by_env[2].reset_count == 1, "RESET bit not one-shot"
-    print("[2/5] RESET forwarding OK (correct envs, one-shot)")
+    print("[2/6] RESET forwarding and reset generations OK")
 
     # --- cycle 3: exception -> status, others unaffected --------------------
     gait_bad = gait.copy()
@@ -169,30 +186,49 @@ def main():
     assert out["status"][3] == STATUS_EXCEPTION
     assert np.allclose(out["torques"][3], 0.0)
     assert np.allclose(out["qpos"][3], STANDING_JOINTS)
+    assert np.allclose(out["qvel"][3], 0.0)
     assert out["cost"][3] == 1e6 and not out["converged"][3]
+    assert out["fresh"][3], "exception response must still identify its input state"
     for i in [0, 1, 2, 4, 5, 6, 7]:
         assert out["status"][i] == STATUS_OK, f"env {i} affected by env 3 failure"
-    print("[3/5] exception isolation OK (env 3 EXC, siblings healthy)")
+    print("[3/6] exception isolation OK (env 3 EXC, siblings healthy)")
 
     # --- cycle 4: solve_mask ------------------------------------------------
     before = {i: controllers_by_env[i].solve_count for i in range(NUM_ENVS)}
     mask = np.zeros(NUM_ENVS, dtype=bool)
     mask[[0, 7]] = True
-    client.solve_all(states, com_ref, foot_pos, gait, solve_mask=mask)
+    masked_out = client.solve_all(states, com_ref, foot_pos, gait, solve_mask=mask)
     for i in range(NUM_ENVS):
         expected = before[i] + (1 if i in (0, 7) else 0)
         assert controllers_by_env[i].solve_count == expected
-    print("[4/5] solve_mask OK (only masked envs solved)")
+        assert masked_out["fresh"][i] == (i in (0, 7))
+    print("[4/6] solve_mask OK; unsolved rows are explicitly stale")
+
+    # --- typed canonical adapter -------------------------------------------
+    ids = np.arange(NUM_ENVS, dtype=np.int64) + 100
+    state_batch = RobotStateBatch(
+        q_pin=states[:, :19], v_pin=states[:, 19:], foot_pos_w=foot_pos,
+        physics_step_id=ids,
+        reset_generation=client._reset_generation.copy(),
+    )
+    command_batch = MPCCommandBatch(
+        com_reference=com_ref, gait=gait, solve_mask=np.ones(NUM_ENVS, dtype=bool),
+    )
+    typed_out = client.solve_batch(state_batch, command_batch)
+    assert np.all(typed_out.source_state_id == ids)
+    assert np.all(typed_out.fresh)
+    assert typed_out.tau_ff.shape == (NUM_ENVS, 12)
+    print("[5/6] canonical typed state/command/output adapter OK")
 
     # --- shutdown -----------------------------------------------------------
     client.shutdown()
     assert all(not t.is_alive() for t in client._threads), "worker threads still alive"
-    print("[5/5] clean shutdown OK")
+    print("[6/6] clean shutdown OK")
 
     # affinity check: each controller was built exactly once, by one worker
     assert len(controllers_by_env) == NUM_ENVS
     print(f"\nALL PASSED — {NUM_ENVS} envs / {NUM_WORKERS} workers, "
-          f"protocol v1 barrier semantics verified.")
+          f"protocol v{PROTOCOL_VERSION} semantics verified.")
 
 
 if __name__ == "__main__":

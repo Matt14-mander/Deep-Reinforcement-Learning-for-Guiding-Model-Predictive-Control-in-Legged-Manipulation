@@ -30,14 +30,25 @@ from .defs import (
     CMD_SHUTDOWN,
     CMD_SOLVE,
     CTRL_QPOS,
+    CTRL_QVEL,
     CTRL_TORQUE,
     GAIT_DIM,
     INPUT_TENSORS,
     META_CONVERGED,
     META_COST,
+    META_CONSTRAINT_VIOLATION,
+    META_DYNAMICS_GAP,
+    META_ITERATIONS,
+    META_SOLVE_TIME,
     META_STATUS,
+    OUT_ID_RESET_GENERATION,
+    OUT_ID_SOLUTION,
+    OUT_ID_SOURCE_STATE,
     OUTPUT_TENSORS,
+    PROTOCOL_VERSION,
     STATE_DIM,
+    STATE_ID_PHYSICS_STEP,
+    STATE_ID_RESET_GENERATION,
     TRIGGER_BASENAME,
     partition_envs,
 )
@@ -119,6 +130,8 @@ class MPCClusterClient:
         self._partitions = partition_envs(num_envs, num_workers)
         self.num_workers = len(self._partitions)
         self._pending_reset = np.zeros(num_envs, dtype=bool)
+        self._physics_step_ids = np.full(num_envs, -1, dtype=np.int32)
+        self._reset_generation = np.zeros(num_envs, dtype=np.int32)
         self._proc = None
         self._cfg_path = None
         self._threads = []
@@ -188,7 +201,9 @@ class MPCClusterClient:
 
     def mark_reset(self, env_ids: Sequence[int]):
         """Queue controller.reset() for these envs; consumed by the next solve_all."""
-        self._pending_reset[np.asarray(env_ids, dtype=int)] = True
+        indices = np.asarray(env_ids, dtype=int)
+        self._pending_reset[indices] = True
+        self._reset_generation[indices] += 1
 
     def solve_all(
         self,
@@ -197,9 +212,11 @@ class MPCClusterClient:
         foot_pos: np.ndarray,    # (E, 4, 3) or (E, 12)
         gait: np.ndarray,        # (E, 3)
         solve_mask: Optional[np.ndarray] = None,  # (E,) bool; default all
+        physics_step_ids: Optional[np.ndarray] = None,  # (E,) int
+        reset_generation: Optional[np.ndarray] = None,  # (E,) int
     ) -> Dict[str, np.ndarray]:
         """One synchronous solve cycle over all envs. Returns copies:
-        torques (E,12), qpos (E,12), cost (E,), converged (E,) bool, status (E,).
+        torques/qpos/qvel, solver diagnostics, and response provenance IDs.
         """
         E = self.num_envs
         buf = self.tensors.buf
@@ -207,6 +224,22 @@ class MPCClusterClient:
         buf["mpc_com_ref"][:] = com_ref.reshape(E, self.horizon_steps * 3)
         buf["mpc_foot_pos"][:] = foot_pos.reshape(E, 12)
         buf["mpc_gait"][:] = gait.reshape(E, GAIT_DIM)
+        buf["mpc_protocol"][:, 0] = PROTOCOL_VERSION
+
+        if physics_step_ids is None:
+            self._physics_step_ids += 1
+        else:
+            supplied = np.asarray(physics_step_ids, dtype=np.int32).reshape(E)
+            if np.any(supplied < self._physics_step_ids):
+                raise ValueError("physics_step_ids must be monotonically non-decreasing")
+            self._physics_step_ids[:] = supplied
+        if reset_generation is not None:
+            supplied = np.asarray(reset_generation, dtype=np.int32).reshape(E)
+            if np.any(supplied < self._reset_generation):
+                raise ValueError("reset_generation must be monotonically non-decreasing")
+            self._reset_generation[:] = supplied
+        buf["mpc_state_ids"][:, STATE_ID_PHYSICS_STEP] = self._physics_step_ids
+        buf["mpc_state_ids"][:, STATE_ID_RESET_GENERATION] = self._reset_generation
 
         cmd = np.where(
             solve_mask if solve_mask is not None else np.ones(E, dtype=bool),
@@ -232,13 +265,55 @@ class MPCClusterClient:
         for name in OUTPUT_TENSORS:
             self.tensors.pull(name, 0, E)
 
+        source_state_id = buf["mpc_out_ids"][:, OUT_ID_SOURCE_STATE].copy()
+        output_generation = buf["mpc_out_ids"][:, OUT_ID_RESET_GENERATION].copy()
+        fresh = (
+            (source_state_id == self._physics_step_ids)
+            & (output_generation == self._reset_generation)
+        )
         return {
             "torques": buf["mpc_out_ctrl"][:, CTRL_TORQUE].copy(),
             "qpos": buf["mpc_out_ctrl"][:, CTRL_QPOS].copy(),
+            "qvel": buf["mpc_out_ctrl"][:, CTRL_QVEL].copy(),
             "cost": buf["mpc_out_meta"][:, META_COST].copy(),
             "converged": buf["mpc_out_meta"][:, META_CONVERGED] > 0.5,
             "status": buf["mpc_out_meta"][:, META_STATUS].copy(),
+            "solve_time": buf["mpc_out_meta"][:, META_SOLVE_TIME].copy(),
+            "iterations": buf["mpc_out_meta"][:, META_ITERATIONS].copy(),
+            "dynamics_gap": buf["mpc_out_meta"][:, META_DYNAMICS_GAP].copy(),
+            "constraint_violation": buf["mpc_out_meta"][:, META_CONSTRAINT_VIOLATION].copy(),
+            "source_state_id": source_state_id,
+            "solution_id": buf["mpc_out_ids"][:, OUT_ID_SOLUTION].copy(),
+            "reset_generation": output_generation,
+            "fresh": fresh,
         }
+
+    def solve_batch(self, state, command):
+        """Solve using the canonical typed interface.
+
+        Kept as a thin adapter so existing callers of :meth:`solve_all` remain
+        valid while Stage-1 code migrates to explicit contracts.
+        """
+        from RL_Bezier_MPC.interfaces import MPCOutputBatch
+
+        raw = self.solve_all(
+            states=state.pin_state,
+            com_ref=command.com_reference,
+            foot_pos=state.foot_pos_w,
+            gait=command.gait,
+            solve_mask=command.solve_mask,
+            physics_step_ids=state.physics_step_id,
+            reset_generation=state.reset_generation,
+        )
+        return MPCOutputBatch(
+            tau_ff=raw["torques"], q_ref=raw["qpos"], dq_ref=raw["qvel"],
+            cost=raw["cost"], converged=raw["converged"], status=raw["status"],
+            solve_time=raw["solve_time"], iterations=raw["iterations"],
+            dynamics_gap=raw["dynamics_gap"],
+            constraint_violation=raw["constraint_violation"],
+            source_state_id=raw["source_state_id"], solution_id=raw["solution_id"],
+            reset_generation=raw["reset_generation"], fresh=raw["fresh"],
+        )
 
     def shutdown(self):
         if self._closed:

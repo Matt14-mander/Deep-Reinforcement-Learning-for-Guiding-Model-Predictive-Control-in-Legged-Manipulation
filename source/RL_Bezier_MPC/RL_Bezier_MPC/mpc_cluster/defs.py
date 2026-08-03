@@ -16,7 +16,7 @@ from typing import Dict, List, NamedTuple
 
 import numpy as np
 
-PROTOCOL_VERSION = 1
+PROTOCOL_VERSION = 2
 
 # --- Command bits (mpc_cmd tensor, int32) -----------------------------------
 CMD_IDLE = 0
@@ -27,6 +27,7 @@ CMD_SHUTDOWN = 4  # worker acks, then exits its loop
 # --- Status codes (mpc_out_meta[:, META_STATUS]) -----------------------------
 STATUS_OK = 0.0
 STATUS_EXCEPTION = 1.0  # solve raised; outputs invalid, env guard takes over
+STATUS_PROTOCOL_MISMATCH = 2.0
 
 # --- Column indices ----------------------------------------------------------
 STATE_DIM = 37          # q (19) + v (18), Pinocchio ordering
@@ -36,14 +37,28 @@ FOOT_POS_DIM = 12       # 4 feet x 3, ordered by FOOT_ORDER
 # {foot_name: (3,)}; both sides serialize through this fixed order.
 FOOT_ORDER = ("LF", "RF", "LH", "RH")
 GAIT_DIM = 3            # step_length / step_height / step_frequency modulation
-OUT_CTRL_DIM = 24       # [0:12] feedforward torques, [12:24] predicted joint positions
+OUT_CTRL_DIM = 36       # torque / predicted joint position / predicted joint velocity
 CTRL_TORQUE = slice(0, 12)
 CTRL_QPOS = slice(12, 24)
+CTRL_QVEL = slice(24, 36)
 
-OUT_META_DIM = 3
+STATE_IDS_DIM = 2       # physics_step_id / reset_generation
+STATE_ID_PHYSICS_STEP = 0
+STATE_ID_RESET_GENERATION = 1
+
+OUT_IDS_DIM = 3         # source_state_id / solution_id / reset_generation
+OUT_ID_SOURCE_STATE = 0
+OUT_ID_SOLUTION = 1
+OUT_ID_RESET_GENERATION = 2
+
+OUT_META_DIM = 7
 META_COST = 0
 META_CONVERGED = 1
 META_STATUS = 2
+META_SOLVE_TIME = 3
+META_ITERATIONS = 4
+META_DYNAMICS_GAP = 5
+META_CONSTRAINT_VIOLATION = 6
 
 # Fallback standing joint positions (matches env fallback pose)
 STANDING_JOINTS = np.array(
@@ -64,14 +79,20 @@ def tensor_specs(horizon_steps: int) -> List[TensorSpec]:
         TensorSpec("mpc_com_ref", horizon_steps * 3, "double"),
         TensorSpec("mpc_foot_pos", FOOT_POS_DIM, "double"),
         TensorSpec("mpc_gait", GAIT_DIM, "double"),
+        TensorSpec("mpc_protocol", 1, "int"),
+        TensorSpec("mpc_state_ids", STATE_IDS_DIM, "int"),
         TensorSpec("mpc_cmd", 1, "int"),
         TensorSpec("mpc_out_ctrl", OUT_CTRL_DIM, "double"),
         TensorSpec("mpc_out_meta", OUT_META_DIM, "double"),
+        TensorSpec("mpc_out_ids", OUT_IDS_DIM, "int"),
     ]
 
 
-INPUT_TENSORS = ("mpc_states", "mpc_com_ref", "mpc_foot_pos", "mpc_gait", "mpc_cmd")
-OUTPUT_TENSORS = ("mpc_out_ctrl", "mpc_out_meta")
+INPUT_TENSORS = (
+    "mpc_states", "mpc_com_ref", "mpc_foot_pos", "mpc_gait",
+    "mpc_protocol", "mpc_state_ids", "mpc_cmd",
+)
+OUTPUT_TENSORS = ("mpc_out_ctrl", "mpc_out_meta", "mpc_out_ids")
 
 # Producer/Consumer channel used for solve triggering
 TRIGGER_BASENAME = "mpc_go"
