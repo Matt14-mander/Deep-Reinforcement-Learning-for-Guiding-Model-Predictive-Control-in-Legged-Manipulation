@@ -16,7 +16,7 @@ from typing import Dict, List, NamedTuple
 
 import numpy as np
 
-PROTOCOL_VERSION = 2
+PROTOCOL_VERSION = 3
 
 # --- Command bits (mpc_cmd tensor, int32) -----------------------------------
 CMD_IDLE = 0
@@ -32,6 +32,9 @@ STATUS_PROTOCOL_MISMATCH = 2.0
 # --- Column indices ----------------------------------------------------------
 STATE_DIM = 37          # q (19) + v (18), Pinocchio ordering
 FOOT_POS_DIM = 12       # 4 feet x 3, ordered by FOOT_ORDER
+FOOT_VEL_DIM = 12       # 4 feet x xyz world-frame linear velocity
+FOOT_CONTACT_DIM = 4    # boolean contact state encoded as int32
+FOOT_FORCE_DIM = 12     # 4 feet x xyz world-frame net contact force
 
 # Wire order of feet inside mpc_foot_pos. The controller API takes a dict
 # {foot_name: (3,)}; both sides serialize through this fixed order.
@@ -51,7 +54,7 @@ OUT_ID_SOURCE_STATE = 0
 OUT_ID_SOLUTION = 1
 OUT_ID_RESET_GENERATION = 2
 
-OUT_META_DIM = 7
+OUT_META_DIM = 8
 META_COST = 0
 META_CONVERGED = 1
 META_STATUS = 2
@@ -59,6 +62,7 @@ META_SOLVE_TIME = 3
 META_ITERATIONS = 4
 META_DYNAMICS_GAP = 5
 META_CONSTRAINT_VIOLATION = 6
+META_SOURCE_TIMESTAMP = 7
 
 # Fallback standing joint positions (matches env fallback pose)
 STANDING_JOINTS = np.array(
@@ -78,7 +82,11 @@ def tensor_specs(horizon_steps: int) -> List[TensorSpec]:
         TensorSpec("mpc_states", STATE_DIM, "double"),
         TensorSpec("mpc_com_ref", horizon_steps * 3, "double"),
         TensorSpec("mpc_foot_pos", FOOT_POS_DIM, "double"),
+        TensorSpec("mpc_foot_vel", FOOT_VEL_DIM, "double"),
+        TensorSpec("mpc_foot_contact", FOOT_CONTACT_DIM, "int"),
+        TensorSpec("mpc_foot_force", FOOT_FORCE_DIM, "double"),
         TensorSpec("mpc_gait", GAIT_DIM, "double"),
+        TensorSpec("mpc_state_time", 1, "double"),
         TensorSpec("mpc_protocol", 1, "int"),
         TensorSpec("mpc_state_ids", STATE_IDS_DIM, "int"),
         TensorSpec("mpc_cmd", 1, "int"),
@@ -89,7 +97,8 @@ def tensor_specs(horizon_steps: int) -> List[TensorSpec]:
 
 
 INPUT_TENSORS = (
-    "mpc_states", "mpc_com_ref", "mpc_foot_pos", "mpc_gait",
+    "mpc_states", "mpc_com_ref", "mpc_foot_pos", "mpc_foot_vel",
+    "mpc_foot_contact", "mpc_foot_force", "mpc_gait", "mpc_state_time",
     "mpc_protocol", "mpc_state_ids", "mpc_cmd",
 )
 OUTPUT_TENSORS = ("mpc_out_ctrl", "mpc_out_meta", "mpc_out_ids")

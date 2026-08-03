@@ -24,6 +24,7 @@ The environment handles the frequency mismatch between RL (5 Hz),
 MPC (50 Hz), and physics (200 Hz) through appropriate buffering.
 """
 
+from collections import deque
 from typing import Dict, Optional, Tuple
 
 import time
@@ -181,6 +182,9 @@ class QuadrupedMPCEnv(DirectRLEnv):
         self._mpc_timing_accum_ms = 0.0
         self._mpc_timing_count = 0
         self._mpc_debug_tick = 0
+        # Bounded env-0 history used by standalone Stage-1 acceptance tests.
+        # It is intentionally bounded so long training runs cannot leak memory.
+        self._mpc_diagnostic_history = deque(maxlen=10000)
 
         # Build joint reordering maps between Isaac Lab and Pinocchio
         # Isaac Lab (USD) and Pinocchio (URDF) may have different joint orderings
@@ -724,7 +728,10 @@ class QuadrupedMPCEnv(DirectRLEnv):
             out=self.trajectory_phases,
         )
 
-    def _prepare_env_mpc_inputs(self, env_idx, robot_states, bezier_params, gait_mods):
+    def _prepare_env_mpc_inputs(
+        self, env_idx, robot_states, bezier_params, gait_mods,
+        foot_positions_override=None,
+    ):
         """Per-env MPC input preparation (trajectory regen/blend/slice/pad + feet).
 
         Shared verbatim by the serial path and the cluster path so both solve
@@ -797,8 +804,11 @@ class QuadrupedMPCEnv(DirectRLEnv):
 
             com_reference = np.concatenate([com_reference, padding_points], axis=0)
 
-        # Get current foot positions (dummy for now)
-        foot_positions = self._get_foot_positions_numpy(env_idx, robot_states[env_idx])
+        foot_positions = foot_positions_override
+        if foot_positions is None:
+            foot_positions = self._get_foot_positions_numpy(
+                env_idx, robot_states[env_idx]
+            )
         return com_reference, foot_positions
 
     def _pre_physics_step_cluster(self, robot_states, bezier_params, gait_mods):
@@ -814,11 +824,20 @@ class QuadrupedMPCEnv(DirectRLEnv):
 
         E = self.num_envs
         H = self.cfg.mpc_horizon_steps
+        state_timestamp = np.full(E, time.monotonic(), dtype=np.float64)
+        foot_pos_batch, foot_vel, foot_contact, foot_force = (
+            self._get_cluster_foot_observations_numpy(robot_states)
+        )
         com_refs = np.zeros((E, H, 3))
         foot_pos = np.zeros((E, 12))
         for env_idx in range(E):
+            foot_positions_override = {
+                name: foot_pos_batch[env_idx, index].copy()
+                for index, name in enumerate(FOOT_ORDER)
+            }
             com_reference, foot_positions = self._prepare_env_mpc_inputs(
-                env_idx, robot_states, bezier_params, gait_mods
+                env_idx, robot_states, bezier_params, gait_mods,
+                foot_positions_override=foot_positions_override,
             )
             com_refs[env_idx] = com_reference
             # foot_positions is a dict {name: (3,)}; serialize in wire order
@@ -830,8 +849,21 @@ class QuadrupedMPCEnv(DirectRLEnv):
             states=robot_states,
             com_ref=com_refs,
             foot_pos=foot_pos,
+            foot_vel=foot_vel,
+            foot_contact=foot_contact,
+            foot_force=foot_force,
             gait=gait_mods,
+            timestamp=state_timestamp,
         )
+        self._mpc_diagnostic_history.append({
+            "fresh": bool(out["fresh"][0]),
+            "status": float(out["status"][0]),
+            "solve_time": float(out["solve_time"][0]),
+            "solution_age": float(out["solution_age"][0]),
+            "iterations": float(out["iterations"][0]),
+            "dynamics_gap": float(out["dynamics_gap"][0]),
+            "constraint_violation": float(out["constraint_violation"][0]),
+        })
 
         # Cover multiple complete gait cycles during standalone diagnostics.
         if self.cfg.mpc_verbose and self._mpc_debug_tick < 120:
@@ -839,14 +871,8 @@ class QuadrupedMPCEnv(DirectRLEnv):
             q_target_pin = out["qpos"][0]
             q_current_pin = robot_states[0, 7:19]
             foot_z = foot_pos[0].reshape(4, 3)[:, 2]
-            contact_forces = self.foot_contact_sensor.data.net_forces_w[
-                0, self._contact_sensor_foot_indices, :
-            ]
-            physical_contacts = (
-                torch.linalg.vector_norm(contact_forces, dim=-1)
-                > self.cfg.foot_contact_force_threshold
-            ).to(device="cpu").numpy()
-            contact_force_z = contact_forces[:, 2].to(device="cpu").numpy()
+            physical_contacts = foot_contact[0]
+            contact_force_z = foot_force[0, :, 2]
             # Both arrays below are already in Pinocchio's by-leg order
             # LF/RF/LH/RH, three joints per leg. Per-leg diagnostics expose a
             # rear-leg tracking or torque asymmetry hidden by the global norm.
@@ -870,7 +896,10 @@ class QuadrupedMPCEnv(DirectRLEnv):
                 f"state_id={int(out['source_state_id'][0])} "
                 f"solution_id={int(out['solution_id'][0])} "
                 f"solve_ms={float(out['solve_time'][0]) * 1e3:.1f} "
+                f"age_ms={float(out['solution_age'][0]) * 1e3:.1f} "
                 f"iter={float(out['iterations'][0]):.0f} "
+                f"gap={float(out['dynamics_gap'][0]):.2e} "
+                f"viol={float(out['constraint_violation'][0]):.2e} "
                 f"|u|={np.linalg.norm(raw_torque):.2f} "
                 f"max|u|={np.max(np.abs(raw_torque)):.2f} "
                 f"leg_qerr=[{','.join(f'{value:.3f}' for value in q_error_by_leg)}] "
@@ -1598,6 +1627,48 @@ class QuadrupedMPCEnv(DirectRLEnv):
                 states[:, nq + 6:nq + 6 + num_robot_joints] = joint_vel[:, :num_robot_joints]
 
         return states
+
+    def _get_cluster_foot_observations_numpy(self, robot_states):
+        """Sample foot kinematics/contact tensors once for the whole batch.
+
+        All returned arrays use protocol order LF/RF/LH/RH and world-frame
+        coordinates.  Keeping this sampling batched avoids four GPU-to-CPU
+        synchronizations per environment at every MPC tick.
+        """
+        E = self.num_envs
+        if self._foot_body_indices is not None:
+            body_indices = self._foot_body_indices.tolist()
+            foot_pos = self.robot.data.body_pos_w[:, body_indices, :].detach()
+            body_lin_vel_w = getattr(self.robot.data, "body_lin_vel_w", None)
+            if body_lin_vel_w is None:
+                body_lin_vel_w = self.robot.data.body_state_w[..., 7:10]
+            foot_vel = body_lin_vel_w[:, body_indices, :].detach()
+            foot_pos = foot_pos.cpu().numpy().copy()
+            foot_vel = foot_vel.cpu().numpy().copy()
+        else:
+            foot_pos = np.zeros((E, 4, 3), dtype=np.float64)
+            for env_idx in range(E):
+                positions = self._get_foot_positions_numpy(
+                    env_idx, robot_states[env_idx]
+                )
+                foot_pos[env_idx] = np.stack(
+                    [positions[name] for name in ("LF", "RF", "LH", "RH")]
+                )
+            foot_vel = np.zeros_like(foot_pos)
+
+        contact_forces = self.foot_contact_sensor.data.net_forces_w[
+            :, self._contact_sensor_foot_indices, :
+        ].detach()
+        foot_contact = (
+            torch.linalg.vector_norm(contact_forces, dim=-1)
+            > self.cfg.foot_contact_force_threshold
+        )
+        return (
+            foot_pos,
+            foot_vel,
+            foot_contact.cpu().numpy().copy(),
+            contact_forces.cpu().numpy().copy(),
+        )
 
     def _get_foot_positions_numpy(
         self, env_idx: int, state: np.ndarray

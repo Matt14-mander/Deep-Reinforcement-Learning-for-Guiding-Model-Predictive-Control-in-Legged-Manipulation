@@ -85,12 +85,16 @@ CUDA 进程 fork/spawn 的全部雷区，集群可独立启停/重启/调试。
 | `mpc_states` | (E, 37) | Double | env→wkr | q(19)+v(18)，Pinocchio 顺序 |
 | `mpc_com_ref` | (E, 75) | Double | env→wkr | 25×3 已切片+padding，row-major 摊平 |
 | `mpc_foot_pos` | (E, 12) | Double | env→wkr | 4×3 当前足端位置 |
+| `mpc_foot_vel` | (E, 12) | Double | env→wkr | 4×3 世界系足端线速度 |
+| `mpc_foot_contact` | (E, 4) | Int | env→wkr | LF/RF/LH/RH 物理接触状态 |
+| `mpc_foot_force` | (E, 12) | Double | env→wkr | 4×3 世界系净接触力 |
 | `mpc_gait` | (E, 3) | Double | env→wkr | step_length/height/frequency mod |
-| `mpc_protocol` | (E, 1) | Int | env→wkr | wire protocol version，当前为 2 |
+| `mpc_state_time` | (E, 1) | Double | env→wkr | 单调时钟采样时间戳（秒） |
+| `mpc_protocol` | (E, 1) | Int | env→wkr | wire protocol version，当前为 3 |
 | `mpc_state_ids` | (E, 2) | Int | env→wkr | physics_step_id, reset_generation |
 | `mpc_cmd` | (E, 1) | Int | env→wkr | 位标志: SOLVE=1, RESET=2, IDLE=0 |
 | `mpc_out_ctrl` | (E, 36) | Double | wkr→env | tau_ff(12), q_ref(12), dq_ref(12) |
-| `mpc_out_meta` | (E, 7) | Double | wkr→env | cost, converged, status, solve_time, iterations, dynamics_gap, constraint_violation |
+| `mpc_out_meta` | (E, 8) | Double | wkr→env | cost, converged, status, solve_time, iterations, dynamics_gap, constraint_violation, source_timestamp |
 | `mpc_out_ids` | (E, 3) | Int | wkr→env | source_state_id, solution_id, reset_generation |
 
 namespace 统一为 `rlbmpc_<run_id>`，防多训练任务共存冲突。

@@ -522,6 +522,8 @@ def main():
     print("RUNNING SIMULATION")
     print("=" * 70)
     obs, _ = env.reset()
+    if hasattr(env, "_mpc_diagnostic_history"):
+        env._mpc_diagnostic_history.clear()
     initial_tick_count = int(env._lifetime_mpc_tick_counts.sum().item())
     initial_guard_count = int(env._lifetime_guard_counts.sum().item())
     initial_converged_count = int(
@@ -687,6 +689,48 @@ def main():
     print(f"MPC tick count:    {mpc_tick_count}")
     print(f"Guard rate:        {100.0 * guard_count / max(mpc_tick_count, 1):.1f}%")
     print(f"Tick convergence:  {100.0 * converged_tick_count / max(mpc_tick_count, 1):.1f}%")
+
+    diagnostic_history = list(getattr(env, "_mpc_diagnostic_history", ()))
+    if diagnostic_history:
+        fresh_rate = 100.0 * np.mean([item["fresh"] for item in diagnostic_history])
+        status_ok_rate = 100.0 * np.mean([
+            item["status"] == 0.0 for item in diagnostic_history
+        ])
+
+        def finite_values(name):
+            values = np.asarray([item[name] for item in diagnostic_history], dtype=float)
+            return values[np.isfinite(values)]
+
+        solve_times = finite_values("solve_time") * 1e3
+        solution_ages = finite_values("solution_age") * 1e3
+        iterations = finite_values("iterations")
+        gaps = finite_values("dynamics_gap")
+        violations = finite_values("constraint_violation")
+        solve_p95 = float(np.percentile(solve_times, 95)) if solve_times.size else float("nan")
+        age_p95 = float(np.percentile(solution_ages, 95)) if solution_ages.size else float("nan")
+        solve_mean = float(np.mean(solve_times)) if solve_times.size else float("nan")
+        age_mean = float(np.mean(solution_ages)) if solution_ages.size else float("nan")
+        print("\nStage-1 IPC/MPC acceptance metrics (env 0):")
+        print(f"  Fresh responses: {fresh_rate:.1f}%")
+        print(f"  Status OK:       {status_ok_rate:.1f}%")
+        print(f"  Solve time:      mean={solve_mean:.1f}ms p95={solve_p95:.1f}ms")
+        print(f"  Solution age:    mean={age_mean:.1f}ms p95={age_p95:.1f}ms")
+        if iterations.size:
+            print(f"  Iterations:      mean={np.mean(iterations):.1f} max={np.max(iterations):.0f}")
+        if gaps.size:
+            print(f"  Dynamics gap:    max={np.max(gaps):.3e}")
+        else:
+            print("  Dynamics gap:    unavailable in this Crocoddyl binding")
+        if violations.size:
+            print(f"  Constraint viol: max={np.max(violations):.3e}")
+        else:
+            print("  Constraint viol: unavailable in this Crocoddyl binding")
+        latency_pass = np.isfinite(age_p95) and age_p95 <= env_cfg.mpc_dt * 1e3
+        transport_pass = fresh_rate == 100.0 and status_ok_rate == 100.0
+        print(
+            "  Transport check: " + ("PASS" if transport_pass else "FAIL")
+            + " | 50 Hz latency check: " + ("PASS" if latency_pass else "FAIL")
+        )
 
     # Distance traveled
     x_traveled = positions_arr[-1, 0] - positions_arr[0, 0]

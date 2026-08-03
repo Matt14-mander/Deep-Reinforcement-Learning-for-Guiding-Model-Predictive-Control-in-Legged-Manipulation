@@ -40,6 +40,7 @@ from .defs import (
     META_DYNAMICS_GAP,
     META_ITERATIONS,
     META_SOLVE_TIME,
+    META_SOURCE_TIMESTAMP,
     META_STATUS,
     OUT_ID_RESET_GENERATION,
     OUT_ID_SOLUTION,
@@ -214,6 +215,10 @@ class MPCClusterClient:
         solve_mask: Optional[np.ndarray] = None,  # (E,) bool; default all
         physics_step_ids: Optional[np.ndarray] = None,  # (E,) int
         reset_generation: Optional[np.ndarray] = None,  # (E,) int
+        timestamp: Optional[np.ndarray] = None,  # (E,) monotonic seconds
+        foot_vel: Optional[np.ndarray] = None,  # (E, 4, 3) world frame
+        foot_contact: Optional[np.ndarray] = None,  # (E, 4) bool
+        foot_force: Optional[np.ndarray] = None,  # (E, 4, 3) world frame
     ) -> Dict[str, np.ndarray]:
         """One synchronous solve cycle over all envs. Returns copies:
         torques/qpos/qvel, solver diagnostics, and response provenance IDs.
@@ -223,7 +228,24 @@ class MPCClusterClient:
         buf["mpc_states"][:] = states.reshape(E, STATE_DIM)
         buf["mpc_com_ref"][:] = com_ref.reshape(E, self.horizon_steps * 3)
         buf["mpc_foot_pos"][:] = foot_pos.reshape(E, 12)
+        buf["mpc_foot_vel"][:] = (
+            0.0 if foot_vel is None else np.asarray(foot_vel).reshape(E, 12)
+        )
+        buf["mpc_foot_contact"][:] = (
+            0 if foot_contact is None
+            else np.asarray(foot_contact, dtype=np.int32).reshape(E, 4)
+        )
+        buf["mpc_foot_force"][:] = (
+            0.0 if foot_force is None else np.asarray(foot_force).reshape(E, 12)
+        )
         buf["mpc_gait"][:] = gait.reshape(E, GAIT_DIM)
+        if timestamp is None:
+            state_timestamp = np.full(E, time.monotonic(), dtype=np.float64)
+        else:
+            state_timestamp = np.asarray(timestamp, dtype=np.float64).reshape(E)
+        if not np.all(np.isfinite(state_timestamp)):
+            raise ValueError("timestamp must contain only finite values")
+        buf["mpc_state_time"][:, 0] = state_timestamp
         buf["mpc_protocol"][:, 0] = PROTOCOL_VERSION
 
         if physics_step_ids is None:
@@ -271,6 +293,8 @@ class MPCClusterClient:
             (source_state_id == self._physics_step_ids)
             & (output_generation == self._reset_generation)
         )
+        source_timestamp = buf["mpc_out_meta"][:, META_SOURCE_TIMESTAMP].copy()
+        solution_age = np.maximum(0.0, time.monotonic() - source_timestamp)
         return {
             "torques": buf["mpc_out_ctrl"][:, CTRL_TORQUE].copy(),
             "qpos": buf["mpc_out_ctrl"][:, CTRL_QPOS].copy(),
@@ -282,6 +306,8 @@ class MPCClusterClient:
             "iterations": buf["mpc_out_meta"][:, META_ITERATIONS].copy(),
             "dynamics_gap": buf["mpc_out_meta"][:, META_DYNAMICS_GAP].copy(),
             "constraint_violation": buf["mpc_out_meta"][:, META_CONSTRAINT_VIOLATION].copy(),
+            "source_timestamp": source_timestamp,
+            "solution_age": solution_age,
             "source_state_id": source_state_id,
             "solution_id": buf["mpc_out_ids"][:, OUT_ID_SOLUTION].copy(),
             "reset_generation": output_generation,
@@ -304,6 +330,10 @@ class MPCClusterClient:
             solve_mask=command.solve_mask,
             physics_step_ids=state.physics_step_id,
             reset_generation=state.reset_generation,
+            timestamp=state.timestamp,
+            foot_vel=state.foot_vel_w,
+            foot_contact=state.foot_contact,
+            foot_force=state.foot_force_w,
         )
         return MPCOutputBatch(
             tau_ff=raw["torques"], q_ref=raw["qpos"], dq_ref=raw["qvel"],
@@ -312,7 +342,9 @@ class MPCClusterClient:
             dynamics_gap=raw["dynamics_gap"],
             constraint_violation=raw["constraint_violation"],
             source_state_id=raw["source_state_id"], solution_id=raw["solution_id"],
-            reset_generation=raw["reset_generation"], fresh=raw["fresh"],
+            reset_generation=raw["reset_generation"],
+            source_timestamp=raw["source_timestamp"],
+            solution_age=raw["solution_age"], fresh=raw["fresh"],
         )
 
     def shutdown(self):

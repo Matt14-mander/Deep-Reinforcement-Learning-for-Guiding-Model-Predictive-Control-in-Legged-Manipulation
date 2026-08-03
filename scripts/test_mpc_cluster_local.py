@@ -14,6 +14,7 @@ exception -> status reporting, barrier semantics, and clean shutdown.
 
 import os
 import sys
+import time
 import types
 from types import SimpleNamespace
 
@@ -63,6 +64,8 @@ class DummySolution:
         self.converged = converged
         self.solve_time = 0.001 + cost * 1e-6
         self.iterations = 4
+        self.dynamics_gap = 1e-5
+        self.constraint_violation = 2e-6
 
 
 class DummyController:
@@ -81,12 +84,16 @@ class DummyController:
         self.reset_count += 1
 
     def solve(self, current_state, com_reference, current_foot_positions,
-              gait_params, warm_start=True):
+              current_foot_velocities, current_foot_contacts,
+              current_foot_forces, gait_params, warm_start=True):
         self.solve_count += 1
         assert com_reference.shape == (HORIZON, 3), com_reference.shape
         # controller API contract: dict {foot_name: (3,)} in FOOT_ORDER
         assert set(current_foot_positions.keys()) == {"LF", "RF", "LH", "RH"}
         assert all(v.shape == (3,) for v in current_foot_positions.values())
+        assert all(v.shape == (3,) for v in current_foot_velocities.values())
+        assert all(isinstance(v, bool) for v in current_foot_contacts.values())
+        assert all(v.shape == (3,) for v in current_foot_forces.values())
         if gait_params["step_length"] < 0:
             raise RuntimeError(f"injected failure env {self.env_id}")
         torque = np.full(12, self.env_id + current_state[0])
@@ -144,10 +151,21 @@ def main():
     states[:, 0] = np.arange(NUM_ENVS) * 100.0  # identifiable per env
     com_ref = np.random.randn(NUM_ENVS, HORIZON, 3)
     foot_pos = np.random.randn(NUM_ENVS, 4, 3)
+    foot_vel = np.random.randn(NUM_ENVS, 4, 3)
+    foot_contact = np.zeros((NUM_ENVS, 4), dtype=bool)
+    foot_contact[:, (0, 3)] = True
+    foot_force = np.random.randn(NUM_ENVS, 4, 3)
     gait = np.ones((NUM_ENVS, 3))
 
     # --- cycle 1: normal solve, verify routing ------------------------------
-    out = client.solve_all(states, com_ref, foot_pos, gait)
+    sample_time = np.full(NUM_ENVS, time.monotonic())
+    out = client.solve_all(
+        states, com_ref, foot_pos, gait,
+        timestamp=sample_time,
+        foot_vel=foot_vel,
+        foot_contact=foot_contact,
+        foot_force=foot_force,
+    )
     for i in range(NUM_ENVS):
         expected_torque = i + states[i, 0]
         assert np.allclose(out["torques"][i], expected_torque), \
@@ -162,6 +180,13 @@ def main():
         assert out["reset_generation"][i] == 0
         assert out["fresh"][i]
         assert out["iterations"][i] == 4
+        assert out["dynamics_gap"][i] == 1e-5
+        assert out["constraint_violation"][i] == 2e-6
+        assert out["source_timestamp"][i] == sample_time[i]
+        assert out["solution_age"][i] >= 0.0
+    assert np.allclose(client.tensors.buf["mpc_foot_vel"], foot_vel.reshape(NUM_ENVS, 12))
+    assert np.array_equal(client.tensors.buf["mpc_foot_contact"], foot_contact)
+    assert np.allclose(client.tensors.buf["mpc_foot_force"], foot_force.reshape(NUM_ENVS, 12))
     print("[1/6] routing and response provenance IDs OK")
 
     # --- cycle 2: RESET forwarding ------------------------------------------
@@ -210,6 +235,10 @@ def main():
         q_pin=states[:, :19], v_pin=states[:, 19:], foot_pos_w=foot_pos,
         physics_step_id=ids,
         reset_generation=client._reset_generation.copy(),
+        timestamp=np.full(NUM_ENVS, time.monotonic()),
+        foot_vel_w=foot_vel,
+        foot_contact=foot_contact,
+        foot_force_w=foot_force,
     )
     command_batch = MPCCommandBatch(
         com_reference=com_ref, gait=gait, solve_mask=np.ones(NUM_ENVS, dtype=bool),

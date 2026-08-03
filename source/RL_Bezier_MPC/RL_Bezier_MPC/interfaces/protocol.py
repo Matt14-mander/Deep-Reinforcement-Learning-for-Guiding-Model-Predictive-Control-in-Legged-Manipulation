@@ -96,6 +96,8 @@ class MPCOutputBatch:
     source_state_id: np.ndarray
     solution_id: np.ndarray
     reset_generation: np.ndarray
+    source_timestamp: np.ndarray
+    solution_age: np.ndarray
     fresh: np.ndarray
 
     def __post_init__(self):
@@ -114,6 +116,8 @@ class MPCOutputBatch:
             ("source_state_id", (e,), np.int64),
             ("solution_id", (e,), np.int64),
             ("reset_generation", (e,), np.int64),
+            ("source_timestamp", (e,), np.float64),
+            ("solution_age", (e,), np.float64),
             ("fresh", (e,), bool),
         ):
             object.__setattr__(self, name, _array(name, getattr(self, name), shape, dtype))

@@ -36,6 +36,7 @@ from .defs import (
     META_DYNAMICS_GAP,
     META_ITERATIONS,
     META_SOLVE_TIME,
+    META_SOURCE_TIMESTAMP,
     META_STATUS,
     OUT_ID_RESET_GENERATION,
     OUT_ID_SOLUTION,
@@ -186,6 +187,7 @@ def worker_loop(
             out_ids[OUT_ID_SOURCE_STATE] = source_state_id
             out_ids[OUT_ID_SOLUTION] = solution_ids[i]
             out_ids[OUT_ID_RESET_GENERATION] = reset_generation
+            source_timestamp = float(tensors.buf["mpc_state_time"][i, 0])
 
             received_version = int(tensors.buf["mpc_protocol"][i, 0])
             if received_version != PROTOCOL_VERSION:
@@ -198,15 +200,31 @@ def worker_loop(
                 meta[META_COST] = 1e6
                 meta[META_CONVERGED] = 0.0
                 meta[META_STATUS] = STATUS_PROTOCOL_MISMATCH
+                meta[META_SOURCE_TIMESTAMP] = source_timestamp
                 continue
 
             try:
                 foot_flat = tensors.buf["mpc_foot_pos"][i].reshape(4, 3)
+                foot_vel_flat = tensors.buf["mpc_foot_vel"][i].reshape(4, 3)
+                foot_force_flat = tensors.buf["mpc_foot_force"][i].reshape(4, 3)
+                foot_contact = tensors.buf["mpc_foot_contact"][i].astype(bool)
                 solution = controllers[i].solve(
                     current_state=tensors.buf["mpc_states"][i],
                     com_reference=tensors.buf["mpc_com_ref"][i].reshape(horizon_steps, 3),
                     current_foot_positions={
                         name: foot_flat[k].copy() for k, name in enumerate(FOOT_ORDER)
+                    },
+                    current_foot_velocities={
+                        name: foot_vel_flat[k].copy()
+                        for k, name in enumerate(FOOT_ORDER)
+                    },
+                    current_foot_contacts={
+                        name: bool(foot_contact[k])
+                        for k, name in enumerate(FOOT_ORDER)
+                    },
+                    current_foot_forces={
+                        name: foot_force_flat[k].copy()
+                        for k, name in enumerate(FOOT_ORDER)
                     },
                     gait_params={
                         "step_length": float(tensors.buf["mpc_gait"][i, 0]),
@@ -236,6 +254,7 @@ def worker_loop(
                 meta[META_CONSTRAINT_VIOLATION] = float(
                     getattr(solution, "constraint_violation", np.nan)
                 )
+                meta[META_SOURCE_TIMESTAMP] = source_timestamp
             except Exception:
                 traceback.print_exc()
                 out = tensors.buf["mpc_out_ctrl"][i]
@@ -250,6 +269,7 @@ def worker_loop(
                 meta[META_ITERATIONS] = np.nan
                 meta[META_DYNAMICS_GAP] = np.nan
                 meta[META_CONSTRAINT_VIOLATION] = np.nan
+                meta[META_SOURCE_TIMESTAMP] = source_timestamp
 
         for name in OUTPUT_TENSORS:
             tensors.push(name, lo, hi)

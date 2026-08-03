@@ -36,7 +36,7 @@ from ..gait.gait_scheduler import GaitScheduler
 from ..gait.ocp_factory import OCPFactory
 from ..trajectory.bezier_foot_trajectory import BezierFootTrajectory
 from ..utils.math_utils import heading_from_tangent, rotation_matrix_z
-from .base_mpc import BaseMPC, MPCSolution
+from .base_mpc import BaseMPC, MPCSolution, solver_residual_norm
 
 # Try to import Crocoddyl
 try:
@@ -243,6 +243,9 @@ class CrocoddylQuadrupedMPC(BaseMPC):
         current_foot_positions: Optional[Dict[str, np.ndarray]] = None,
         gait_params: Optional[Dict[str, float]] = None,
         warm_start: bool = True,
+        current_foot_velocities: Optional[Dict[str, np.ndarray]] = None,
+        current_foot_contacts: Optional[Dict[str, bool]] = None,
+        current_foot_forces: Optional[Dict[str, np.ndarray]] = None,
     ) -> MPCSolution:
         """Solve MPC and return optimal control.
 
@@ -260,6 +263,11 @@ class CrocoddylQuadrupedMPC(BaseMPC):
             com_reference: CoM trajectory from Bezier, shape (T, 3).
             current_foot_positions: Current position of each foot.
                 If None, computed from current_state via FK.
+            current_foot_velocities: Measured world-frame foot velocities.
+            current_foot_contacts: Measured physical contact flags. During
+                Stage 1 these are diagnostic and do not replace scheduled OCP
+                contacts.
+            current_foot_forces: Measured world-frame net contact forces.
             gait_params: Optional RL-provided gait modulation:
                 - "step_length": modifier for step length
                 - "step_height": modifier for step height
@@ -507,6 +515,22 @@ class CrocoddylQuadrupedMPC(BaseMPC):
                 print(f"  Root->CoM offset: {root_to_com_offset}", flush=True)
             print(f"  CoM ref[0]: {ocp_com_reference[0]}", flush=True)
             print(f"  CoM ref[-1]: {ocp_com_reference[-1]}", flush=True)
+            if current_foot_contacts is not None:
+                contact_text = "".join(
+                    "1" if current_foot_contacts.get(name, False) else "0"
+                    for name in ("LF", "RF", "LH", "RH")
+                )
+                force_z_text = "-"
+                if current_foot_forces is not None:
+                    force_z_text = ",".join(
+                        f"{float(current_foot_forces[name][2]):.1f}"
+                        for name in ("LF", "RF", "LH", "RH")
+                    )
+                print(
+                    f"  Physical contacts LF/RF/LH/RH={contact_text} "
+                    f"force_z=[{force_z_text}]",
+                    flush=True,
+                )
             print(
                 "  Isolation: "
                 f"fixed_contacts={self.force_standing_contacts}, "
@@ -807,6 +831,18 @@ class CrocoddylQuadrupedMPC(BaseMPC):
             if predicted_control.size == self.actuation.nu:
                 predicted_controls[index] = predicted_control
 
+        dynamics_gap = solver_residual_norm(solver, "ffeas")
+        constraint_terms = [
+            value for value in (
+                solver_residual_norm(solver, "gfeas"),
+                solver_residual_norm(solver, "hfeas"),
+            )
+            if np.isfinite(value)
+        ]
+        constraint_violation = (
+            max(constraint_terms) if constraint_terms else float("nan")
+        )
+
         return MPCSolution(
             control=control,
             predicted_states=predicted_states,
@@ -815,6 +851,8 @@ class CrocoddylQuadrupedMPC(BaseMPC):
             converged=bool(converged),
             cost=float(solver.cost),
             iterations=int(solver.iter),
+            dynamics_gap=dynamics_gap,
+            constraint_violation=constraint_violation,
         )
 
     def _print_cost_breakdown(self, problem: Any, solver: Any) -> None:
