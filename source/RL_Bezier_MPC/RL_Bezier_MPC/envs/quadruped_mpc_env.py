@@ -156,6 +156,7 @@ class QuadrupedMPCEnv(DirectRLEnv):
                         cfg.mpc_touchdown_gate_height_tolerance
                     ),
                     touchdown_gate_max_steps=cfg.mpc_touchdown_gate_max_steps,
+                    max_joint_torque=cfg.max_joint_torque,
                 )
             else:
                 mpc = None  # Dummy mode / cluster mode
@@ -641,7 +642,20 @@ class QuadrupedMPCEnv(DirectRLEnv):
 
                     # MPC divergence guard: catch exploding or NaN costs, fall back to last-good solution
                     _COST_THRESHOLD = 50000.0
-                    if solution.cost > _COST_THRESHOLD or np.isnan(solution.cost):
+                    raw_control = np.asarray(solution.control, dtype=float)
+                    torque_out_of_bounds = (
+                        raw_control.size != self.cfg.num_joints
+                        or not np.all(np.isfinite(raw_control))
+                        or np.any(
+                            np.abs(raw_control)
+                            > self.cfg.max_joint_torque + 1e-3
+                        )
+                    )
+                    if (
+                        solution.cost > _COST_THRESHOLD
+                        or np.isnan(solution.cost)
+                        or torque_out_of_bounds
+                    ):
                         self.guard_triggered[env_idx] = True
                         failed_cost_for_reward = solution.cost  # save before overwriting with fallback
                         if self._last_good_solutions[env_idx] is not None:
@@ -919,11 +933,20 @@ class QuadrupedMPCEnv(DirectRLEnv):
 
         for env_idx in range(E):
             cost = float(out["cost"][env_idx])
+            raw_torque = np.asarray(out["torques"][env_idx], dtype=float)
+            torque_out_of_bounds = (
+                raw_torque.size != self.cfg.num_joints
+                or not np.all(np.isfinite(raw_torque))
+                or np.any(
+                    np.abs(raw_torque) > self.cfg.max_joint_torque + 1e-3
+                )
+            )
             failed = (
                 not bool(out["fresh"][env_idx])
                 or out["status"][env_idx] != STATUS_OK
                 or np.isnan(cost)
                 or cost > _COST_THRESHOLD
+                or torque_out_of_bounds
             )
             if failed:
                 self.guard_triggered[env_idx] = True
@@ -932,7 +955,12 @@ class QuadrupedMPCEnv(DirectRLEnv):
                 self._last_mpc_converged[env_idx] = False
                 if self._last_good_valid[env_idx]:
                     if env_idx == 0:
-                        reason = "stale" if not out["fresh"][env_idx] else "solver"
+                        if torque_out_of_bounds:
+                            reason = "torque_bounds"
+                        elif not out["fresh"][env_idx]:
+                            reason = "stale"
+                        else:
+                            reason = "solver"
                         print(
                             f"[MPC Guard] env 0: FAILED reason={reason} "
                             f"cost={cost:.0f} -> fallback", flush=True

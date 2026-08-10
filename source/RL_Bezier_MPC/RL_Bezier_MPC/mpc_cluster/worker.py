@@ -134,6 +134,7 @@ def build_default_controllers(env_ids: Iterable[int], mpc_cfg: Dict) -> Dict[int
             touchdown_gate_max_steps=int(
                 mpc_cfg.get("mpc_touchdown_gate_max_steps", 0)
             ),
+            max_joint_torque=float(mpc_cfg.get("max_joint_torque", 23.5)),
         )
     return controllers
 

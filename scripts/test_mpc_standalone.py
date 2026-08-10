@@ -548,6 +548,9 @@ def main():
     guard_count = 0
     mpc_tick_count = 0
     converged_tick_count = 0
+    terminated_early = False
+    terminal_state_for_summary = None
+    termination_reasons = []
 
     # Run simulation
     for step in range(args_cli.max_steps):
@@ -625,6 +628,9 @@ def main():
                 if triggered
             ]
             terminal_state = env._last_terminal_root_state[0].cpu().numpy()
+            terminated_early = True
+            terminal_state_for_summary = terminal_state.copy()
+            termination_reasons = reasons
             terminal_quat = terminal_state[3:7]
             tw, tx, ty, tz = terminal_quat
             terminal_roll = np.degrees(np.arctan2(
@@ -663,9 +669,15 @@ def main():
     print("=" * 70)
 
     T = len(positions_arr)
-    final_height = positions_arr[-1, 2]
+    summary_final_position = positions_arr[-1].copy()
+    if terminal_state_for_summary is not None:
+        summary_final_position = terminal_state_for_summary[:3].copy()
+    final_height = summary_final_position[2]
     min_height = np.min(positions_arr[:, 2])
     max_height = np.max(positions_arr[:, 2])
+    if terminal_state_for_summary is not None:
+        min_height = min(min_height, final_height)
+        max_height = max(max_height, final_height)
 
     # Compute pitch over time
     pitches = []
@@ -675,10 +687,16 @@ def main():
         sinp = np.clip(sinp, -1.0, 1.0)
         pitches.append(np.degrees(np.arcsin(sinp)))
     pitches = np.array(pitches)
+    if terminal_state_for_summary is not None:
+        tw, tx, ty, tz = terminal_state_for_summary[3:7]
+        terminal_pitch = np.degrees(np.arcsin(np.clip(
+            2.0 * (tw * ty - tz * tx), -1.0, 1.0
+        )))
+        pitches = np.append(pitches, terminal_pitch)
 
     print(f"Test mode:         {args_cli.mode}")
     print(f"Policy steps:      {T} / {args_cli.max_steps} ({T * policy_dt:.1f}s)")
-    print(f"Final position:    [{positions_arr[-1, 0]:+.3f}, {positions_arr[-1, 1]:+.3f}, {positions_arr[-1, 2]:.3f}]")
+    print(f"Final position:    [{summary_final_position[0]:+.3f}, {summary_final_position[1]:+.3f}, {summary_final_position[2]:.3f}]")
     print(f"Target position:   [{target_pos[0]:.3f}, {target_pos[1]:.3f}, {target_pos[2]:.3f}]")
     print(f"Height range:      [{min_height:.3f}, {max_height:.3f}]m (standing: 0.40m)")
     print(f"Pitch range:       [{np.min(pitches):.1f}°, {np.max(pitches):.1f}°]")
@@ -733,8 +751,8 @@ def main():
         )
 
     # Distance traveled
-    x_traveled = positions_arr[-1, 0] - positions_arr[0, 0]
-    y_traveled = positions_arr[-1, 1] - positions_arr[0, 1]
+    x_traveled = summary_final_position[0] - positions_arr[0, 0]
+    y_traveled = summary_final_position[1] - positions_arr[0, 1]
     total_dist = np.sqrt(x_traveled**2 + y_traveled**2)
     print(f"X displacement:    {x_traveled:+.3f}m")
     print(f"Y displacement:    {y_traveled:+.3f}m")
@@ -775,7 +793,9 @@ def main():
     elif pitch_collapsed:
         print("🟡 ROBOT TILTED — Pitch exceeded 40° but didn't fully fall")
         print("   → MPC is partially working but orientation control is weak.")
-    elif T < args_cli.max_steps * 0.8:
+    elif terminated_early or T < args_cli.max_steps * 0.8:
+        if termination_reasons:
+            print(f"   Termination reasons: {termination_reasons}")
         print("🟡 EARLY TERMINATION — Robot survived but terminated early")
         print(f"   → Lasted {T * policy_dt:.1f}s out of {args_cli.max_steps * policy_dt:.1f}s")
     else:

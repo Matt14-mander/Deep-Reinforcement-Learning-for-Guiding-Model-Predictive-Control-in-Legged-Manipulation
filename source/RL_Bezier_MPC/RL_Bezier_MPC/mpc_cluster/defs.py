@@ -179,4 +179,5 @@ def mpc_cfg_to_dict(cfg) -> Dict:
         "mpc_touchdown_gate_max_steps": int(
             getattr(cfg, "mpc_touchdown_gate_max_steps", 0)
         ),
+        "max_joint_torque": float(getattr(cfg, "max_joint_torque", 23.5)),
     }

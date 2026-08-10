@@ -10,7 +10,7 @@ This controller integrates all the quadruped-specific components:
 - FootholdPlanner → landing positions
 - BezierFootTrajectory → swing trajectories
 - OCPFactory → Crocoddyl OCP construction
-- SolverFDDP → trajectory optimization
+- SolverBoxFDDP → torque-bounded trajectory optimization
 
 State representation: (nq + nv) dimensional
     For a 12-DOF quadruped (Pinocchio convention):
@@ -58,7 +58,7 @@ class CrocoddylQuadrupedMPC(BaseMPC):
     - FootholdPlanner → landing positions
     - BezierFootTrajectory → swing trajectories
     - OCPFactory → Crocoddyl OCP construction
-    - SolverFDDP → trajectory optimization
+    - SolverBoxFDDP → torque-bounded trajectory optimization
 
     Attributes:
         rmodel: Pinocchio robot model.
@@ -99,6 +99,7 @@ class CrocoddylQuadrupedMPC(BaseMPC):
         swing_landing_height_ratio: float = 0.8,
         touchdown_gate_height_tolerance: float = 0.0,
         touchdown_gate_max_steps: int = 0,
+        max_joint_torque: float = 23.5,
     ):
         """Initialize MPC with all sub-components.
 
@@ -137,6 +138,8 @@ class CrocoddylQuadrupedMPC(BaseMPC):
                 metres above its locked landing target. Zero disables gating.
             touchdown_gate_max_steps: Maximum extra MPC ticks allowed for the
                 physical foot to reach the landing target.
+            max_joint_torque: Symmetric joint-torque bound enforced inside the
+                OCP. It must match the Isaac actuator effort limit.
         """
         if not CROCODDYL_AVAILABLE:
             raise ImportError(
@@ -174,6 +177,9 @@ class CrocoddylQuadrupedMPC(BaseMPC):
             0.0, float(touchdown_gate_height_tolerance)
         )
         self.touchdown_gate_max_steps = max(0, int(touchdown_gate_max_steps))
+        self.max_joint_torque = float(max_joint_torque)
+        if not np.isfinite(self.max_joint_torque) or self.max_joint_torque <= 0.0:
+            raise ValueError("max_joint_torque must be a finite positive value")
         self._touchdown_gate_steps = 0
         self._solve_count = 0  # Track solve calls for selective verbose
 
@@ -211,6 +217,7 @@ class CrocoddylQuadrupedMPC(BaseMPC):
             ),
             use_demo_stabilization_weights=use_demo_stabilization_weights,
             use_pseudo_impulse=use_pseudo_impulse,
+            max_joint_torque=self.max_joint_torque,
         )
 
         # State and actuation from factory
@@ -489,8 +496,15 @@ class CrocoddylQuadrupedMPC(BaseMPC):
             max_nodes=self.horizon_steps,
         )
 
-        # Create solver
-        solver = crocoddyl.SolverFDDP(problem)
+        # Clipping only at the Isaac actuator invalidates the optimized
+        # rollout. BoxFDDP enforces the same limits inside the OCP.
+        solver_class = getattr(crocoddyl, "SolverBoxFDDP", None)
+        if solver_class is None:
+            raise RuntimeError(
+                "This Crocoddyl build does not provide SolverBoxFDDP; "
+                "joint-torque bounds cannot be enforced safely."
+            )
+        solver = solver_class(problem)
         solver.th_stop = self.convergence_threshold
 
         # Verbose logging for debugging
@@ -603,7 +617,7 @@ class CrocoddylQuadrupedMPC(BaseMPC):
             sys.stdout.flush()
 
         # Warm-start from the shifted previous solution, or cold-start from a
-        # rollout of gravity-compensation controls. SolverFDDP.solve() calls
+        # rollout of gravity-compensation controls. SolverBoxFDDP.solve() calls
         # setCandidate() internally, so these trajectories must be passed to
         # solve() rather than installed before a later solve([], []) call.
         use_warm_start = False
@@ -720,6 +734,14 @@ class CrocoddylQuadrupedMPC(BaseMPC):
                 f"is_feasible={initial_guess_feasible}",
                 flush=True,
             )
+        try:
+            calculated_cost = problem.calc(xs_init, us_init)
+            if calculated_cost is None:
+                calculated_cost = getattr(problem, "cost", float("nan"))
+            initial_cost = float(calculated_cost)
+        except (TypeError, ValueError, RuntimeError):
+            initial_cost = float("nan")
+
         converged = solver.solve(
             xs_init,
             us_init,
@@ -747,13 +769,61 @@ class CrocoddylQuadrupedMPC(BaseMPC):
         xs = list(solver.xs)
         us = list(solver.us)
 
-        # Only store xs/us for next warm-start when this solve did NOT diverge.
-        # Diverged xs (cost >> 1e4) corrupt the next warm-start → cascade failure.
-        STORE_COST_THRESHOLD = 1e4
-        if solver.cost < STORE_COST_THRESHOLD:
+        # Preserve only safe candidates; a bad trajectory can otherwise poison
+        # every subsequent shifted warm start.
+        dynamics_gap = solver_residual_norm(solver, "ffeas")
+        constraint_terms = [
+            value for value in (
+                solver_residual_norm(solver, "gfeas"),
+                solver_residual_norm(solver, "hfeas"),
+            )
+            if np.isfinite(value)
+        ]
+        constraint_violation = (
+            max(constraint_terms) if constraint_terms else float("nan")
+        )
+
+        # Absolute cost depends on task weights and contact topology. The old
+        # 1e4 cutoff rejected useful trot solutions and forced every tick back
+        # to a cold start. Retain finite, dynamically consistent, bounded
+        # candidates that converged or materially improved their initial cost.
+        states_finite = bool(xs) and all(
+            np.all(np.isfinite(np.asarray(state, dtype=float))) for state in xs
+        )
+        controls_finite = bool(us) and all(
+            np.all(np.isfinite(np.asarray(control, dtype=float))) for control in us
+        )
+        bounded_controls = controls_finite and all(
+            np.asarray(control).size == 0
+            or np.max(np.abs(np.asarray(control, dtype=float)))
+            <= self.max_joint_torque + 1e-6
+            for control in us
+        )
+        gap_ok = not np.isfinite(dynamics_gap) or dynamics_gap <= 1e-2
+        material_improvement = (
+            np.isfinite(initial_cost)
+            and np.isfinite(solver.cost)
+            and solver.cost
+            <= initial_cost - max(1.0, 1e-3 * abs(initial_cost))
+        )
+        warm_start_candidate_ok = (
+            states_finite
+            and bounded_controls
+            and gap_ok
+            and np.isfinite(solver.cost)
+            and (bool(converged) or material_improvement)
+        )
+        if warm_start_candidate_ok:
             self._prev_xs = xs
             self._prev_us = us
-        # else: keep previous _prev_xs intact (last good solution)
+        elif is_verbose_call:
+            print(
+                "  Warm-start candidate rejected: "
+                f"finite={states_finite and controls_finite}, "
+                f"bounded={bounded_controls}, gap={dynamics_gap:.3e}, "
+                f"initial_cost={initial_cost:.2f}, final_cost={solver.cost:.2f}",
+                flush=True,
+            )
 
         # Advance the gait phase clock so the next solve starts from the correct
         # position in the gait cycle (fixes the "Groundhog Day" bug). At the
@@ -831,18 +901,6 @@ class CrocoddylQuadrupedMPC(BaseMPC):
             if predicted_control.size == self.actuation.nu:
                 predicted_controls[index] = predicted_control
 
-        dynamics_gap = solver_residual_norm(solver, "ffeas")
-        constraint_terms = [
-            value for value in (
-                solver_residual_norm(solver, "gfeas"),
-                solver_residual_norm(solver, "hfeas"),
-            )
-            if np.isfinite(value)
-        ]
-        constraint_violation = (
-            max(constraint_terms) if constraint_terms else float("nan")
-        )
-
         return MPCSolution(
             control=control,
             predicted_states=predicted_states,
@@ -854,6 +912,11 @@ class CrocoddylQuadrupedMPC(BaseMPC):
             dynamics_gap=dynamics_gap,
             constraint_violation=constraint_violation,
         )
+
+    def get_control_bounds(self):
+        """Return the actuator bounds enforced by BoxFDDP."""
+        limit = np.full(self.actuation.nu, self.max_joint_torque, dtype=float)
+        return -limit, limit
 
     def _print_cost_breakdown(self, problem: Any, solver: Any) -> None:
         """Print weighted residual contributions for an abnormally costly solve.

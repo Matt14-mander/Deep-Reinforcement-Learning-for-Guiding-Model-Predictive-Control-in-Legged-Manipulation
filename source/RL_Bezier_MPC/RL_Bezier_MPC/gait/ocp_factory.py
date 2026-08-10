@@ -32,7 +32,7 @@ Reference Crocoddyl API classes used:
     - crocoddyl.ImpulseModelMultiple / ImpulseModel3D
     - crocoddyl.ActionModelImpulseFwdDynamics
     - crocoddyl.ShootingProblem
-    - crocoddyl.SolverFDDP
+    - crocoddyl.SolverBoxFDDP
 """
 
 from typing import Any, Dict, List, Optional, Tuple
@@ -108,6 +108,7 @@ class OCPFactory:
         weights: Optional[Dict[str, float]] = None,
         use_demo_stabilization_weights: bool = False,
         use_pseudo_impulse: bool = False,
+        max_joint_torque: float = 23.5,
     ):
         """Initialize factory with robot model and cost weights.
 
@@ -121,6 +122,7 @@ class OCPFactory:
             weights: Dict of cost weights. Uses DEFAULT_WEIGHTS for missing keys.
             use_demo_stabilization_weights: Use the state and main task weights
                 from Crocoddyl's SimpleQuadrupedGaitProblem standing model.
+            max_joint_torque: Symmetric actuator torque limit in N.m.
         """
         if not CROCODDYL_AVAILABLE:
             raise ImportError(
@@ -135,6 +137,9 @@ class OCPFactory:
         self.fwddyn = fwddyn
         self.use_demo_stabilization_weights = use_demo_stabilization_weights
         self.use_pseudo_impulse = use_pseudo_impulse
+        self.max_joint_torque = float(max_joint_torque)
+        if not np.isfinite(self.max_joint_torque) or self.max_joint_torque <= 0.0:
+            raise ValueError("max_joint_torque must be a finite positive value")
 
         # Merge weights with defaults
         self.weights = self.DEFAULT_WEIGHTS.copy()
@@ -152,12 +157,21 @@ class OCPFactory:
         self.nv = self.rmodel.nv  # velocity dimension
         self.nx = self.state.nx  # state dimension (nq + nv)
         self.nu = self.actuation.nu  # control dimension (actuated joints only)
+        self.control_lb = np.full(self.nu, -self.max_joint_torque, dtype=float)
+        self.control_ub = np.full(self.nu, self.max_joint_torque, dtype=float)
 
         # Default state for regularization (standing pose)
         self.x0 = self.rmodel.defaultState if hasattr(self.rmodel, 'defaultState') else self._compute_default_state()
 
         # Precompute state weights (from Crocoddyl demo structure)
         self._compute_state_weights()
+
+    def _apply_control_bounds(self, model: Any) -> Any:
+        """Attach actuator-consistent bounds to a continuous action model."""
+        if int(getattr(model, "nu", 0)) == self.nu:
+            model.u_lb = self.control_lb.copy()
+            model.u_ub = self.control_ub.copy()
+        return model
 
     def _compute_default_state(self) -> np.ndarray:
         """Compute a default standing state for regularization.
@@ -422,7 +436,7 @@ class OCPFactory:
         else:
             raise ValueError(f"Unknown integrator: {self.integrator}")
 
-        return model
+        return self._apply_control_bounds(model)
 
     def build_impulse_node(
         self,
@@ -493,7 +507,7 @@ class OCPFactory:
             self.state, impulse_model, cost_model
         )
 
-        return model
+        return self._apply_control_bounds(model)
 
     def build_pseudo_impulse_node(
         self,
@@ -564,7 +578,8 @@ class OCPFactory:
         differential_model = crocoddyl.DifferentialActionModelContactFwdDynamics(
             self.state, self.actuation, contact_model, cost_model
         )
-        return crocoddyl.IntegratedActionModelEuler(differential_model, 0.0)
+        model = crocoddyl.IntegratedActionModelEuler(differential_model, 0.0)
+        return self._apply_control_bounds(model)
 
     def build_terminal_node(
         self,
@@ -669,7 +684,7 @@ class OCPFactory:
         # Zero timestep for terminal
         model = crocoddyl.IntegratedActionModelEuler(dmodel, 0.0)
 
-        return model
+        return self._apply_control_bounds(model)
 
     def build_problem(
         self,
@@ -889,8 +904,8 @@ class OCPFactory:
         problem: "crocoddyl.ShootingProblem",
         max_iterations: int = 100,
         th_stop: float = 1e-4,
-    ) -> "crocoddyl.SolverFDDP":
-        """Create a FDDP solver for the problem.
+    ) -> "crocoddyl.SolverBoxFDDP":
+        """Create a box-constrained FDDP solver for the problem.
 
         Args:
             problem: ShootingProblem to solve.
@@ -898,8 +913,8 @@ class OCPFactory:
             th_stop: Convergence threshold.
 
         Returns:
-            Configured FDDP solver.
+            Configured BoxFDDP solver.
         """
-        solver = crocoddyl.SolverFDDP(problem)
+        solver = crocoddyl.SolverBoxFDDP(problem)
         solver.th_stop = th_stop
         return solver
