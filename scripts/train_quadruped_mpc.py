@@ -69,6 +69,11 @@ parser.add_argument("--stage1_crawl_ppo", action="store_true",
 parser.add_argument("--stage1_checkpoint_dir", default=None,
                     help="Directory for Stage 1 PPO checkpoints")
 
+parser.add_argument("--stage1_compare", action="store_true",
+                    help="Compare fixed 40 mm and pre/post mean policies around balanced PPO updates")
+parser.add_argument("--stage1_start_from", help="Continue Stage 1 policy and optimizer from checkpoint")
+parser.add_argument("--stage1_eval_run", help="Repeat the three-way evaluation of a completed pilot")
+
 # AppLauncher arguments
 AppLauncher.add_app_launcher_args(parser)
 args_cli = parser.parse_args()
@@ -233,7 +238,11 @@ def main():
     env_cfg.cluster_python_executable = args_cli.mpc_python
     env_cfg.robot_urdf_path = args_cli.robot_urdf
 
-    if args_cli.check_stage1_entry or args_cli.stage1_crawl_ppo:
+    if (args_cli.stage1_compare or args_cli.stage1_start_from) and not args_cli.stage1_crawl_ppo:
+        parser.error("--stage1_compare and --stage1_start_from require --stage1_crawl_ppo")
+    if args_cli.stage1_eval_run and args_cli.stage1_crawl_ppo:
+        parser.error("Choose either training or standalone evaluation")
+    if args_cli.check_stage1_entry or args_cli.stage1_crawl_ppo or args_cli.stage1_eval_run:
         if args_cli.use_mpc_cluster or args_cli.num_envs != 1:
             parser.error("Stage 1 fixed crawl requires --num_envs 1 and in-process MPC")
         if args_cli.resume or args_cli.video:
@@ -241,17 +250,20 @@ def main():
         if args_cli.stage1_crawl_ppo and args_cli.max_iterations < 1:
             parser.error("PPO requires at least one iteration")
         from RL_Bezier_MPC.envs.stage1_crawl import Stage1CrawlTask
-        from stage1_entry_check import check_stage1_entry, train_stage1
+        from stage1_entry_check import check_stage1_entry, evaluate_saved_run, train_stage1
         env_cfg.sim.device = args_cli.device
         env_cfg.gait_type = "walk"
         task = Stage1CrawlTask(env_cfg)
         try:
             check_stage1_entry(task, args_cli.seed)
+            if args_cli.stage1_eval_run:
+                evaluate_saved_run(task, args_cli.stage1_eval_run, args_cli.seed)
             if args_cli.stage1_crawl_ppo:
                 directory = args_cli.stage1_checkpoint_dir or (
                     Path(__file__).resolve().parents[1] / "logs" / "stage1_crawl"
                     / datetime.now().strftime("%Y-%m-%d_%H-%M-%S"))
-                train_stage1(task, args_cli.max_iterations, directory)
+                train_stage1(task, args_cli.max_iterations, directory, compare=args_cli.stage1_compare,
+                             seed=args_cli.seed, start_from=args_cli.stage1_start_from)
         finally:
             task.close()
         return

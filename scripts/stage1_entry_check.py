@@ -41,12 +41,12 @@ class TrajectoryPolicy(nn.Module):
         return Normal(self.actor(obs), self.log_std.clamp(-4, 1).exp())
 
 
-def ppo_iteration(task, policy, optimizer, samples):
+def ppo_iteration(task, policy, optimizer, samples, goals=None):
     # Every decision ends an episode, so the return is its measured terminal reward.
     observations, latents, old_logps, returns = [], [], [], []
     completed = 0
-    for _ in range(samples):
-        obs = task.reset()
+    for i in range(samples):
+        obs = task.reset() if goals is None else task.reset(goals[i])
         with torch.no_grad():
             dist = policy.distribution(obs)
             latent = dist.sample()
@@ -84,13 +84,83 @@ def ppo_iteration(task, policy, optimizer, samples):
                           loss=loss.item(), actor_change=change)), flush=True)
 
 
-def train_stage1(task, iterations, checkpoint_dir):
+@torch.no_grad()
+def evaluate(task, policy, role, seed):
+    if policy is not None:
+        policy.eval()
+    rows = {}
+    for goal in task.targets_mm:
+        obs = task.reset(goal, seed)
+        action = obs.new_zeros(2) if policy is None else policy.actor(obs).tanh()
+        reward, metrics = task.step(action)
+        rows[goal] = dict(role=role, action=action.tolist(), reward=reward, **metrics)
+        print(json.dumps(dict(stage="evaluation", **rows[goal]), allow_nan=False), flush=True)
+    return rows
+
+
+def report_comparison(baseline, before, after, destination, seed):
+    rows = []
+    for goal in before:
+        trials = [group[goal] for group in (baseline, before, after)]
+        errors = [r.get("error_mm") for r in trials]
+        complete = all("failure" not in r and r["landings"] == 8 and r["stable_ticks"] == 50
+                       and max(r["drift_mm"]) <= 10 and r["stop_span_mm"] <= 1 for r in trials)
+        baseline_error, pre_error, post_error = errors
+        rows.append(dict(target_mm=goal, baseline_error_mm=baseline_error,
+                         pre_error_mm=pre_error, post_error_mm=post_error,
+                         improvement_mm=pre_error-post_error if complete else None,
+                         beats_both=complete and post_error < min(baseline_error, pre_error),
+                         physical_checks=complete, post_success=after[goal]["success"]))
+    passed = (all(r["physical_checks"] and r["post_success"] for r in rows)
+              and all(r["beats_both"] for r in rows if r["target_mm"] in (32, 48)))
+    report = dict(seed=seed, baseline=baseline, before=before, after=after,
+                  comparison=rows, pilot_criteria_met=passed)
+    destination.write_text(json.dumps(report, indent=2, allow_nan=False), encoding="utf8")
+    print(json.dumps(dict(stage="comparison", goals=rows, pilot_criteria_met=passed,
+                          report=str(destination))), flush=True)
+
+
+def evaluate_saved_run(task, run, seed):
+    run = Path(run)
+    manifest = json.loads((run / "comparison_checkpoints.json").read_text(encoding="utf8"))
+    baseline = evaluate(task, None, "fixed40", seed)
+    results = []
+    for role in ("before", "after"):
+        policy = TrajectoryPolicy().to(task.env.device)
+        saved = torch.load(run / manifest[role], map_location=task.env.device, weights_only=True)
+        policy.load_state_dict(saved["policy"])
+        results.append(evaluate(task, policy, role, seed))
+    report_comparison(baseline, *results, run / f"reevaluation_seed{seed}.json", seed)
+
+
+def train_stage1(task, iterations, checkpoint_dir, *, compare=False, seed=37, start_from=None):
     policy = TrajectoryPolicy().to(task.env.device)
     optimizer = torch.optim.Adam(policy.parameters(), lr=3e-4)
     directory = Path(checkpoint_dir)
     directory.mkdir(parents=True, exist_ok=True)
-    for iteration in range(1, iterations + 1):
-        ppo_iteration(task, policy, optimizer, samples=4)
+    start = 0
+    if start_from:
+        saved = torch.load(start_from, map_location=task.env.device, weights_only=True)
+        policy.load_state_dict(saved["policy"])
+        optimizer.load_state_dict(saved["optimizer"])
+        start = saved["iteration"]
+    if any(directory.glob("stage1_*.pt")):
+        raise FileExistsError(f"Choose a fresh checkpoint directory: {directory}")
+    if compare:
+        pre_path = directory / f"stage1_{start:04d}.pt"
+        torch.save(dict(policy=policy.state_dict(), optimizer=optimizer.state_dict(),
+                        iteration=start), pre_path)
+        baseline = evaluate(task, None, "fixed40", seed)
+        before = evaluate(task, policy, "before", seed)
+        policy.train()
+    for iteration in range(start + 1, start + iterations + 1):
+        if compare:
+            # Equal coverage at each update; draw independent exploratory actions.
+            goals = [goal for goal in task.targets_mm for _ in range(2)]
+            order = torch.randperm(len(goals), generator=task.rng).tolist()
+            ppo_iteration(task, policy, optimizer, len(goals), [goals[i] for i in order])
+        else:
+            ppo_iteration(task, policy, optimizer, samples=4)
         path = directory / f"stage1_{iteration:04d}.pt"
         torch.save(dict(policy=policy.state_dict(), optimizer=optimizer.state_dict(),
                         iteration=iteration), path)
@@ -108,3 +178,8 @@ def train_stage1(task, iterations, checkpoint_dir):
                 raise RuntimeError("Reloaded policy differs on the three goals")
         policy, optimizer = restored, resumed
         print(f"PASS: PPO update and checkpoint reload {path}", flush=True)
+    if compare:
+        manifest = dict(before=pre_path.name, after=path.name)
+        (directory / "comparison_checkpoints.json").write_text(json.dumps(manifest), encoding="utf8")
+        after = evaluate(task, policy, "after", seed)
+        report_comparison(baseline, before, after, directory / "comparison.json", seed)
