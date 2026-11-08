@@ -62,6 +62,9 @@ parser.add_argument(
     help="Absolute path to the Go2 URDF used by MPC workers",
 )
 
+parser.add_argument("--check_stage1_entry", action="store_true",
+                    help="Probe the single-Go2 Torch training path before starting PPO")
+
 # AppLauncher arguments
 AppLauncher.add_app_launcher_args(parser)
 args_cli = parser.parse_args()
@@ -226,6 +229,20 @@ def main():
     env_cfg.cluster_python_executable = args_cli.mpc_python
     env_cfg.robot_urdf_path = args_cli.robot_urdf
 
+    if args_cli.check_stage1_entry:
+        if args_cli.use_mpc_cluster or args_cli.num_envs != 1:
+            parser.error("--check_stage1_entry requires --num_envs 1 and in-process MPC")
+        from stage1_entry_check import check_stage1_entry
+        env_cfg.mpc_backend = "torch_tracking"
+        env_cfg.torch_foot_plane_height = .022
+        env_cfg.sim.device = args_cli.device
+        env = QuadrupedMPCEnv(cfg=env_cfg)
+        try:
+            check_stage1_entry(env)
+        finally:
+            env.close()
+        return
+
     if env_cfg.use_mpc_cluster:
         if not env_cfg.cluster_python_executable:
             parser.error("--use_mpc_cluster requires --mpc_python")
@@ -263,7 +280,17 @@ def main():
 
 
 if __name__ == "__main__":
+    failed = False
     try:
         main()
+    except BaseException:
+        failed = True
+        import traceback
+        traceback.print_exc()
+        raise
     finally:
-        simulation_app.close()
+        try:
+            simulation_app.close()
+        finally:
+            if failed:
+                raise SystemExit(1)
