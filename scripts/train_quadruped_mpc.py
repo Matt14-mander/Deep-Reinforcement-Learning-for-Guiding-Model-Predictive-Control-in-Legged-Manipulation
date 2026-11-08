@@ -63,7 +63,11 @@ parser.add_argument(
 )
 
 parser.add_argument("--check_stage1_entry", action="store_true",
-                    help="Probe the single-Go2 Torch training path before starting PPO")
+                    help="Run the three full fixed-crawl Stage 1 episodes")
+parser.add_argument("--stage1_crawl_ppo", action="store_true",
+                    help="Train the single-decision fixed crawl after passing all three goals")
+parser.add_argument("--stage1_checkpoint_dir", default=None,
+                    help="Directory for Stage 1 PPO checkpoints")
 
 # AppLauncher arguments
 AppLauncher.add_app_launcher_args(parser)
@@ -229,18 +233,27 @@ def main():
     env_cfg.cluster_python_executable = args_cli.mpc_python
     env_cfg.robot_urdf_path = args_cli.robot_urdf
 
-    if args_cli.check_stage1_entry:
+    if args_cli.check_stage1_entry or args_cli.stage1_crawl_ppo:
         if args_cli.use_mpc_cluster or args_cli.num_envs != 1:
-            parser.error("--check_stage1_entry requires --num_envs 1 and in-process MPC")
-        from stage1_entry_check import check_stage1_entry
-        env_cfg.mpc_backend = "torch_tracking"
-        env_cfg.torch_foot_plane_height = .022
+            parser.error("Stage 1 fixed crawl requires --num_envs 1 and in-process MPC")
+        if args_cli.resume or args_cli.video:
+            parser.error("Stage 1 fixed crawl currently supports fresh headless rollouts")
+        if args_cli.stage1_crawl_ppo and args_cli.max_iterations < 1:
+            parser.error("PPO requires at least one iteration")
+        from RL_Bezier_MPC.envs.stage1_crawl import Stage1CrawlTask
+        from stage1_entry_check import check_stage1_entry, train_stage1
         env_cfg.sim.device = args_cli.device
-        env = QuadrupedMPCEnv(cfg=env_cfg)
+        env_cfg.gait_type = "walk"
+        task = Stage1CrawlTask(env_cfg)
         try:
-            check_stage1_entry(env)
+            check_stage1_entry(task, args_cli.seed)
+            if args_cli.stage1_crawl_ppo:
+                directory = args_cli.stage1_checkpoint_dir or (
+                    Path(__file__).resolve().parents[1] / "logs" / "stage1_crawl"
+                    / datetime.now().strftime("%Y-%m-%d_%H-%M-%S"))
+                train_stage1(task, args_cli.max_iterations, directory)
         finally:
-            env.close()
+            task.close()
         return
 
     if env_cfg.use_mpc_cluster:
