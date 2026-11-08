@@ -12,9 +12,23 @@ control inputs to track the trajectory.
 
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
-from typing import Tuple
+from typing import Any, Tuple
 
 import numpy as np
+
+
+def solver_residual_norm(solver: Any, attribute: str) -> float:
+    """Read a solver feasibility field across binding/API variants."""
+    value = getattr(solver, attribute, None)
+    if value is None:
+        return float("nan")
+    try:
+        array = np.asarray(value, dtype=float)
+        if array.size == 0 or not np.all(np.isfinite(array)):
+            return float("nan")
+        return float(np.max(np.abs(array)))
+    except (TypeError, ValueError):
+        return float("nan")
 
 
 @dataclass
@@ -41,6 +55,8 @@ class MPCSolution:
     converged: bool
     cost: float
     iterations: int = 0
+    dynamics_gap: float = float("nan")
+    constraint_violation: float = float("nan")
 
 
 class BaseMPC(ABC):

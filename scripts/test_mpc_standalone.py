@@ -16,9 +16,9 @@ If the robot FALLS in this test → problem is (A), fix MPC integration.
 If the robot WALKS stably → problem is (B), focus on RL training.
 
 Usage:
-    python scripts/test_mpc_standalone.py --num_envs 1 --headless
-    python scripts/test_mpc_standalone.py --num_envs 1 --headless --max_steps 500
-    python scripts/test_mpc_standalone.py --num_envs 1 --headless --mode stand
+    python scripts/test_mpc_standalone.py --num_envs 1 --headless --mode stand \
+        --use_mpc_cluster --cluster_workers 1 --mpc_python /path/to/mpc/python \
+        --robot_urdf /path/to/go2.urdf
 """
 
 import argparse
@@ -34,8 +34,8 @@ parser.add_argument(
     help="Number of parallel environments (default: 1)",
 )
 parser.add_argument(
-    "--max_steps", type=int, default=500,
-    help="Maximum MPC steps to run (default: 500, = 10 seconds at 50Hz)",
+    "--max_steps", type=int, default=50,
+    help="Maximum 5 Hz policy steps (default: 50, = 10 simulated seconds)",
 )
 parser.add_argument(
     "--mode", type=str, default="walk",
@@ -45,6 +45,110 @@ parser.add_argument(
 parser.add_argument(
     "--plot_dir", type=str, default="plots/mpc_diagnostic",
     help="Directory to save diagnostic plots",
+)
+parser.add_argument("--seed", type=int, default=42, help="Deterministic test seed")
+parser.add_argument(
+    "--torque_only", action="store_true",
+    help="Disable Isaac actuator Kp/Kd for an explicit torque-only A/B test",
+)
+parser.add_argument(
+    "--use_mpc_cluster", action="store_true",
+    help="Run Crocoddyl in the separate EigenIPC MPC environment",
+)
+parser.add_argument(
+    "--cluster_workers", type=int, default=1,
+    help="Number of MPC worker processes (default: 1)",
+)
+parser.add_argument(
+    "--mpc_python", type=str, default="",
+    help="Absolute path to the rlbmpc_mpc environment Python executable",
+)
+parser.add_argument(
+    "--robot_urdf", type=str, default="",
+    help="Absolute path to the Go2 URDF used by MPC workers",
+)
+parser.add_argument(
+    "--debug_group",
+    choices=[
+        "static_fixed",
+        "cold_fixed",
+        "warm_fixed",
+        "warm_trot",
+        "cold_trot_infeasible_init",
+        "warm_trot_infeasible_init",
+    ],
+    default=None,
+    help=(
+        "Controlled isolation experiment: quasi-static/fixed contacts, cold/fixed contacts, "
+        "warm/fixed contacts, or cold/warm trot contacts"
+    ),
+)
+parser.add_argument(
+    "--debug_root_height",
+    type=float,
+    default=0.31,
+    help=(
+        "Initial Go2 root height for isolation groups. 0.31 m places the "
+        "foot-frame origins near the approximately 0.02 m contact radius."
+    ),
+)
+parser.add_argument(
+    "--debug_friction_cone_weight",
+    type=float,
+    default=None,
+    help=(
+        "Override only the Crocoddyl friction-cone barrier weight for a "
+        "controlled A/B test (official quadrupedal-gait reference: 1e1)."
+    ),
+)
+parser.add_argument(
+    "--debug_disable_pseudo_impulse",
+    action="store_true",
+    help=(
+        "Do not insert the legacy zero-time Euler touchdown node. The first "
+        "finite-time support node still tracks touchdown and damps contact."
+    ),
+)
+parser.add_argument(
+    "--debug_hybrid_control",
+    action="store_true",
+    help=(
+        "Apply both Crocoddyl feedforward torque and predicted joint-position "
+        "targets, matching the production Stage 1 execution path."
+    ),
+)
+parser.add_argument(
+    "--debug_touchdown_hold_steps",
+    type=int,
+    default=0,
+    help=(
+        "Hold each swing foot at its landing target for this many extra MPC "
+        "nodes before the contact schedule switches to support."
+    ),
+)
+parser.add_argument(
+    "--debug_swing_landing_height_ratio",
+    type=float,
+    default=0.8,
+    help=(
+        "Swing-foot P2 vertical control-point ratio. Lower than the legacy "
+        "0.8 value starts descent earlier without compressing swing time."
+    ),
+)
+parser.add_argument(
+    "--debug_touchdown_gate_tolerance",
+    type=float,
+    default=0.0,
+    help=(
+        "Delay the swing-to-support clock transition while a swing foot is "
+        "more than this many metres above its locked landing target."
+    ),
+)
+parser.add_argument(
+    "--debug_touchdown_gate_max_steps",
+    type=int,
+    default=0,
+    help="Maximum extra MPC ticks permitted by touchdown gating.",
 )
 
 # AppLauncher arguments (adds --headless, --device, --livestream, etc.)
@@ -86,28 +190,23 @@ def generate_fixed_bezier_params(mode: str = "walk") -> np.ndarray:
         Values are in the DENORMALIZED action space (meters offset).
     """
     if mode == "stand":
-        # P0 = [0,0,0], P1-P3 = very small offsets → robot stays in place
-        params = np.array([
-            0.0, 0.0, 0.0,    # P0: start offset (always zero)
-            0.05, 0.0, 0.0,   # P1: tiny forward
-            0.05, 0.0, 0.0,   # P2: tiny forward
-            0.05, 0.0, 0.0,   # P3: end (barely moves)
-        ])
+        # True zero-displacement reference.
+        params = np.zeros(12, dtype=np.float32)
     elif mode == "walk":
-        # Gentle forward trajectory (~0.5m over 1.5s = 0.33 m/s)
+        # Gentle forward trajectory (0.15m over 3s = 0.05 m/s)
+        params = np.array([
+            0.0, 0.0, 0.0,     # P0: start
+            0.05, 0.0, 0.0,    # P1: control point
+            0.10, 0.0, 0.0,    # P2: control point
+            0.15, 0.0, 0.0,    # P3: end
+        ])
+    elif mode == "walk_fast":
+        # Current training bias (0.45m over 3s = 0.15 m/s)
         params = np.array([
             0.0, 0.0, 0.0,     # P0: start
             0.15, 0.0, 0.0,    # P1: control point
-            0.35, 0.0, 0.0,    # P2: control point
-            0.50, 0.0, 0.0,    # P3: end (~0.5m forward)
-        ])
-    elif mode == "walk_fast":
-        # Moderate forward trajectory (~1.0m over 1.5s = 0.67 m/s)
-        params = np.array([
-            0.0, 0.0, 0.0,     # P0: start
-            0.30, 0.0, 0.0,    # P1: control point
-            0.70, 0.0, 0.0,    # P2: control point
-            1.00, 0.0, 0.0,    # P3: end (~1.0m forward)
+            0.30, 0.0, 0.0,    # P2: control point
+            0.45, 0.0, 0.0,    # P3: end
         ])
     else:
         raise ValueError(f"Unknown mode: {mode}")
@@ -158,11 +257,12 @@ def plot_diagnostic(positions, orientations, target_pos, rewards,
     """
     os.makedirs(save_dir, exist_ok=True)
     T = len(positions)
-    time_steps = np.arange(T) * 0.02  # MPC dt = 0.02s
+    policy_dt = 0.2
+    time_steps = np.arange(T) * policy_dt
 
     fig, axes = plt.subplots(3, 2, figsize=(16, 14))
     fig.suptitle(
-        f"MPC Standalone Diagnostic | Mode: {mode} | {T} steps ({T*0.02:.1f}s)\n"
+        f"MPC Standalone Diagnostic | Mode: {mode} | {T} policy steps ({T*policy_dt:.1f}s)\n"
         f"Final height: {positions[-1, 2]:.3f}m | "
         f"Total reward: {np.sum(rewards):.2f} | "
         f"MPC convergence: {np.mean(mpc_converged_log)*100:.0f}%",
@@ -231,7 +331,7 @@ def plot_diagnostic(positions, orientations, target_pos, rewards,
                      "RR_hip", "RR_thigh", "RR_calf",
                      "RL_hip", "RL_thigh", "RL_calf"]
         # Plot by leg (average of 3 joints per leg)
-        t_torques = np.arange(len(torques)) * 0.02
+        t_torques = np.arange(len(torques)) * policy_dt
         colors = ["red", "blue", "green", "orange"]
         for leg_idx, (leg_name, color) in enumerate(
             zip(["FR", "FL", "RR", "RL"], colors)):
@@ -248,7 +348,7 @@ def plot_diagnostic(positions, orientations, target_pos, rewards,
     ax = axes[2, 0]
     if len(joint_positions_log) > 0:
         jpos = np.array(joint_positions_log)
-        t_jpos = np.arange(len(jpos)) * 0.02
+        t_jpos = np.arange(len(jpos)) * policy_dt
         # Isaac Lab joint order: FR_hip, FL_hip, RR_hip, RL_hip, FR_thigh, ...
         # Plot hip, thigh, calf averages across legs
         for j in range(min(12, jpos.shape[1])):
@@ -261,7 +361,7 @@ def plot_diagnostic(positions, orientations, target_pos, rewards,
     # --- Panel 6: MPC Cost & Convergence ---
     ax = axes[2, 1]
     if len(mpc_costs_log) > 0:
-        t_mpc = np.arange(len(mpc_costs_log)) * 0.02
+        t_mpc = np.arange(len(mpc_costs_log)) * policy_dt
         ax.semilogy(t_mpc, np.clip(mpc_costs_log, 1e-6, None),
                     "b-", linewidth=1, label="MPC cost")
         ax.set_xlabel("Time (s)")
@@ -279,19 +379,109 @@ def plot_diagnostic(positions, orientations, target_pos, rewards,
 
 def main():
     """Main MPC diagnostic test."""
+    if args_cli.debug_group is not None:
+        # Keep the task identical across all groups. Only warm start and contact
+        # topology are changed, so a pass/fail transition identifies the cause.
+        args_cli.mode = "stand"
+        args_cli.num_envs = 1
+
     print("=" * 70)
     print("MPC STANDALONE DIAGNOSTIC TEST")
     print("=" * 70)
     print(f"Mode: {args_cli.mode}")
-    print(f"Max steps: {args_cli.max_steps} ({args_cli.max_steps * 0.02:.1f}s)")
+    policy_dt = 0.2
+    print(f"Max policy steps: {args_cli.max_steps} ({args_cli.max_steps * policy_dt:.1f}s)")
     print(f"Purpose: Test if MPC can control Go2 in Isaac Lab WITHOUT RL")
     print("=" * 70)
 
     # Create environment configuration
     env_cfg = QuadrupedMPCEnvCfg()
     env_cfg.scene.num_envs = args_cli.num_envs
+    env_cfg.seed = args_cli.seed
     env_cfg.fix_gait_params = True  # Fixed gait for diagnostic
     env_cfg.mpc_verbose = True  # Enable verbose MPC debugging (first 5 solves)
+    env_cfg.mpc_torque_control_only = args_cli.torque_only
+    env_cfg.forward_velocity_bias = 0.0  # test exactly the trajectory selected above
+    env_cfg.use_mpc_cluster = args_cli.use_mpc_cluster
+    env_cfg.cluster_num_workers = args_cli.cluster_workers
+    env_cfg.cluster_python_executable = args_cli.mpc_python
+    env_cfg.robot_urdf_path = args_cli.robot_urdf
+
+    if args_cli.debug_group is not None:
+        env_cfg.mpc_force_standing_contacts = (
+            args_cli.debug_group in ("static_fixed", "cold_fixed", "warm_fixed")
+        )
+        # Keep the validated Crocoddyl demo weights identical across the
+        # controlled groups. warm_trot must change only the contact schedule.
+        env_cfg.mpc_use_demo_stabilization_weights = True
+        if args_cli.debug_friction_cone_weight is not None:
+            env_cfg.mpc_friction_cone_weight = args_cli.debug_friction_cone_weight
+        if args_cli.debug_disable_pseudo_impulse:
+            env_cfg.mpc_use_pseudo_impulse = False
+        env_cfg.mpc_initial_full_support_duration = 0.10 if args_cli.debug_group in (
+            "warm_trot",
+            "cold_trot_infeasible_init",
+            "warm_trot_infeasible_init",
+        ) else 0.0
+        env_cfg.mpc_use_feasible_cold_start_rollout = (
+            args_cli.debug_group
+            not in ("cold_trot_infeasible_init", "warm_trot_infeasible_init")
+        )
+        env_cfg.mpc_enable_warm_start = args_cli.debug_group not in (
+            "static_fixed", "cold_fixed", "cold_trot_infeasible_init"
+        )
+        env_cfg.mpc_return_quasi_static_control = (
+            args_cli.debug_group == "static_fixed"
+        )
+        env_cfg.mpc_torque_control_only = not args_cli.debug_hybrid_control
+        env_cfg.mpc_touchdown_hold_steps = max(
+            0, args_cli.debug_touchdown_hold_steps
+        )
+        env_cfg.mpc_swing_landing_height_ratio = max(
+            0.0, args_cli.debug_swing_landing_height_ratio
+        )
+        env_cfg.mpc_touchdown_gate_height_tolerance = max(
+            0.0, args_cli.debug_touchdown_gate_tolerance
+        )
+        env_cfg.mpc_touchdown_gate_max_steps = max(
+            0, args_cli.debug_touchdown_gate_max_steps
+        )
+        env_cfg.mpc_use_raw_state_input = True
+        env_cfg.mpc_reference_is_root_position = True
+        env_cfg.initial_pos_range = (
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            args_cli.debug_root_height,
+            args_cli.debug_root_height,
+        )
+        env_cfg.initial_yaw_range = (0.0, 0.0)
+        print(
+            "Isolation group: "
+            f"{args_cli.debug_group} | "
+            f"fixed_contacts={env_cfg.mpc_force_standing_contacts} | "
+            f"warm_start={env_cfg.mpc_enable_warm_start} | "
+            f"demo_weights={env_cfg.mpc_use_demo_stabilization_weights} | "
+            f"friction_weight={env_cfg.mpc_friction_cone_weight:.1e} | "
+            f"pseudo_impulse={env_cfg.mpc_use_pseudo_impulse} | "
+            f"initial_support={env_cfg.mpc_initial_full_support_duration:.2f}s | "
+            f"feasible_cold_start={env_cfg.mpc_use_feasible_cold_start_rollout} | "
+            f"quasi_static={env_cfg.mpc_return_quasi_static_control} | "
+            f"torque_only={env_cfg.mpc_torque_control_only} | "
+            f"touchdown_hold={env_cfg.mpc_touchdown_hold_steps} | "
+            f"landing_height_ratio={env_cfg.mpc_swing_landing_height_ratio:.2f} | "
+            f"touchdown_gate={env_cfg.mpc_touchdown_gate_height_tolerance:.3f}m/"
+            f"{env_cfg.mpc_touchdown_gate_max_steps}steps | "
+            "raw_state=True | root_reference=True | "
+            f"root_height={args_cli.debug_root_height:.3f}"
+        )
+
+    if env_cfg.use_mpc_cluster:
+        if not env_cfg.cluster_python_executable:
+            parser.error("--use_mpc_cluster requires --mpc_python")
+        if not env_cfg.robot_urdf_path:
+            parser.error("--use_mpc_cluster requires --robot_urdf")
 
     # Force target to be straight ahead (simple test)
     env_cfg.target_pos_range = (2.0, 2.0, 0.0, 0.0, 0.0, 0.0)  # Fixed at x=2.0
@@ -332,6 +522,13 @@ def main():
     print("RUNNING SIMULATION")
     print("=" * 70)
     obs, _ = env.reset()
+    if hasattr(env, "_mpc_diagnostic_history"):
+        env._mpc_diagnostic_history.clear()
+    initial_tick_count = int(env._lifetime_mpc_tick_counts.sum().item())
+    initial_guard_count = int(env._lifetime_guard_counts.sum().item())
+    initial_converged_count = int(
+        env._lifetime_mpc_converged_counts.sum().item()
+    )
 
     # Print initial state
     robot_data = env.robot.data
@@ -348,11 +545,30 @@ def main():
     joint_positions_log = []
     mpc_converged_log = []
     mpc_costs_log = []
+    guard_count = 0
+    mpc_tick_count = 0
+    converged_tick_count = 0
+    terminated_early = False
+    terminal_state_for_summary = None
+    termination_reasons = []
 
     # Run simulation
     for step in range(args_cli.max_steps):
         # Apply FIXED actions (bypassing RL)
         obs, rewards, terminated, truncated, info = env.step(action_tensor)
+
+        # One policy step contains rl_policy_period MPC ticks. The environment
+        # accumulates these before returning from env.step().
+        guard_count = (
+            int(env._lifetime_guard_counts.sum().item()) - initial_guard_count
+        )
+        converged_tick_count = (
+            int(env._lifetime_mpc_converged_counts.sum().item())
+            - initial_converged_count
+        )
+        mpc_tick_count = (
+            int(env._lifetime_mpc_tick_counts.sum().item()) - initial_tick_count
+        )
 
         # Print detailed MPC info for first 3 steps
         if step < 3 and hasattr(env, 'last_mpc_solutions') and env.last_mpc_solutions[0] is not None:
@@ -383,7 +599,7 @@ def main():
             mpc_costs_log.append(env._last_mpc_costs[0])
 
         # Print progress every 50 steps
-        if (step + 1) % 50 == 0:
+        if (step + 1) % 5 == 0:
             height = pos[2]
             # Compute pitch from quaternion
             w, x, y, z = quat
@@ -391,18 +607,50 @@ def main():
             sinp = np.clip(sinp, -1.0, 1.0)
             pitch = np.degrees(np.arcsin(sinp))
 
-            conv_rate = np.mean(mpc_converged_log[-50:]) * 100 if mpc_converged_log else 0
+            conv_rate = 100.0 * converged_tick_count / max(mpc_tick_count, 1)
+            guard_rate = 100.0 * guard_count / max(mpc_tick_count, 1)
             print(f"  Step {step+1:4d}/{args_cli.max_steps}: "
                   f"pos=[{pos[0]:+.3f}, {pos[1]:+.3f}, {pos[2]:.3f}], "
                   f"pitch={pitch:+.1f}°, "
                   f"reward={rewards[0].item():+.3f}, "
-                  f"MPC conv={conv_rate:.0f}%")
+                  f"MPC conv={conv_rate:.1f}%, Guard={guard_rate:.1f}%")
 
         # Check termination
         dones = terminated | truncated
         if dones.any():
+            reason_names = (
+                "low_height", "high_height", "flipped",
+                "out_of_bounds", "consecutive_mpc_failures",
+            )
+            reason_mask = env._last_termination_reason_mask[0].cpu().tolist()
+            reasons = [
+                name for name, triggered in zip(reason_names, reason_mask)
+                if triggered
+            ]
+            terminal_state = env._last_terminal_root_state[0].cpu().numpy()
+            terminated_early = True
+            terminal_state_for_summary = terminal_state.copy()
+            termination_reasons = reasons
+            terminal_quat = terminal_state[3:7]
+            tw, tx, ty, tz = terminal_quat
+            terminal_roll = np.degrees(np.arctan2(
+                2.0 * (tw * tx + ty * tz),
+                1.0 - 2.0 * (tx * tx + ty * ty),
+            ))
+            terminal_pitch = np.degrees(np.arcsin(np.clip(
+                2.0 * (tw * ty - tz * tx), -1.0, 1.0
+            )))
             print(f"\n  *** TERMINATED at step {step + 1} "
                   f"(terminated={terminated[0].item()}, truncated={truncated[0].item()}) ***")
+            print(f"  Reasons: {reasons or ['timeout/unknown']}")
+            print(
+                "  Pre-reset state: "
+                f"pos=[{terminal_state[0]:+.3f}, {terminal_state[1]:+.3f}, "
+                f"{terminal_state[2]:.3f}], roll={terminal_roll:+.1f} deg, "
+                f"pitch={terminal_pitch:+.1f} deg, "
+                f"lin_vel=[{terminal_state[7]:+.3f}, {terminal_state[8]:+.3f}, "
+                f"{terminal_state[9]:+.3f}]"
+            )
             break
 
     # Convert logs to arrays
@@ -421,9 +669,15 @@ def main():
     print("=" * 70)
 
     T = len(positions_arr)
-    final_height = positions_arr[-1, 2]
+    summary_final_position = positions_arr[-1].copy()
+    if terminal_state_for_summary is not None:
+        summary_final_position = terminal_state_for_summary[:3].copy()
+    final_height = summary_final_position[2]
     min_height = np.min(positions_arr[:, 2])
     max_height = np.max(positions_arr[:, 2])
+    if terminal_state_for_summary is not None:
+        min_height = min(min_height, final_height)
+        max_height = max(max_height, final_height)
 
     # Compute pitch over time
     pitches = []
@@ -433,10 +687,16 @@ def main():
         sinp = np.clip(sinp, -1.0, 1.0)
         pitches.append(np.degrees(np.arcsin(sinp)))
     pitches = np.array(pitches)
+    if terminal_state_for_summary is not None:
+        tw, tx, ty, tz = terminal_state_for_summary[3:7]
+        terminal_pitch = np.degrees(np.arcsin(np.clip(
+            2.0 * (tw * ty - tz * tx), -1.0, 1.0
+        )))
+        pitches = np.append(pitches, terminal_pitch)
 
     print(f"Test mode:         {args_cli.mode}")
-    print(f"Steps completed:   {T} / {args_cli.max_steps} ({T * 0.02:.1f}s)")
-    print(f"Final position:    [{positions_arr[-1, 0]:+.3f}, {positions_arr[-1, 1]:+.3f}, {positions_arr[-1, 2]:.3f}]")
+    print(f"Policy steps:      {T} / {args_cli.max_steps} ({T * policy_dt:.1f}s)")
+    print(f"Final position:    [{summary_final_position[0]:+.3f}, {summary_final_position[1]:+.3f}, {summary_final_position[2]:.3f}]")
     print(f"Target position:   [{target_pos[0]:.3f}, {target_pos[1]:.3f}, {target_pos[2]:.3f}]")
     print(f"Height range:      [{min_height:.3f}, {max_height:.3f}]m (standing: 0.40m)")
     print(f"Pitch range:       [{np.min(pitches):.1f}°, {np.max(pitches):.1f}°]")
@@ -444,10 +704,55 @@ def main():
 
     if len(mpc_converged_arr) > 0:
         print(f"MPC convergence:   {np.mean(mpc_converged_arr)*100:.1f}%")
+    print(f"MPC tick count:    {mpc_tick_count}")
+    print(f"Guard rate:        {100.0 * guard_count / max(mpc_tick_count, 1):.1f}%")
+    print(f"Tick convergence:  {100.0 * converged_tick_count / max(mpc_tick_count, 1):.1f}%")
+
+    diagnostic_history = list(getattr(env, "_mpc_diagnostic_history", ()))
+    if diagnostic_history:
+        fresh_rate = 100.0 * np.mean([item["fresh"] for item in diagnostic_history])
+        status_ok_rate = 100.0 * np.mean([
+            item["status"] == 0.0 for item in diagnostic_history
+        ])
+
+        def finite_values(name):
+            values = np.asarray([item[name] for item in diagnostic_history], dtype=float)
+            return values[np.isfinite(values)]
+
+        solve_times = finite_values("solve_time") * 1e3
+        solution_ages = finite_values("solution_age") * 1e3
+        iterations = finite_values("iterations")
+        gaps = finite_values("dynamics_gap")
+        violations = finite_values("constraint_violation")
+        solve_p95 = float(np.percentile(solve_times, 95)) if solve_times.size else float("nan")
+        age_p95 = float(np.percentile(solution_ages, 95)) if solution_ages.size else float("nan")
+        solve_mean = float(np.mean(solve_times)) if solve_times.size else float("nan")
+        age_mean = float(np.mean(solution_ages)) if solution_ages.size else float("nan")
+        print("\nStage-1 IPC/MPC acceptance metrics (env 0):")
+        print(f"  Fresh responses: {fresh_rate:.1f}%")
+        print(f"  Status OK:       {status_ok_rate:.1f}%")
+        print(f"  Solve time:      mean={solve_mean:.1f}ms p95={solve_p95:.1f}ms")
+        print(f"  Solution age:    mean={age_mean:.1f}ms p95={age_p95:.1f}ms")
+        if iterations.size:
+            print(f"  Iterations:      mean={np.mean(iterations):.1f} max={np.max(iterations):.0f}")
+        if gaps.size:
+            print(f"  Dynamics gap:    max={np.max(gaps):.3e}")
+        else:
+            print("  Dynamics gap:    unavailable in this Crocoddyl binding")
+        if violations.size:
+            print(f"  Constraint viol: max={np.max(violations):.3e}")
+        else:
+            print("  Constraint viol: unavailable in this Crocoddyl binding")
+        latency_pass = np.isfinite(age_p95) and age_p95 <= env_cfg.mpc_dt * 1e3
+        transport_pass = fresh_rate == 100.0 and status_ok_rate == 100.0
+        print(
+            "  Transport check: " + ("PASS" if transport_pass else "FAIL")
+            + " | 50 Hz latency check: " + ("PASS" if latency_pass else "FAIL")
+        )
 
     # Distance traveled
-    x_traveled = positions_arr[-1, 0] - positions_arr[0, 0]
-    y_traveled = positions_arr[-1, 1] - positions_arr[0, 1]
+    x_traveled = summary_final_position[0] - positions_arr[0, 0]
+    y_traveled = summary_final_position[1] - positions_arr[0, 1]
     total_dist = np.sqrt(x_traveled**2 + y_traveled**2)
     print(f"X displacement:    {x_traveled:+.3f}m")
     print(f"Y displacement:    {y_traveled:+.3f}m")
@@ -488,9 +793,11 @@ def main():
     elif pitch_collapsed:
         print("🟡 ROBOT TILTED — Pitch exceeded 40° but didn't fully fall")
         print("   → MPC is partially working but orientation control is weak.")
-    elif T < args_cli.max_steps * 0.8:
+    elif terminated_early or T < args_cli.max_steps * 0.8:
+        if termination_reasons:
+            print(f"   Termination reasons: {termination_reasons}")
         print("🟡 EARLY TERMINATION — Robot survived but terminated early")
-        print(f"   → Lasted {T * 0.02:.1f}s out of {args_cli.max_steps * 0.02:.1f}s")
+        print(f"   → Lasted {T * policy_dt:.1f}s out of {args_cli.max_steps * policy_dt:.1f}s")
     else:
         if args_cli.mode == "stand":
             if abs(x_traveled) < 0.3 and abs(y_traveled) < 0.3:
@@ -500,7 +807,7 @@ def main():
         else:
             if x_traveled > 0.2:
                 print("🟢 ROBOT IS WALKING FORWARD — MPC works in Isaac Lab!")
-                print(f"   → Traveled {x_traveled:.2f}m forward in {T*0.02:.1f}s")
+                print(f"   → Traveled {x_traveled:.2f}m forward in {T*policy_dt:.1f}s")
                 print("   → Problem is in RL training, not MPC integration.")
             elif x_traveled < -0.2:
                 print("🟡 ROBOT WALKED BACKWARD — MPC has direction issue")

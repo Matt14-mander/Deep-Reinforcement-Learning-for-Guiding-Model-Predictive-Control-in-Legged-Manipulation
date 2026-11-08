@@ -32,7 +32,7 @@ Reference Crocoddyl API classes used:
     - crocoddyl.ImpulseModelMultiple / ImpulseModel3D
     - crocoddyl.ActionModelImpulseFwdDynamics
     - crocoddyl.ShootingProblem
-    - crocoddyl.SolverFDDP
+    - crocoddyl.SolverBoxFDDP
 """
 
 from typing import Any, Dict, List, Optional, Tuple
@@ -81,6 +81,23 @@ class OCPFactory:
                                     # than physical constraint satisfaction)
     }
 
+    # Crocoddyl SimpleQuadrupedGaitProblem reference values. Keep these behind
+    # an isolation switch until the closed-loop standing test validates them.
+    DEMO_STANDING_WEIGHTS = {
+        "com_track": 1e6,
+        # Crocoddyl's official quadrupedal-gait helper gives swing-foot
+        # translation the same priority as CoM tracking. The previous 1e2
+        # weight let the solver hold the body while ignoring touchdown, so
+        # feet remained airborne when the contact schedule advanced.
+        "foot_track": 1e6,
+        "state_reg": 1e1,
+        "ctrl_reg": 1e-1,
+    }
+
+    # Baumgarte gains used by Crocoddyl's quadrupedal-gait example.  The
+    # derivative term damps foot velocity when a new contact becomes active.
+    CONTACT_GAINS = np.array([0.0, 50.0])
+
     def __init__(
         self,
         rmodel: "pinocchio.Model",
@@ -89,6 +106,9 @@ class OCPFactory:
         integrator: str = "euler",
         fwddyn: bool = True,
         weights: Optional[Dict[str, float]] = None,
+        use_demo_stabilization_weights: bool = False,
+        use_pseudo_impulse: bool = False,
+        max_joint_torque: float = 23.5,
     ):
         """Initialize factory with robot model and cost weights.
 
@@ -100,6 +120,9 @@ class OCPFactory:
             integrator: Integration scheme, "euler" or "rk4".
             fwddyn: If True, use forward dynamics. Otherwise inverse dynamics.
             weights: Dict of cost weights. Uses DEFAULT_WEIGHTS for missing keys.
+            use_demo_stabilization_weights: Use the state and main task weights
+                from Crocoddyl's SimpleQuadrupedGaitProblem standing model.
+            max_joint_torque: Symmetric actuator torque limit in N.m.
         """
         if not CROCODDYL_AVAILABLE:
             raise ImportError(
@@ -112,9 +135,16 @@ class OCPFactory:
         self.mu = mu
         self.integrator = integrator
         self.fwddyn = fwddyn
+        self.use_demo_stabilization_weights = use_demo_stabilization_weights
+        self.use_pseudo_impulse = use_pseudo_impulse
+        self.max_joint_torque = float(max_joint_torque)
+        if not np.isfinite(self.max_joint_torque) or self.max_joint_torque <= 0.0:
+            raise ValueError("max_joint_torque must be a finite positive value")
 
         # Merge weights with defaults
         self.weights = self.DEFAULT_WEIGHTS.copy()
+        if self.use_demo_stabilization_weights:
+            self.weights.update(self.DEMO_STANDING_WEIGHTS)
         if weights is not None:
             self.weights.update(weights)
 
@@ -127,12 +157,21 @@ class OCPFactory:
         self.nv = self.rmodel.nv  # velocity dimension
         self.nx = self.state.nx  # state dimension (nq + nv)
         self.nu = self.actuation.nu  # control dimension (actuated joints only)
+        self.control_lb = np.full(self.nu, -self.max_joint_torque, dtype=float)
+        self.control_ub = np.full(self.nu, self.max_joint_torque, dtype=float)
 
         # Default state for regularization (standing pose)
         self.x0 = self.rmodel.defaultState if hasattr(self.rmodel, 'defaultState') else self._compute_default_state()
 
         # Precompute state weights (from Crocoddyl demo structure)
         self._compute_state_weights()
+
+    def _apply_control_bounds(self, model: Any) -> Any:
+        """Attach actuator-consistent bounds to a continuous action model."""
+        if int(getattr(model, "nu", 0)) == self.nu:
+            model.u_lb = self.control_lb.copy()
+            model.u_ub = self.control_ub.copy()
+        return model
 
     def _compute_default_state(self) -> np.ndarray:
         """Compute a default standing state for regularization.
@@ -180,24 +219,37 @@ class OCPFactory:
         """
         # Configuration tangent space (nv dimensions)
         # Structure: [base_pos(3), base_SO3(3), joints(nv-6)]
-        state_weights_q = np.array(
-            [0.0] * 3        # base position — free (tracked by comTrack)
-            + [500.0] * 3    # base orientation — keep upright (critical for balance)
-            + [0.0] * (self.nv - 6)  # joints — zero weight avoids wrong-reference pull
-        )
+        if self.use_demo_stabilization_weights:
+            # ActivationModelWeightedQuad consumes quadratic coefficients. The
+            # Crocoddyl quadruped demo explicitly squares its intuitive weights.
+            state_weights_q = np.array(
+                [0.0] * 3
+                + [500.0**2] * 3
+                + [0.01**2] * (self.nv - 6)
+            )
+            state_weights_v = np.array(
+                [10.0**2] * 6
+                + [1.0**2] * (self.nv - 6)
+            )
+        else:
+            state_weights_q = np.array(
+                [0.0] * 3        # base position — free (tracked by comTrack)
+                + [500.0] * 3    # base orientation — keep upright (critical for balance)
+                + [0.0] * (self.nv - 6)  # joints — zero weight avoids wrong-reference pull
+            )
 
-        # Velocity tangent space (nv dimensions)
-        state_weights_v = np.array(
-            [10.0] * 6       # base linear+angular velocity damping
-            + [0.1] * (self.nv - 6)  # joint velocity damping (light)
-        )
+            # Velocity tangent space (nv dimensions)
+            state_weights_v = np.array(
+                [10.0] * 6       # base linear+angular velocity damping
+                + [0.1] * (self.nv - 6)  # joint velocity damping (light)
+            )
 
         self.state_weights = np.concatenate([state_weights_q, state_weights_v])
 
     def build_swing_node(
         self,
         dt: float,
-        support_foot_ids: List[int],
+        support_foot_targets: List[Tuple[int, np.ndarray]],
         com_target: Optional[np.ndarray] = None,
         swing_foot_targets: Optional[List[Tuple[int, np.ndarray]]] = None,
         body_yaw_target: Optional[float] = None,
@@ -220,7 +272,10 @@ class OCPFactory:
 
         Args:
             dt: Timestep in seconds.
-            support_foot_ids: List of Pinocchio frame IDs for feet in contact.
+            support_foot_targets: ``(frame_id, world_position)`` pairs for
+                feet in contact. Each contact must remain at its own stance
+                location; constraining every foot to the world origin makes
+                the multi-contact dynamics infeasible.
             com_target: Target CoM position, shape (3,). Optional.
             swing_foot_targets: List of (frame_id, target_pos) for swing feet.
             body_yaw_target: Target body yaw angle in radians. Optional.
@@ -231,14 +286,17 @@ class OCPFactory:
         # Create contact model
         contact_model = crocoddyl.ContactModelMultiple(self.state, self.nu)
 
-        for foot_id in support_foot_ids:
+        for foot_id, contact_position in support_foot_targets:
             contact = crocoddyl.ContactModel3D(
                 self.state,
                 foot_id,
-                np.array([0.0, 0.0, 0.0]),  # contact point offset
+                np.asarray(contact_position, dtype=float),
                 pinocchio.LOCAL_WORLD_ALIGNED,
                 self.nu,
-                np.array([0.0, 0.0]),  # gains
+                # Match Crocoddyl's quadrupedal-gait helper: damp contact
+                # velocity at touchdown instead of leaving the constraint
+                # completely unstabilized.
+                self.CONTACT_GAINS.copy(),
             )
             contact_model.addContact(f"contact_{foot_id}", contact)
 
@@ -278,7 +336,7 @@ class OCPFactory:
         cost_model.addCost("ctrlReg", ctrl_cost, self.weights["ctrl_reg"])
 
         # Friction cone constraints for each support foot
-        for foot_id in support_foot_ids:
+        for foot_id, _ in support_foot_targets:
             # Create friction cone
             # FrictionCone expects a 3x3 rotation matrix (not a normal vector).
             # np.eye(3) means the cone normal is aligned with world z-axis (upward).
@@ -378,7 +436,7 @@ class OCPFactory:
         else:
             raise ValueError(f"Unknown integrator: {self.integrator}")
 
-        return model
+        return self._apply_control_bounds(model)
 
     def build_impulse_node(
         self,
@@ -423,6 +481,22 @@ class OCPFactory:
             velocity_cost = crocoddyl.CostModelResidual(self.state, velocity_residual)
             cost_model.addCost(f"impactVel_{foot_id}", velocity_cost, 1e2)
 
+        # Keep the newly landed feet at their planned touchdown locations
+        # while the impulse model removes their pre-impact velocity.
+        if swing_foot_targets is not None:
+            for foot_id, target_pos in swing_foot_targets:
+                foot_residual = crocoddyl.ResidualModelFrameTranslation(
+                    self.state, foot_id, np.asarray(target_pos, dtype=float), 0
+                )
+                foot_cost = crocoddyl.CostModelResidual(
+                    self.state, foot_residual
+                )
+                cost_model.addCost(
+                    f"footTrack_{foot_id}",
+                    foot_cost,
+                    self.weights["foot_track"],
+                )
+
         # State regularization
         state_residual = crocoddyl.ResidualModelState(self.state, self.x0, 0)
         state_cost = crocoddyl.CostModelResidual(self.state, state_residual)
@@ -433,12 +507,85 @@ class OCPFactory:
             self.state, impulse_model, cost_model
         )
 
-        return model
+        return self._apply_control_bounds(model)
+
+    def build_pseudo_impulse_node(
+        self,
+        support_foot_targets: List[Tuple[int, np.ndarray]],
+        landed_foot_targets: List[Tuple[int, np.ndarray]],
+    ) -> Any:
+        """Build a zero-time, fixed-control-dimension touchdown node.
+
+        A true impulse action has ``nu=0``.  That is valid for an offline
+        shooting problem, but it breaks the one-node receding-horizon shift
+        used by this controller whenever an impulse enters or leaves the
+        horizon.  The pseudo-impulse keeps ``nu=self.nu`` while imposing the
+        post-touchdown contacts and strongly damping the newly landed feet.
+        """
+        contact_model = crocoddyl.ContactModelMultiple(self.state, self.nu)
+        for foot_id, contact_position in support_foot_targets:
+            contact = crocoddyl.ContactModel3D(
+                self.state,
+                foot_id,
+                np.asarray(contact_position, dtype=float),
+                pinocchio.LOCAL_WORLD_ALIGNED,
+                self.nu,
+                self.CONTACT_GAINS.copy(),
+            )
+            contact_model.addContact(f"contact_{foot_id}", contact)
+
+        cost_model = crocoddyl.CostModelSum(self.state, self.nu)
+
+        for foot_id, target_pos in landed_foot_targets:
+            position_residual = crocoddyl.ResidualModelFrameTranslation(
+                self.state, foot_id, np.asarray(target_pos, dtype=float), self.nu
+            )
+            position_cost = crocoddyl.CostModelResidual(
+                self.state, position_residual
+            )
+            cost_model.addCost(
+                f"footTrack_{foot_id}",
+                position_cost,
+                self.weights["foot_track"],
+            )
+
+            velocity_residual = crocoddyl.ResidualModelFrameVelocity(
+                self.state,
+                foot_id,
+                pinocchio.Motion.Zero(),
+                pinocchio.LOCAL_WORLD_ALIGNED,
+                self.nu,
+            )
+            velocity_cost = crocoddyl.CostModelResidual(
+                self.state, velocity_residual
+            )
+            cost_model.addCost(
+                f"impactVel_{foot_id}", velocity_cost, 1e4
+            )
+
+        state_residual = crocoddyl.ResidualModelState(
+            self.state, self.x0, self.nu
+        )
+        state_cost = crocoddyl.CostModelResidual(self.state, state_residual)
+        cost_model.addCost("stateReg", state_cost, self.weights["state_reg"])
+
+        control_residual = crocoddyl.ResidualModelControl(self.state, self.nu)
+        control_cost = crocoddyl.CostModelResidual(
+            self.state, control_residual
+        )
+        cost_model.addCost("ctrlReg", control_cost, self.weights["ctrl_reg"])
+
+        differential_model = crocoddyl.DifferentialActionModelContactFwdDynamics(
+            self.state, self.actuation, contact_model, cost_model
+        )
+        model = crocoddyl.IntegratedActionModelEuler(differential_model, 0.0)
+        return self._apply_control_bounds(model)
 
     def build_terminal_node(
         self,
         com_target: Optional[np.ndarray] = None,
         body_yaw_target: Optional[float] = None,
+        support_foot_targets: Optional[List[Tuple[int, np.ndarray]]] = None,
     ) -> Any:
         """Build terminal cost node for the OCP.
 
@@ -449,18 +596,25 @@ class OCPFactory:
         Returns:
             Crocoddyl IntegratedActionModel with zero time step.
         """
-        # All feet in contact for terminal state
-        all_foot_ids = list(self.foot_frame_ids.values())
+        # The caller supplies the support topology active at the end of the
+        # prediction horizon.  Falling back to four-foot support preserves the
+        # standalone use of this helper, but build_problem() must not introduce
+        # phantom contacts when its horizon ends inside a swing phase.
+        if support_foot_targets is None:
+            support_foot_targets = [
+                (frame_id, np.zeros(3))
+                for frame_id in self.foot_frame_ids.values()
+            ]
 
         contact_model = crocoddyl.ContactModelMultiple(self.state, self.nu)
-        for foot_id in all_foot_ids:
+        for foot_id, contact_position in support_foot_targets:
             contact = crocoddyl.ContactModel3D(
                 self.state,
                 foot_id,
-                np.array([0.0, 0.0, 0.0]),
+                np.asarray(contact_position, dtype=float),
                 pinocchio.LOCAL_WORLD_ALIGNED,
                 self.nu,
-                np.array([0.0, 0.0]),
+                self.CONTACT_GAINS.copy(),
             )
             contact_model.addContact(f"contact_{foot_id}", contact)
 
@@ -530,7 +684,7 @@ class OCPFactory:
         # Zero timestep for terminal
         model = crocoddyl.IntegratedActionModelEuler(dmodel, 0.0)
 
-        return model
+        return self._apply_control_bounds(model)
 
     def build_problem(
         self,
@@ -538,6 +692,7 @@ class OCPFactory:
         contact_sequence: ContactSequence,
         com_trajectory: np.ndarray,
         foot_trajectories: Dict[str, List[FootholdPlan]],
+        current_foot_positions: Dict[str, np.ndarray],
         dt: float,
         heading_trajectory: Optional[np.ndarray] = None,
         max_nodes: Optional[int] = None,
@@ -559,6 +714,7 @@ class OCPFactory:
             contact_sequence: ContactSequence defining the gait.
             com_trajectory: Dense CoM waypoints, shape (T, 3).
             foot_trajectories: Dict from FootholdPlanner.
+            current_foot_positions: Current world-frame position of each foot.
             dt: OCP timestep in seconds.
             heading_trajectory: Target yaw angles, shape (T,). Optional.
             max_nodes: If set, cap the number of running nodes at this value.
@@ -573,6 +729,23 @@ class OCPFactory:
 
         # Track which swing is current for each foot
         foot_swing_indices = {foot: 0 for foot in self.foot_frame_ids.keys()}
+        stance_positions = {
+            foot: np.asarray(current_foot_positions[foot], dtype=float).copy()
+            for foot in self.foot_frame_ids.keys()
+        }
+        terminal_foot_positions = {
+            foot: position.copy() for foot, position in stance_positions.items()
+        }
+        # Keep the terminal contact topology aligned with the last running
+        # model.  The horizon moves through the gait on every MPC tick, so
+        # forcing all four feet into terminal contact would intermittently
+        # constrain airborne swing feet and create discontinuous solutions.
+        terminal_support_feet = list(self.foot_frame_ids.keys())
+        # A contact model with zero Baumgarte gains constrains acceleration but
+        # does not make the state at a swing-to-support boundary reach the
+        # planned foothold.  Keep the completed swing targets for the first
+        # support node so the preceding control is optimized for touchdown.
+        touchdown_targets: Dict[str, np.ndarray] = {}
 
         # Iterate through contact sequence phases
         done = False
@@ -580,12 +753,42 @@ class OCPFactory:
             if done:
                 break
 
+            # A swing-to-support transition changes velocity instantaneously.
+            # Adding the new holonomic contacts directly in a finite-time
+            # dynamics node makes the first support node fight the incoming
+            # foot velocity through enormous friction-cone penalties.  Insert
+            # a zero-time impulse node before that support phase instead.
+            if (
+                self.use_pseudo_impulse
+                and phase.phase_type == "support"
+                and touchdown_targets
+            ):
+                support_targets = [
+                    (
+                        self.foot_frame_ids[foot],
+                        np.asarray(stance_positions[foot], dtype=float),
+                    )
+                    for foot in phase.support_feet
+                    if foot in self.foot_frame_ids
+                ]
+                landed_targets = [
+                    (self.foot_frame_ids[foot], np.asarray(target, dtype=float))
+                    for foot, target in touchdown_targets.items()
+                    if foot in self.foot_frame_ids
+                ]
+                running_models.append(
+                    self.build_pseudo_impulse_node(
+                        support_foot_targets=support_targets,
+                        landed_foot_targets=landed_targets,
+                    )
+                )
+
             # Discretize phase into knots
             num_knots = max(1, round(phase.duration / dt))
 
-            # Get support foot frame IDs for this phase
-            support_foot_ids = [
-                self.foot_frame_ids[foot]
+            # Keep every support contact at that foot's own stance location.
+            support_foot_targets = [
+                (self.foot_frame_ids[foot], stance_positions[foot])
                 for foot in phase.support_feet
                 if foot in self.foot_frame_ids
             ]
@@ -608,6 +811,15 @@ class OCPFactory:
 
                 # Get swing foot targets
                 swing_foot_targets = []
+                if phase.phase_type == "support" and knot == 0:
+                    for foot_name, target_pos in touchdown_targets.items():
+                        if foot_name in self.foot_frame_ids:
+                            swing_foot_targets.append(
+                                (
+                                    self.foot_frame_ids[foot_name],
+                                    np.asarray(target_pos, dtype=float),
+                                )
+                            )
                 for foot_name in phase.swing_feet:
                     if foot_name not in self.foot_frame_ids:
                         continue
@@ -628,23 +840,42 @@ class OCPFactory:
                             target_pos = (1 - alpha) * plan.start_pos + alpha * plan.end_pos
 
                         swing_foot_targets.append((frame_id, target_pos))
+                        terminal_foot_positions[foot_name] = np.asarray(
+                            target_pos, dtype=float
+                        ).copy()
 
                 # Build the node
                 model = self.build_swing_node(
                     dt=dt,
-                    support_foot_ids=support_foot_ids,
+                    support_foot_targets=support_foot_targets,
                     com_target=com_target,
                     swing_foot_targets=swing_foot_targets if swing_foot_targets else None,
                     body_yaw_target=body_yaw_target,
                 )
                 running_models.append(model)
+                terminal_support_feet = list(phase.support_feet)
                 knot_index += 1
 
             # After each swing phase, increment the swing index for those feet
             if phase.phase_type == "swing" and not done:
+                touchdown_targets = {}
                 for foot_name in phase.swing_feet:
                     if foot_name in foot_swing_indices:
+                        swing_idx = foot_swing_indices[foot_name]
+                        plans = foot_trajectories.get(foot_name, [])
+                        if swing_idx < len(plans):
+                            stance_positions[foot_name] = np.asarray(
+                                plans[swing_idx].end_pos, dtype=float
+                            ).copy()
+                            terminal_foot_positions[foot_name] = stance_positions[
+                                foot_name
+                            ].copy()
+                            touchdown_targets[foot_name] = stance_positions[
+                                foot_name
+                            ].copy()
                         foot_swing_indices[foot_name] += 1
+            elif phase.phase_type == "support":
+                touchdown_targets = {}
 
         # Terminal target: the waypoint at the end of the actual OCP horizon.
         # Using the index of the last running node ensures the terminal cost
@@ -656,6 +887,11 @@ class OCPFactory:
         terminal_model = self.build_terminal_node(
             com_target=terminal_com,
             body_yaw_target=terminal_yaw,
+            support_foot_targets=[
+                (self.foot_frame_ids[foot], terminal_foot_positions[foot])
+                for foot in terminal_support_feet
+                if foot in self.foot_frame_ids
+            ],
         )
 
         # Create shooting problem
@@ -668,8 +904,8 @@ class OCPFactory:
         problem: "crocoddyl.ShootingProblem",
         max_iterations: int = 100,
         th_stop: float = 1e-4,
-    ) -> "crocoddyl.SolverFDDP":
-        """Create a FDDP solver for the problem.
+    ) -> "crocoddyl.SolverBoxFDDP":
+        """Create a box-constrained FDDP solver for the problem.
 
         Args:
             problem: ShootingProblem to solve.
@@ -677,8 +913,8 @@ class OCPFactory:
             th_stop: Convergence threshold.
 
         Returns:
-            Configured FDDP solver.
+            Configured BoxFDDP solver.
         """
-        solver = crocoddyl.SolverFDDP(problem)
+        solver = crocoddyl.SolverBoxFDDP(problem)
         solver.th_stop = th_stop
         return solver

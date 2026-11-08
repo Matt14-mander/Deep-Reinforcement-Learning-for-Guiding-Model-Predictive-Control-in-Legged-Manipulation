@@ -24,6 +24,7 @@ The environment handles the frequency mismatch between RL (5 Hz),
 MPC (50 Hz), and physics (200 Hz) through appropriate buffering.
 """
 
+from collections import deque
 from typing import Dict, Optional, Tuple
 
 import time
@@ -35,6 +36,7 @@ import isaaclab.sim as sim_utils
 from isaaclab.assets import Articulation, ArticulationCfg
 from isaaclab.envs import DirectRLEnv
 from isaaclab.scene import InteractiveScene
+from isaaclab.sensors import ContactSensor, ContactSensorCfg
 
 from ..controllers.crocoddyl_quadruped_mpc import CrocoddylQuadrupedMPC, CROCODDYL_AVAILABLE
 from ..controllers.base_mpc import MPCSolution
@@ -81,6 +83,13 @@ class QuadrupedMPCEnv(DirectRLEnv):
         """
         # Store configuration before parent init
         self._env_cfg = cfg
+        if cfg.mpc_backend not in {"crocoddyl", "torch_tracking"}:
+            raise ValueError(f"Unknown MPC backend: {cfg.mpc_backend}")
+        self._torch_stance = cfg.mpc_backend == "torch_tracking"
+        if self._torch_stance:
+            if cfg.use_mpc_cluster or cfg.robot_name.lower() != "go2":
+                raise ValueError("torch_tracking requires Go2 and an in-process controller")
+            cfg.mpc_torque_control_only = True
 
         # Initialize parent class
         super().__init__(cfg, render_mode, **kwargs)
@@ -97,7 +106,16 @@ class QuadrupedMPCEnv(DirectRLEnv):
         self._pinocchio_data = None
         self._foot_frame_ids = None
 
-        if CROCODDYL_AVAILABLE:
+        if self._torch_stance:
+            from crocoddyl_batched_mpc.models import Go2TensorAdapter, go2_front_leg_tracking_plan
+
+            self.tracking = Go2TensorAdapter(
+                self.robot.joint_names, self.num_envs, device=self.device, dt=cfg.mpc_dt
+            )
+            controller = self.tracking.controller
+            plan = go2_front_leg_tracking_plan(controller.model, standing_only=True)
+            self.stance_command = plan.command(0, self.num_envs, controller.horizon)
+        elif CROCODDYL_AVAILABLE:
             try:
                 self._pinocchio_model, _ = load_pinocchio_model(
                     urdf_path=(cfg.robot_urdf_path or None),
@@ -135,6 +153,26 @@ class QuadrupedMPCEnv(DirectRLEnv):
                     mu=cfg.friction_coefficient,
                     max_iterations=cfg.mpc_max_iterations,
                     verbose=(cfg.mpc_verbose and _ == 0),  # Only verbose for env 0
+                    force_standing_contacts=cfg.mpc_force_standing_contacts,
+                    use_demo_stabilization_weights=cfg.mpc_use_demo_stabilization_weights,
+                    friction_cone_weight=(
+                        cfg.mpc_friction_cone_weight
+                        if cfg.mpc_friction_cone_weight >= 0.0
+                        else None
+                    ),
+                    use_pseudo_impulse=cfg.mpc_use_pseudo_impulse,
+                    initial_full_support_duration=cfg.mpc_initial_full_support_duration,
+                    use_feasible_cold_start_rollout=cfg.mpc_use_feasible_cold_start_rollout,
+                    enable_warm_start=cfg.mpc_enable_warm_start,
+                    reference_is_root_position=cfg.mpc_reference_is_root_position,
+                    return_quasi_static_control=cfg.mpc_return_quasi_static_control,
+                    touchdown_hold_steps=cfg.mpc_touchdown_hold_steps,
+                    swing_landing_height_ratio=cfg.mpc_swing_landing_height_ratio,
+                    touchdown_gate_height_tolerance=(
+                        cfg.mpc_touchdown_gate_height_tolerance
+                    ),
+                    touchdown_gate_max_steps=cfg.mpc_touchdown_gate_max_steps,
+                    max_joint_torque=cfg.max_joint_torque,
                 )
             else:
                 mpc = None  # Dummy mode / cluster mode
@@ -160,6 +198,10 @@ class QuadrupedMPCEnv(DirectRLEnv):
         # P0 timing instrumentation: wall time of the MPC block per control step
         self._mpc_timing_accum_ms = 0.0
         self._mpc_timing_count = 0
+        self._mpc_debug_tick = 0
+        # Bounded env-0 history used by standalone Stage-1 acceptance tests.
+        # It is intentionally bounded so long training runs cannot leak memory.
+        self._mpc_diagnostic_history = deque(maxlen=10000)
 
         # Build joint reordering maps between Isaac Lab and Pinocchio
         # Isaac Lab (USD) and Pinocchio (URDF) may have different joint orderings
@@ -167,14 +209,23 @@ class QuadrupedMPCEnv(DirectRLEnv):
         self._pin_to_isaac_joint_idx = None  # Pinocchio index → Isaac Lab index
 
         self._foot_body_indices = None
+        self._contact_sensor_foot_indices = None
         self._build_joint_mapping()
         self._build_foot_body_mapping()
+        self._build_contact_sensor_mapping()
 
         # Initialize CoM trajectory buffers
         # Shape: (num_envs, num_waypoints, 3)
         self.current_com_trajectories = np.zeros(
             (self.num_envs, cfg.num_bezier_waypoints, 3)
         )
+
+        # Keep the vertical trajectory origin fixed for the whole episode.
+        # Re-anchoring z to the measured root height at every 5 Hz policy
+        # refresh turns accumulated tracking error into the next reference and
+        # causes a slow, irreversible body-height drift. Horizontal references
+        # remain receding-horizon and continue to start at the current x/y.
+        self._trajectory_anchor_heights = np.zeros(self.num_envs, dtype=float)
 
         # Trajectory phase (current timestep within trajectory)
         self.trajectory_phases = np.zeros(self.num_envs, dtype=np.int32)
@@ -266,6 +317,55 @@ class QuadrupedMPCEnv(DirectRLEnv):
         # Pending joint effort buffer
         self._pending_joint_efforts = torch.zeros(
             (self.num_envs, cfg.num_joints), device=self.device, dtype=torch.float32
+        )
+
+        # Two-rate control state. One policy action is held for an entire
+        # 200 ms environment step while MPC is refreshed ten times at 50 Hz.
+        self._policy_bezier_params = np.zeros(
+            (self.num_envs, cfg.num_bezier_actions), dtype=np.float32
+        )
+        self._policy_gait_mods = np.ones(
+            (self.num_envs, cfg.num_gait_mod_actions), dtype=np.float32
+        )
+        self._physics_substep = 0
+        self._mpc_ticks_in_policy_step = 0
+        self._policy_reward_accum = torch.zeros(
+            self.num_envs, device=self.device, dtype=torch.float32
+        )
+        self._policy_guard_counts = torch.zeros(
+            self.num_envs, device=self.device, dtype=torch.long
+        )
+        self._policy_mpc_cost_sums = torch.zeros(
+            self.num_envs, device=self.device, dtype=torch.float32
+        )
+        self._policy_mpc_converged_counts = torch.zeros(
+            self.num_envs, device=self.device, dtype=torch.long
+        )
+        # Monotonic diagnostic counters survive automatic episode resets. This
+        # lets standalone tests measure failures from the step that terminated
+        # an episode instead of losing them in _reset_idx().
+        self._lifetime_mpc_tick_counts = torch.zeros(
+            self.num_envs, device=self.device, dtype=torch.long
+        )
+        self._lifetime_guard_counts = torch.zeros(
+            self.num_envs, device=self.device, dtype=torch.long
+        )
+        self._lifetime_mpc_converged_counts = torch.zeros(
+            self.num_envs, device=self.device, dtype=torch.long
+        )
+        # Last pre-reset terminal snapshot. Columns in the reason mask are:
+        # low height, high height, flipped, out of bounds, MPC failures.
+        self._last_termination_reason_mask = torch.zeros(
+            (self.num_envs, 5), device=self.device, dtype=torch.bool
+        )
+        self._last_terminal_root_state = torch.zeros(
+            (self.num_envs, 13), device=self.device, dtype=torch.float32
+        )
+        self._inner_terminated = torch.zeros(
+            self.num_envs, device=self.device, dtype=torch.bool
+        )
+        self._mpc_tick_reward_mask = torch.ones(
+            self.num_envs, device=self.device, dtype=torch.bool
         )
 
     def _build_joint_mapping(self):
@@ -380,6 +480,26 @@ class QuadrupedMPCEnv(DirectRLEnv):
         self._foot_body_indices = np.asarray(indices, dtype=np.int32)
         print(f"[FootMapping] Isaac foot body indices: {indices}")
 
+    def _build_contact_sensor_mapping(self):
+        """Map contact-sensor bodies to the policy order LF, RF, LH, RH."""
+        ordered_names = [
+            self.cfg.foot_frame_names[foot_key]
+            for foot_key in ("LF", "RF", "LH", "RH")
+        ]
+        indices, matched_names = self.foot_contact_sensor.find_bodies(
+            ordered_names, preserve_order=True
+        )
+        if len(indices) != 4 or list(matched_names) != ordered_names:
+            raise RuntimeError(
+                "Contact sensor must resolve exactly four feet in LF/RF/LH/RH "
+                f"order. Expected {ordered_names}, got {list(matched_names)}."
+            )
+        self._contact_sensor_foot_indices = indices
+        print(
+            "[FootContact] Sensor body order LF/RF/LH/RH: "
+            f"{matched_names} -> {indices}"
+        )
+
     def _setup_scene(self):
         """Set up the simulation scene with Go2 quadruped and ground plane."""
         from isaaclab_assets.robots.unitree import UNITREE_GO2_CFG
@@ -401,7 +521,28 @@ class QuadrupedMPCEnv(DirectRLEnv):
         robot_cfg = UNITREE_GO2_CFG.replace(
             prim_path="/World/envs/env_.*/Robot",
         )
+        if self.cfg.mpc_torque_control_only:
+            for actuator_cfg in robot_cfg.actuators.values():
+                actuator_cfg.stiffness = 0.0
+                actuator_cfg.damping = 0.0
+            print(
+                "[Actuation] Crocoddyl torque-only mode: "
+                "disabled Isaac actuator Kp/Kd terms."
+            )
+        # ContactSensor relies on PhysX ContactReporter being enabled on the
+        # spawned rigid bodies. Keep this explicit instead of depending on the
+        # asset's default setting.
+        robot_cfg.spawn.activate_contact_sensors = True
         self.robot = Articulation(robot_cfg)
+
+        foot_contact_cfg = ContactSensorCfg(
+            prim_path="/World/envs/env_.*/Robot/.*_foot",
+            update_period=0.0,
+            history_length=0,
+            debug_vis=self.cfg.visualize_contacts,
+            force_threshold=self.cfg.foot_contact_force_threshold,
+        )
+        self.foot_contact_sensor = ContactSensor(foot_contact_cfg)
 
         # Add lights
         light_cfg = sim_utils.DomeLightCfg(
@@ -415,6 +556,7 @@ class QuadrupedMPCEnv(DirectRLEnv):
 
         # Register articulation to scene AFTER cloning
         self.scene.articulations["robot"] = self.robot
+        self.scene.sensors["foot_contact"] = self.foot_contact_sensor
 
     def _pre_physics_step(self, actions: torch.Tensor):
         """Process RL actions before physics stepping.
@@ -448,7 +590,7 @@ class QuadrupedMPCEnv(DirectRLEnv):
         # 0.3 m/s caused too many MPC Guard failures (model_1900 tuned for near-stationary).
         # Once reward > 150 and Guard failures < 1/iter, increase to _v_fwd=0.3.
         _hz = float(self.cfg.bezier_horizon)
-        _v_fwd = 0.15  # m/s — curriculum step 2 of 3 (was 0.05, target 0.30)
+        _v_fwd = float(self.cfg.forward_velocity_bias)
         _fwd_bias = np.array([
             0.0, 0.0, 0.0,
             _v_fwd * _hz / 3, 0.0, 0.0,
@@ -456,6 +598,41 @@ class QuadrupedMPCEnv(DirectRLEnv):
             _v_fwd * _hz, 0.0, 0.0,
         ], dtype=np.float32)
         bezier_params = bezier_params + _fwd_bias[np.newaxis, :]
+
+        # Hold this action for the complete 5 Hz policy interval. MPC consumes
+        # the cached trajectory/gait parameters ten times from _apply_action.
+        self._policy_bezier_params[:] = bezier_params
+        self._policy_gait_mods[:] = gait_mods
+        self._physics_substep = 0
+        self._mpc_ticks_in_policy_step = 0
+        self._policy_reward_accum.zero_()
+        self._policy_guard_counts.zero_()
+        self._policy_mpc_cost_sums.zero_()
+        self._policy_mpc_converged_counts.zero_()
+        self._inner_terminated.zero_()
+        self._mpc_tick_reward_mask.fill_(True)
+
+    def _solve_mpc_control_step(self):
+        """Refresh joint targets once at the 50 Hz MPC rate."""
+        if self._torch_stance:
+            data = self.robot.data
+            output = self.tracking.compute(
+                data.root_link_pose_w.double(), data.root_link_vel_w.double(),
+                data.joint_pos.double(), data.joint_vel.double(),
+                self.stance_command, self.scene.env_origins.double(),
+            )
+            self._pending_joint_efforts.copy_(output.joint_effort.clamp(
+                -self.cfg.max_joint_torque, self.cfg.max_joint_torque
+            ))
+            self.guard_triggered.copy_(output.tracking.needs_reset)
+            result = output.tracking.result
+            self.tracking_status = result.status
+            self._last_mpc_costs = torch.where(output.tracking.usable, result.cost, 1e6)
+            self._last_mpc_converged = result.success
+            self._advance_reference_clocks()
+            return
+        bezier_params = self._policy_bezier_params
+        gait_mods = self._policy_gait_mods
 
         # Get current robot states
         robot_states = self._get_robot_states_numpy()
@@ -466,6 +643,7 @@ class QuadrupedMPCEnv(DirectRLEnv):
         # batch apply. Serial path below is kept for debugging and A/B baseline.
         if self.mpc_cluster is not None:
             self._pre_physics_step_cluster(robot_states, bezier_params, gait_mods)
+            self._advance_reference_clocks()
             self._record_mpc_timing(_t_mpc_start)
             return
 
@@ -497,7 +675,20 @@ class QuadrupedMPCEnv(DirectRLEnv):
 
                     # MPC divergence guard: catch exploding or NaN costs, fall back to last-good solution
                     _COST_THRESHOLD = 50000.0
-                    if solution.cost > _COST_THRESHOLD or np.isnan(solution.cost):
+                    raw_control = np.asarray(solution.control, dtype=float)
+                    torque_out_of_bounds = (
+                        raw_control.size != self.cfg.num_joints
+                        or not np.all(np.isfinite(raw_control))
+                        or np.any(
+                            np.abs(raw_control)
+                            > self.cfg.max_joint_torque + 1e-3
+                        )
+                    )
+                    if (
+                        solution.cost > _COST_THRESHOLD
+                        or np.isnan(solution.cost)
+                        or torque_out_of_bounds
+                    ):
                         self.guard_triggered[env_idx] = True
                         failed_cost_for_reward = solution.cost  # save before overwriting with fallback
                         if self._last_good_solutions[env_idx] is not None:
@@ -565,9 +756,29 @@ class QuadrupedMPCEnv(DirectRLEnv):
             self._apply_control(env_idx, joint_positions, joint_torques)
 
 
+        self._advance_reference_clocks()
         self._record_mpc_timing(_t_mpc_start)
 
-    def _prepare_env_mpc_inputs(self, env_idx, robot_states, bezier_params, gait_mods):
+    def _advance_reference_clocks(self):
+        """Advance the shared MPC/reference clock after one control step.
+
+        Both the serial and IPC-cluster backends prepare their references from
+        the same counters, so the counters must advance exactly once after
+        either backend finishes.  Saturating the trajectory phase keeps the
+        final waypoint valid until the next policy-period regeneration.
+        """
+        max_phase = max(self.cfg.num_bezier_waypoints - 1, 0)
+        self.mpc_step_counter += 1
+        np.minimum(
+            self.trajectory_phases + 1,
+            max_phase,
+            out=self.trajectory_phases,
+        )
+
+    def _prepare_env_mpc_inputs(
+        self, env_idx, robot_states, bezier_params, gait_mods,
+        foot_positions_override=None,
+    ):
         """Per-env MPC input preparation (trajectory regen/blend/slice/pad + feet).
 
         Shared verbatim by the serial path and the cluster path so both solve
@@ -579,7 +790,8 @@ class QuadrupedMPCEnv(DirectRLEnv):
         # Check if time to update trajectory
         if self.mpc_step_counter[env_idx] % self.cfg.rl_policy_period == 0:
             # Generate new CoM trajectory from Bezier parameters
-            current_pos = robot_states[env_idx, :3]
+            current_pos = np.asarray(robot_states[env_idx, :3], dtype=float).copy()
+            current_pos[2] = self._trajectory_anchor_heights[env_idx]
             new_trajectory = self.trajectory_generator.params_to_waypoints(
                 params=bezier_params[env_idx],
                 dt=self.cfg.mpc_dt,
@@ -639,8 +851,11 @@ class QuadrupedMPCEnv(DirectRLEnv):
 
             com_reference = np.concatenate([com_reference, padding_points], axis=0)
 
-        # Get current foot positions (dummy for now)
-        foot_positions = self._get_foot_positions_numpy(env_idx, robot_states[env_idx])
+        foot_positions = foot_positions_override
+        if foot_positions is None:
+            foot_positions = self._get_foot_positions_numpy(
+                env_idx, robot_states[env_idx]
+            )
         return com_reference, foot_positions
 
     def _pre_physics_step_cluster(self, robot_states, bezier_params, gait_mods):
@@ -656,11 +871,20 @@ class QuadrupedMPCEnv(DirectRLEnv):
 
         E = self.num_envs
         H = self.cfg.mpc_horizon_steps
+        state_timestamp = np.full(E, time.monotonic(), dtype=np.float64)
+        foot_pos_batch, foot_vel, foot_contact, foot_force = (
+            self._get_cluster_foot_observations_numpy(robot_states)
+        )
         com_refs = np.zeros((E, H, 3))
         foot_pos = np.zeros((E, 12))
         for env_idx in range(E):
+            foot_positions_override = {
+                name: foot_pos_batch[env_idx, index].copy()
+                for index, name in enumerate(FOOT_ORDER)
+            }
             com_reference, foot_positions = self._prepare_env_mpc_inputs(
-                env_idx, robot_states, bezier_params, gait_mods
+                env_idx, robot_states, bezier_params, gait_mods,
+                foot_positions_override=foot_positions_override,
             )
             com_refs[env_idx] = com_reference
             # foot_positions is a dict {name: (3,)}; serialize in wire order
@@ -672,8 +896,64 @@ class QuadrupedMPCEnv(DirectRLEnv):
             states=robot_states,
             com_ref=com_refs,
             foot_pos=foot_pos,
+            foot_vel=foot_vel,
+            foot_contact=foot_contact,
+            foot_force=foot_force,
             gait=gait_mods,
+            timestamp=state_timestamp,
         )
+        self._mpc_diagnostic_history.append({
+            "fresh": bool(out["fresh"][0]),
+            "status": float(out["status"][0]),
+            "solve_time": float(out["solve_time"][0]),
+            "solution_age": float(out["solution_age"][0]),
+            "iterations": float(out["iterations"][0]),
+            "dynamics_gap": float(out["dynamics_gap"][0]),
+            "constraint_violation": float(out["constraint_violation"][0]),
+        })
+
+        # Cover multiple complete gait cycles during standalone diagnostics.
+        if self.cfg.mpc_verbose and self._mpc_debug_tick < 120:
+            raw_torque = out["torques"][0]
+            q_target_pin = out["qpos"][0]
+            q_current_pin = robot_states[0, 7:19]
+            foot_z = foot_pos[0].reshape(4, 3)[:, 2]
+            physical_contacts = foot_contact[0]
+            contact_force_z = foot_force[0, :, 2]
+            # Both arrays below are already in Pinocchio's by-leg order
+            # LF/RF/LH/RH, three joints per leg. Per-leg diagnostics expose a
+            # rear-leg tracking or torque asymmetry hidden by the global norm.
+            q_error_by_leg = np.linalg.norm(
+                (q_target_pin - q_current_pin).reshape(4, 3), axis=1
+            )
+            torque_by_leg = np.linalg.norm(raw_torque.reshape(4, 3), axis=1)
+            contact_bits = "".join("1" if value else "0" for value in physical_contacts)
+            print(
+                f"[MPC Tick {self._mpc_debug_tick:02d}] "
+                f"z={robot_states[0, 2]:.3f} "
+                f"ref_z0={com_refs[0, 0, 2]:.3f} "
+                f"vz={robot_states[0, 21]:+.3f} "
+                f"foot_z=[{','.join(f'{value:.3f}' for value in foot_z)}] "
+                f"phys_contact={contact_bits} "
+                f"fz=[{','.join(f'{value:.1f}' for value in contact_force_z)}] "
+                f"cost={float(out['cost'][0]):.1f} "
+                f"status={int(out['status'][0])} "
+                f"conv={bool(out['converged'][0])} "
+                f"fresh={bool(out['fresh'][0])} "
+                f"state_id={int(out['source_state_id'][0])} "
+                f"solution_id={int(out['solution_id'][0])} "
+                f"solve_ms={float(out['solve_time'][0]) * 1e3:.1f} "
+                f"age_ms={float(out['solution_age'][0]) * 1e3:.1f} "
+                f"iter={float(out['iterations'][0]):.0f} "
+                f"gap={float(out['dynamics_gap'][0]):.2e} "
+                f"viol={float(out['constraint_violation'][0]):.2e} "
+                f"|u|={np.linalg.norm(raw_torque):.2f} "
+                f"max|u|={np.max(np.abs(raw_torque)):.2f} "
+                f"leg_qerr=[{','.join(f'{value:.3f}' for value in q_error_by_leg)}] "
+                f"leg_u=[{','.join(f'{value:.2f}' for value in torque_by_leg)}]",
+                flush=True,
+            )
+        self._mpc_debug_tick += 1
 
         _COST_THRESHOLD = 50000.0
         if hasattr(self._pinocchio_model, "referenceConfigurations") and \
@@ -686,10 +966,20 @@ class QuadrupedMPCEnv(DirectRLEnv):
 
         for env_idx in range(E):
             cost = float(out["cost"][env_idx])
+            raw_torque = np.asarray(out["torques"][env_idx], dtype=float)
+            torque_out_of_bounds = (
+                raw_torque.size != self.cfg.num_joints
+                or not np.all(np.isfinite(raw_torque))
+                or np.any(
+                    np.abs(raw_torque) > self.cfg.max_joint_torque + 1e-3
+                )
+            )
             failed = (
-                out["status"][env_idx] != STATUS_OK
+                not bool(out["fresh"][env_idx])
+                or out["status"][env_idx] != STATUS_OK
                 or np.isnan(cost)
                 or cost > _COST_THRESHOLD
+                or torque_out_of_bounds
             )
             if failed:
                 self.guard_triggered[env_idx] = True
@@ -698,8 +988,16 @@ class QuadrupedMPCEnv(DirectRLEnv):
                 self._last_mpc_converged[env_idx] = False
                 if self._last_good_valid[env_idx]:
                     if env_idx == 0:
-                        print(f"[MPC Guard] env 0: FAILED cost={cost:.0f} "
-                              "-> fallback", flush=True)
+                        if torque_out_of_bounds:
+                            reason = "torque_bounds"
+                        elif not out["fresh"][env_idx]:
+                            reason = "stale"
+                        else:
+                            reason = "solver"
+                        print(
+                            f"[MPC Guard] env 0: FAILED reason={reason} "
+                            f"cost={cost:.0f} -> fallback", flush=True
+                        )
                     joint_torques = self._last_good_ctrl[env_idx, :12].copy()
                     joint_positions = self._last_good_ctrl[env_idx, 12:].copy()
                 else:
@@ -733,11 +1031,111 @@ class QuadrupedMPCEnv(DirectRLEnv):
             self._mpc_timing_accum_ms = 0.0
 
     def _apply_action(self):
-        """Apply both accumulated joint position targets and feedforward efforts."""
+        """Refresh MPC at 50 Hz and apply its control at the 200 Hz physics rate."""
+        if self._physics_substep % self.cfg.mpc_decimation == 0:
+            # At every boundary after the first, the current simulator state is
+            # the result of the preceding 20 ms MPC interval.
+            if self._mpc_ticks_in_policy_step > 0:
+                tick_rewards = self._compute_mpc_tick_rewards()
+                self._policy_reward_accum += tick_rewards * (
+                    self._mpc_tick_reward_mask.to(dtype=tick_rewards.dtype)
+                )
+
+            tick_active = ~self._inner_terminated
+            self._solve_mpc_control_step()
+            self._mpc_ticks_in_policy_step += 1
+            self._mpc_tick_reward_mask.copy_(tick_active)
+            self._update_mpc_tick_accounting()
+            self._apply_safe_control_to_terminated_envs()
         # 让 IsaacLab 底层同时接受目标位置和前馈力矩
         # 物理引擎底层公式：tau_总 = tau_前馈 + Kp*(q_目标 - q) + Kd*(dq_目标 - dq)
-        self.robot.set_joint_position_target(self._pending_joint_positions)
+        if not self.cfg.mpc_torque_control_only:
+            self.robot.set_joint_position_target(self._pending_joint_positions)
         self.robot.set_joint_effort_target(self._pending_joint_efforts)
+        self._physics_substep += 1
+
+    def _update_mpc_tick_accounting(self):
+        """Update 50 Hz MPC statistics and safety counters."""
+        active = ~self._inner_terminated
+        guard = self.guard_triggered & active
+
+        converged = torch.as_tensor(
+            self._last_mpc_converged,
+            device=self.device,
+            dtype=torch.bool,
+        ) & active
+
+        self._lifetime_mpc_tick_counts += active.to(dtype=torch.long)
+        self._lifetime_guard_counts += guard.to(dtype=torch.long)
+        self._lifetime_mpc_converged_counts += converged.to(dtype=torch.long)
+
+        self._policy_guard_counts += guard.to(dtype=torch.long)
+        self._policy_mpc_cost_sums += torch.as_tensor(
+            self._last_mpc_costs, device=self.device, dtype=torch.float32
+        )
+        self._policy_mpc_converged_counts += torch.as_tensor(
+            self._last_mpc_converged,
+            device=self.device,
+            dtype=torch.long,
+        )
+
+        self.consecutive_mpc_failures = torch.where(
+            active,
+            torch.where(
+                self.guard_triggered,
+                self.consecutive_mpc_failures + 1,
+                torch.zeros_like(self.consecutive_mpc_failures),
+            ),
+            self.consecutive_mpc_failures,
+        )
+
+        position = self.robot.data.root_pos_w
+        orientation = self.robot.data.root_quat_w
+        currently_low = (position[:, 2] < self.cfg.min_body_height) & active
+        self._too_low_counter[currently_low] += 1
+        self._too_low_counter[(~currently_low) & active] = 0
+
+        too_low = self._too_low_counter >= self.cfg.min_body_height_consecutive_steps
+        too_high = position[:, 2] > self.cfg.max_body_height
+        up_world_z = 1.0 - 2.0 * (
+            orientation[:, 1].square() + orientation[:, 2].square()
+        )
+        flipped = up_world_z < 0.5
+        out_of_bounds = (
+            torch.linalg.vector_norm(position[:, :2], dim=1)
+            > self.cfg.max_distance_from_start
+        )
+        too_many_failures = self.consecutive_mpc_failures >= 5
+        if self._torch_stance:
+            too_many_failures |= self.guard_triggered
+        reason_mask = torch.stack(
+            (too_low, too_high, flipped, out_of_bounds, too_many_failures),
+            dim=1,
+        )
+        newly_terminated = reason_mask.any(dim=1) & active
+        if torch.any(newly_terminated):
+            self._last_termination_reason_mask[newly_terminated] = reason_mask[
+                newly_terminated
+            ]
+            self._last_terminal_root_state[newly_terminated] = torch.cat(
+                (
+                    position,
+                    orientation,
+                    self.robot.data.root_lin_vel_w,
+                    self.robot.data.root_ang_vel_w,
+                ),
+                dim=1,
+            )[newly_terminated]
+        self._inner_terminated |= reason_mask.any(dim=1)
+
+    def _apply_safe_control_to_terminated_envs(self):
+        """Hold latched environments safely until the policy step ends."""
+        if not torch.any(self._inner_terminated):
+            return
+        self._pending_joint_efforts[self._inner_terminated] = 0.0
+        self._pending_joint_positions[self._inner_terminated] = (
+            self.robot.data.default_joint_pos[self._inner_terminated]
+        )
 
     def _apply_control(self, env_idx: int, joint_positions: np.ndarray, joint_torques: np.ndarray):
         """Apply joint position and feedforward torque control."""
@@ -803,10 +1201,17 @@ class QuadrupedMPCEnv(DirectRLEnv):
         joint_pos = robot_data.joint_pos[:, :12]  # (num_envs, 12)
         joint_vel = robot_data.joint_vel[:, :12]  # (num_envs, 12)
 
-        # Foot contacts: estimate from foot height
-        # TODO: Add ContactSensorCfg for accurate contact detection
-        foot_contacts = (position[:, 2:3] < self.cfg.standing_height * 0.5).float()
-        foot_contacts = foot_contacts.expand(-1, 4)
+        # True per-foot contacts from the PhysX contact reporter. The explicit
+        # index mapping guarantees policy order LF, RF, LH, RH regardless of
+        # the USD/contact-view body order.
+        contact_forces = self.foot_contact_sensor.data.net_forces_w[
+            :, self._contact_sensor_foot_indices, :
+        ]
+        foot_contacts_bool = torch.linalg.vector_norm(contact_forces, dim=-1) > (
+            self.cfg.foot_contact_force_threshold
+        )
+        self.foot_contacts.copy_(foot_contacts_bool)
+        foot_contacts = foot_contacts_bool.to(dtype=position.dtype)
 
         # Target positions and phases
         phases = torch.zeros((self.num_envs, 1), device=self.device)
@@ -831,8 +1236,8 @@ class QuadrupedMPCEnv(DirectRLEnv):
 
         return {"policy": obs}
 
-    def _get_rewards(self) -> torch.Tensor:
-        """Compute rewards for locomotion task.
+    def _compute_mpc_tick_rewards(self) -> torch.Tensor:
+        """Compute one 50 Hz reward sample for the held policy action.
 
         Returns:
             Reward tensor. Shape: (num_envs,)
@@ -957,6 +1362,19 @@ class QuadrupedMPCEnv(DirectRLEnv):
 
         return rewards
 
+    def _get_rewards(self) -> torch.Tensor:
+        """Return the sum of ten 50 Hz rewards for one 5 Hz policy step."""
+        if self._mpc_ticks_in_policy_step != self.cfg.rl_policy_period:
+            raise RuntimeError(
+                "Expected exactly "
+                f"{self.cfg.rl_policy_period} MPC ticks per policy step, got "
+                f"{self._mpc_ticks_in_policy_step}. Check DirectRLEnv decimation."
+            )
+        final_tick_reward = self._compute_mpc_tick_rewards()
+        return self._policy_reward_accum + final_tick_reward * (
+            self._mpc_tick_reward_mask.to(dtype=final_tick_reward.dtype)
+        )
+
     def _get_dones(self) -> Tuple[torch.Tensor, torch.Tensor]:
         """Determine episode termination conditions.
 
@@ -970,20 +1388,12 @@ class QuadrupedMPCEnv(DirectRLEnv):
         terminated = torch.zeros(self.num_envs, dtype=torch.bool, device=self.device)
         truncated = torch.zeros(self.num_envs, dtype=torch.bool, device=self.device)
 
-        # Height check with grace period: only terminate after N consecutive steps below threshold
-        # Prevents normal trot-gait body oscillations from prematurely killing the episode
-        currently_low = position[:, 2] < self.cfg.min_body_height
-        self._too_low_counter[currently_low] += 1
-        self._too_low_counter[~currently_low] = 0
+        # The 50 Hz counters are updated inside _apply_action. Here we only
+        # consume their latched result at the 5 Hz policy boundary.
         too_low = self._too_low_counter >= self.cfg.min_body_height_consecutive_steps
         too_high = position[:, 2] > self.cfg.max_body_height
 
-        # Consecutive MPC failures: terminate after 5 consecutive guard fires (~1s of fallback)
-        self.consecutive_mpc_failures = torch.where(
-            self.guard_triggered,
-            self.consecutive_mpc_failures + 1,
-            torch.zeros_like(self.consecutive_mpc_failures)
-        )
+        # Consecutive failures are counted at the 50 Hz MPC rate.
         too_many_failures = self.consecutive_mpc_failures >= 5
 
         # Orientation check (flipped)
@@ -1001,7 +1411,14 @@ class QuadrupedMPCEnv(DirectRLEnv):
         out_of_bounds = distance > self.cfg.max_distance_from_start
 
         # Termination
-        terminated = too_low | too_high | flipped | out_of_bounds | too_many_failures
+        terminated = (
+            self._inner_terminated
+            | too_low
+            | too_high
+            | flipped
+            | out_of_bounds
+            | too_many_failures
+        )
 
         # Truncation (timeout)
         time_out = self.episode_length_buf >= self.max_episode_length
@@ -1054,6 +1471,10 @@ class QuadrupedMPCEnv(DirectRLEnv):
         zero_vel = torch.zeros((num_resets, 3), device=self.device)
 
         # Write custom poses AFTER parent reset
+        if self._torch_stance:
+            q = self.stance_command.reference[env_ids, 0, :19].to(random_pos)
+            random_pos = self.scene.env_origins[env_ids] + q[:, :3]
+            random_quat = q[:, [6, 3, 4, 5]]
         self.robot.write_root_pose_to_sim(
             torch.cat([random_pos, random_quat], dim=-1), env_ids
         )
@@ -1064,6 +1485,12 @@ class QuadrupedMPCEnv(DirectRLEnv):
         # Reset joint positions to default standing pose and zero velocities
         num_joints = self.robot.data.joint_pos.shape[1]
         default_joint_pos = self.robot.data.default_joint_pos[env_ids]
+        if self._torch_stance:
+            default_joint_pos[:, self.tracking.mpc_to_sim] = q[:, 7:19]
+            self._pending_joint_efforts[env_ids] = 0
+            mask = torch.zeros(self.num_envs, device=self.device, dtype=torch.bool)
+            mask[env_ids] = True
+            self.tracking.reset(mask)
         default_joint_vel = torch.zeros(
             (num_resets, num_joints), device=self.device
         )
@@ -1088,6 +1515,7 @@ class QuadrupedMPCEnv(DirectRLEnv):
 
             # Initialize trajectory towards target
             start_pos = random_pos[idx].cpu().numpy()
+            self._trajectory_anchor_heights[env_idx] = float(start_pos[2])
             initial_params = self._generate_initial_bezier_params(
                 start_pos, target
             )
@@ -1122,11 +1550,19 @@ class QuadrupedMPCEnv(DirectRLEnv):
             # Reset guard state
             self.guard_triggered[env_idx] = False
             self.consecutive_mpc_failures[env_idx] = 0
+            self._inner_terminated[env_idx] = False
+            self._policy_reward_accum[env_idx] = 0.0
+            self._policy_guard_counts[env_idx] = 0
+            self._policy_mpc_cost_sums[env_idx] = 0.0
+            self._policy_mpc_converged_counts[env_idx] = 0
+            self._mpc_tick_reward_mask[env_idx] = True
 
             # Reset stored params
             self.prev_bezier_params[env_idx] = initial_params
             self.prev_gait_mods[env_idx] = np.ones(self.cfg.num_gait_mod_actions)
             self._prev_bezier_params_last[env_idx] = initial_params.copy()
+            self._policy_bezier_params[env_idx] = initial_params
+            self._policy_gait_mods[env_idx] = 1.0
 
     def _generate_initial_bezier_params(
         self,
@@ -1232,16 +1668,23 @@ class QuadrupedMPCEnv(DirectRLEnv):
         
         # Z 轴速度：EMA 低通滤波 + 收紧钳位，防止足端冲击脉冲和下落速度引爆 MPC 代价
         # alpha=0.3：新值权重；0.7 保留历史，有效抑制单帧尖峰
-        _alpha = 0.3
-        self._z_vel_filtered = _alpha * root_lin_vel_b[:, 2] + (1.0 - _alpha) * self._z_vel_filtered
-        root_lin_vel_b[:, 2] = np.clip(self._z_vel_filtered, -0.15, 0.15)
+        if not self.cfg.mpc_use_raw_state_input:
+            _alpha = 0.3
+            self._z_vel_filtered = (
+                _alpha * root_lin_vel_b[:, 2]
+                + (1.0 - _alpha) * self._z_vel_filtered
+            )
+            root_lin_vel_b[:, 2] = np.clip(
+                self._z_vel_filtered, -0.15, 0.15
+            )
         
         states[:, nq:nq + 3] = root_lin_vel_b
 
         root_ang_vel_b = robot_data.root_ang_vel_b.cpu().numpy()
         
         # 加入角速度钳制
-        root_ang_vel_b = np.clip(root_ang_vel_b, -1.0, 1.0)
+        if not self.cfg.mpc_use_raw_state_input:
+            root_ang_vel_b = np.clip(root_ang_vel_b, -1.0, 1.0)
         
         states[:, nq + 3:nq + 6] = root_ang_vel_b
 
@@ -1257,6 +1700,48 @@ class QuadrupedMPCEnv(DirectRLEnv):
                 states[:, nq + 6:nq + 6 + num_robot_joints] = joint_vel[:, :num_robot_joints]
 
         return states
+
+    def _get_cluster_foot_observations_numpy(self, robot_states):
+        """Sample foot kinematics/contact tensors once for the whole batch.
+
+        All returned arrays use protocol order LF/RF/LH/RH and world-frame
+        coordinates.  Keeping this sampling batched avoids four GPU-to-CPU
+        synchronizations per environment at every MPC tick.
+        """
+        E = self.num_envs
+        if self._foot_body_indices is not None:
+            body_indices = self._foot_body_indices.tolist()
+            foot_pos = self.robot.data.body_pos_w[:, body_indices, :].detach()
+            body_lin_vel_w = getattr(self.robot.data, "body_lin_vel_w", None)
+            if body_lin_vel_w is None:
+                body_lin_vel_w = self.robot.data.body_state_w[..., 7:10]
+            foot_vel = body_lin_vel_w[:, body_indices, :].detach()
+            foot_pos = foot_pos.cpu().numpy().copy()
+            foot_vel = foot_vel.cpu().numpy().copy()
+        else:
+            foot_pos = np.zeros((E, 4, 3), dtype=np.float64)
+            for env_idx in range(E):
+                positions = self._get_foot_positions_numpy(
+                    env_idx, robot_states[env_idx]
+                )
+                foot_pos[env_idx] = np.stack(
+                    [positions[name] for name in ("LF", "RF", "LH", "RH")]
+                )
+            foot_vel = np.zeros_like(foot_pos)
+
+        contact_forces = self.foot_contact_sensor.data.net_forces_w[
+            :, self._contact_sensor_foot_indices, :
+        ].detach()
+        foot_contact = (
+            torch.linalg.vector_norm(contact_forces, dim=-1)
+            > self.cfg.foot_contact_force_threshold
+        )
+        return (
+            foot_pos,
+            foot_vel,
+            foot_contact.cpu().numpy().copy(),
+            contact_forces.cpu().numpy().copy(),
+        )
 
     def _get_foot_positions_numpy(
         self, env_idx: int, state: np.ndarray

@@ -29,6 +29,8 @@ class ContactPhase:
         support_feet: List of feet on ground, e.g., ["LF", "RH"].
         swing_feet: List of feet in air, e.g., ["RF", "LH"].
         duration: Phase duration in seconds.
+        elapsed: Time already elapsed in this phase when a receding horizon
+            starts part-way through it.
         phase_type: Type of phase - one of:
             - "support": All four feet on ground (double/quad support)
             - "swing": Some feet swinging (normal locomotion)
@@ -40,6 +42,7 @@ class ContactPhase:
     swing_feet: List[str]
     duration: float
     phase_type: str = "swing"
+    elapsed: float = 0.0
 
     def __post_init__(self):
         """Validate the contact phase configuration."""
@@ -49,6 +52,8 @@ class ContactPhase:
 
         if self.duration < 0:
             raise ValueError(f"duration must be non-negative, got {self.duration}")
+        if self.elapsed < 0:
+            raise ValueError(f"elapsed must be non-negative, got {self.elapsed}")
 
         # Validate foot names
         all_feet = set(self.support_feet) | set(self.swing_feet)
@@ -95,6 +100,7 @@ class ContactPhase:
             swing_feet=self.swing_feet.copy(),
             duration=self.duration,
             phase_type=self.phase_type,
+            elapsed=self.elapsed,
         )
 
 

@@ -69,8 +69,13 @@ class QuadrupedMPCEnvCfg(DirectRLEnvCfg):
         gravity=(0.0, 0.0, -9.81),
     )
 
-    # Control decimation: 200 Hz / 4 = 50 Hz MPC rate
-    decimation: int = 4
+    # One RL environment step spans 40 physics steps:
+    #   200 Hz physics / 4 = 50 Hz MPC
+    #   50 Hz MPC / 10 = 5 Hz policy
+    # The environment refreshes MPC control from _apply_action every
+    # mpc_decimation physics steps while holding one policy action throughout.
+    mpc_decimation: int = 4
+    decimation: int = 40
 
     # Episode settings (longer for quadruped locomotion)
     episode_length_s: float = 15.0
@@ -134,6 +139,35 @@ class QuadrupedMPCEnvCfg(DirectRLEnvCfg):
     # Previous value of 10 was too low → 0% convergence rate
     mpc_max_iterations: int = 50
 
+    # Diagnostic switches. Production training keeps the existing behaviour;
+    # the standalone diagnostic overrides one dimension at a time.
+    mpc_force_standing_contacts: bool = False
+    mpc_use_demo_stabilization_weights: bool = False
+    # Negative preserves OCPFactory's production default. Standalone A/B tests
+    # can set Crocoddyl's quadrupedal-gait reference value (1e1) explicitly.
+    mpc_friction_cone_weight: float = -1.0
+    # The legacy dt=0 Euler pseudo-impulse cannot create an impact state jump
+    # and inserts an extra model outside the MPC time grid.
+    mpc_use_pseudo_impulse: bool = False
+    mpc_initial_full_support_duration: float = 0.0
+    mpc_use_feasible_cold_start_rollout: bool = False
+    mpc_enable_warm_start: bool = True
+    mpc_use_raw_state_input: bool = False
+    # Diagnostic A/B switch. The current Bezier generator is anchored at the
+    # floating-base/root, while Crocoddyl's position residual tracks true CoM.
+    mpc_reference_is_root_position: bool = False
+    mpc_return_quasi_static_control: bool = False
+    # Extra swing nodes held at the landing target before contact activation.
+    # Keep zero for the production baseline; diagnostics can test 1-2 nodes.
+    mpc_touchdown_hold_steps: int = 0
+    # P2 vertical height ratio for the swing-foot Bezier. 0.8 preserves the
+    # legacy symmetric arc; diagnostics can lower it to begin descent earlier.
+    mpc_swing_landing_height_ratio: float = 0.8
+    # Event-based contact activation diagnostic. Disabled by default until the
+    # standalone test validates it against Isaac's physical touchdown timing.
+    mpc_touchdown_gate_height_tolerance: float = 0.0
+    mpc_touchdown_gate_max_steps: int = 0
+
     # MPC verbose mode (print solver info for first 5 solves, for debugging)
     mpc_verbose: bool = False
 
@@ -143,6 +177,7 @@ class QuadrupedMPCEnvCfg(DirectRLEnvCfg):
     # serial path is used (Windows debugging / A-B baseline).
     # ==========================================================================
 
+    mpc_backend: str = "crocoddyl"  # or torch_tracking for fixed Go2 stance
     use_mpc_cluster: bool = False
 
     # Worker process count. Rule of thumb: physical cores - 2.
@@ -182,6 +217,11 @@ class QuadrupedMPCEnvCfg(DirectRLEnvCfg):
     # and max-negative action gives P3_x=0.4m (0.13 m/s, still forward). Robot CANNOT go backward.
     max_bezier_displacement: float = 0.5  # meters
 
+    # Nominal forward velocity added to the policy's Bezier control points.
+    # Keep this configurable so standalone MPC diagnostics can test a true
+    # zero-velocity reference without changing the training action space.
+    forward_velocity_bias: float = 0.15  # m/s
+
     # Trajectory blending steps when updating
     trajectory_blend_steps: int = 5
 
@@ -195,7 +235,9 @@ class QuadrupedMPCEnvCfg(DirectRLEnvCfg):
     # Gait timing defaults
     default_step_duration: float = 0.25  # seconds per swing phase
     default_support_duration: float = 0.10  # double support duration
-    default_step_height: float = 0.15  # meters
+    # Match GO2_CFG.  The previous 0.15 m value is the B1 default and makes
+    # Go2 lift each swing foot to roughly one third of its standing height.
+    default_step_height: float = 0.08  # meters
 
     # Gait modulation bounds (multipliers around 1.0)
     step_length_mod_range: tuple = (0.5, 2.0)
@@ -228,6 +270,16 @@ class QuadrupedMPCEnvCfg(DirectRLEnvCfg):
         "RR_hip_joint", "RR_thigh_joint", "RR_calf_joint",
     )
     max_joint_torque: float = 23.5  # N.m (Go2 HV motor peak torque)
+
+    # Crocoddyl's control variable is joint torque. The stock Isaac Lab Go2
+    # actuator adds Kp/Kd position tracking to the requested feed-forward
+    # effort, which changes the dynamics that MPC optimized. Disable those
+    # extra PD terms so simulated actuation matches the MPC model.
+    mpc_torque_control_only: bool = False
+
+    # Minimum net normal force used to classify a foot as being in contact.
+    # A small non-zero threshold rejects PhysX contact-force numerical noise.
+    foot_contact_force_threshold: float = 1.0  # N
 
     # Friction coefficient for MPC
     friction_coefficient: float = 0.7
@@ -386,8 +438,19 @@ class QuadrupedMPCEnvCfg(DirectRLEnvCfg):
 
         # Validate configuration
         assert self.decimation > 0, "Decimation must be positive"
+        assert self.mpc_decimation > 0, "MPC decimation must be positive"
         assert self.mpc_horizon_steps > 0, "MPC horizon must be positive"
         assert self.rl_policy_period > 0, "RL policy period must be positive"
+        assert self.decimation == self.mpc_decimation * self.rl_policy_period, (
+            "Environment decimation must equal MPC decimation times the number "
+            "of MPC steps per policy step"
+        )
+        assert abs(self.mpc_dt - self.sim.dt * self.mpc_decimation) < 1.0e-9, (
+            "MPC dt must equal physics dt times MPC decimation"
+        )
+        assert self.foot_contact_force_threshold > 0.0, (
+            "Foot contact force threshold must be positive"
+        )
         assert self.num_bezier_waypoints > self.mpc_horizon_steps, (
             "Bezier horizon should be longer than MPC horizon"
         )
