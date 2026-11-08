@@ -177,6 +177,7 @@ class QuadrupedMPCEnvCfg(DirectRLEnvCfg):
     # serial path is used (Windows debugging / A-B baseline).
     # ==========================================================================
 
+    mpc_backend: str = "crocoddyl"  # or torch_tracking for fixed Go2 stance
     use_mpc_cluster: bool = False
 
     # Worker process count. Rule of thumb: physical cores - 2.

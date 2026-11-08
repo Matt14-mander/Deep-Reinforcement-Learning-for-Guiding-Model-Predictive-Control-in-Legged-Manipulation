@@ -83,6 +83,13 @@ class QuadrupedMPCEnv(DirectRLEnv):
         """
         # Store configuration before parent init
         self._env_cfg = cfg
+        if cfg.mpc_backend not in {"crocoddyl", "torch_tracking"}:
+            raise ValueError(f"Unknown MPC backend: {cfg.mpc_backend}")
+        self._torch_stance = cfg.mpc_backend == "torch_tracking"
+        if self._torch_stance:
+            if cfg.use_mpc_cluster or cfg.robot_name.lower() != "go2":
+                raise ValueError("torch_tracking requires Go2 and an in-process controller")
+            cfg.mpc_torque_control_only = True
 
         # Initialize parent class
         super().__init__(cfg, render_mode, **kwargs)
@@ -99,7 +106,16 @@ class QuadrupedMPCEnv(DirectRLEnv):
         self._pinocchio_data = None
         self._foot_frame_ids = None
 
-        if CROCODDYL_AVAILABLE:
+        if self._torch_stance:
+            from crocoddyl_batched_mpc.models import Go2TensorAdapter, go2_front_leg_tracking_plan
+
+            self.tracking = Go2TensorAdapter(
+                self.robot.joint_names, self.num_envs, device=self.device, dt=cfg.mpc_dt
+            )
+            controller = self.tracking.controller
+            plan = go2_front_leg_tracking_plan(controller.model, standing_only=True)
+            self.stance_command = plan.command(0, self.num_envs, controller.horizon)
+        elif CROCODDYL_AVAILABLE:
             try:
                 self._pinocchio_model, _ = load_pinocchio_model(
                     urdf_path=(cfg.robot_urdf_path or None),
@@ -598,6 +614,23 @@ class QuadrupedMPCEnv(DirectRLEnv):
 
     def _solve_mpc_control_step(self):
         """Refresh joint targets once at the 50 Hz MPC rate."""
+        if self._torch_stance:
+            data = self.robot.data
+            output = self.tracking.compute(
+                data.root_link_pose_w.double(), data.root_link_vel_w.double(),
+                data.joint_pos.double(), data.joint_vel.double(),
+                self.stance_command, self.scene.env_origins.double(),
+            )
+            self._pending_joint_efforts.copy_(output.joint_effort.clamp(
+                -self.cfg.max_joint_torque, self.cfg.max_joint_torque
+            ))
+            self.guard_triggered.copy_(output.tracking.needs_reset)
+            result = output.tracking.result
+            self.tracking_status = result.status
+            self._last_mpc_costs = torch.where(output.tracking.usable, result.cost, 1e6)
+            self._last_mpc_converged = result.success
+            self._advance_reference_clocks()
+            return
         bezier_params = self._policy_bezier_params
         gait_mods = self._policy_gait_mods
 
@@ -1073,6 +1106,8 @@ class QuadrupedMPCEnv(DirectRLEnv):
             > self.cfg.max_distance_from_start
         )
         too_many_failures = self.consecutive_mpc_failures >= 5
+        if self._torch_stance:
+            too_many_failures |= self.guard_triggered
         reason_mask = torch.stack(
             (too_low, too_high, flipped, out_of_bounds, too_many_failures),
             dim=1,
@@ -1436,6 +1471,10 @@ class QuadrupedMPCEnv(DirectRLEnv):
         zero_vel = torch.zeros((num_resets, 3), device=self.device)
 
         # Write custom poses AFTER parent reset
+        if self._torch_stance:
+            q = self.stance_command.reference[env_ids, 0, :19].to(random_pos)
+            random_pos = self.scene.env_origins[env_ids] + q[:, :3]
+            random_quat = q[:, [6, 3, 4, 5]]
         self.robot.write_root_pose_to_sim(
             torch.cat([random_pos, random_quat], dim=-1), env_ids
         )
@@ -1446,6 +1485,12 @@ class QuadrupedMPCEnv(DirectRLEnv):
         # Reset joint positions to default standing pose and zero velocities
         num_joints = self.robot.data.joint_pos.shape[1]
         default_joint_pos = self.robot.data.default_joint_pos[env_ids]
+        if self._torch_stance:
+            default_joint_pos[:, self.tracking.mpc_to_sim] = q[:, 7:19]
+            self._pending_joint_efforts[env_ids] = 0
+            mask = torch.zeros(self.num_envs, device=self.device, dtype=torch.bool)
+            mask[env_ids] = True
+            self.tracking.reset(mask)
         default_joint_vel = torch.zeros(
             (num_resets, num_joints), device=self.device
         )
