@@ -109,6 +109,9 @@ class QuadrupedMPCEnv(DirectRLEnv):
         if self._torch_stance:
             from crocoddyl_batched_mpc.models import Go2TensorAdapter, go2_front_leg_tracking_plan
 
+            # Torch contact anchors use z=0 at the stance foot-link plane.
+            self.tracking_origins = self.scene.env_origins.double().clone()
+            self.tracking_origins[:, 2] += cfg.torch_foot_plane_height
             self.tracking = Go2TensorAdapter(
                 self.robot.joint_names, self.num_envs, device=self.device, dt=cfg.mpc_dt
             )
@@ -619,7 +622,7 @@ class QuadrupedMPCEnv(DirectRLEnv):
             output = self.tracking.compute(
                 data.root_link_pose_w.double(), data.root_link_vel_w.double(),
                 data.joint_pos.double(), data.joint_vel.double(),
-                self.stance_command, self.scene.env_origins.double(),
+                self.stance_command, self.tracking_origins,
             )
             self._pending_joint_efforts.copy_(output.joint_effort.clamp(
                 -self.cfg.max_joint_torque, self.cfg.max_joint_torque
@@ -1473,7 +1476,7 @@ class QuadrupedMPCEnv(DirectRLEnv):
         # Write custom poses AFTER parent reset
         if self._torch_stance:
             q = self.stance_command.reference[env_ids, 0, :19].to(random_pos)
-            random_pos = self.scene.env_origins[env_ids] + q[:, :3]
+            random_pos = self.tracking_origins[env_ids].to(random_pos) + q[:, :3]
             random_quat = q[:, [6, 3, 4, 5]]
         self.robot.write_root_pose_to_sim(
             torch.cat([random_pos, random_quat], dim=-1), env_ids
