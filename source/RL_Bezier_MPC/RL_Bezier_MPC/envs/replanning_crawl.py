@@ -9,7 +9,7 @@ from .fixed_crawl_env import FixedCrawlEnv
 
 
 class ReplanningCrawlEnv(FixedCrawlEnv):
-    def begin_forward_crawl(self, goal, cycles, *, stride_policy=None):
+    def begin_forward_crawl(self, goal, cycles, *, stride_policy=None, require_goal_for_stop=True):
         """Optionally call policy([remaining meters, cycles left]) once per cycle.
 
         Input shape (1, 2), float32 on the simulation device. Output (1, 1)
@@ -17,7 +17,8 @@ class ReplanningCrawlEnv(FixedCrawlEnv):
         observing progress. A queued goal becomes visible at the next boundary.
         """
         self.stride_policy = stride_policy
-        self.begin_crawl(.75, endpoint=True, cycles=cycles, step_length=goal/cycles)
+        self.begin_crawl(.75, endpoint=True, cycles=cycles, step_length=goal/cycles,
+                         require_goal_for_stop=require_goal_for_stop)
         self.endpoint_ready = True
         self.goal = goal
         self.total_cycles = cycles

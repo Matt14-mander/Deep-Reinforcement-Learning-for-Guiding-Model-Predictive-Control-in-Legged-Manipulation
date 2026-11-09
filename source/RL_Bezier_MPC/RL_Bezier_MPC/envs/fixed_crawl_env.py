@@ -16,7 +16,7 @@ class CrawlFailure(RuntimeError):
 class FixedCrawlEnv(QuadrupedMPCEnv):
 
     def begin_crawl(self, shift_fraction, *, endpoint=False, shape=False, record_probe=False,
-                    cycles=2, step_length=.02):
+                    cycles=2, step_length=.02, require_goal_for_stop=True):
         if self.num_envs != 1 or self._foot_body_indices is None:
             raise ValueError("Fixed crawl requires a single Go2 with mapped feet")
         self.shift_fraction = shift_fraction
@@ -33,6 +33,7 @@ class FixedCrawlEnv(QuadrupedMPCEnv):
         self.index = self.tick = self.landings = self.hold_ticks = 0
         self.segment = self.previous = None
         self.endpoint_ready = self.stopped = self.probe_ready = False
+        self.require_goal_for_stop = require_goal_for_stop
         self.stop_window = []
         self.samples = []
         self.walking = True
@@ -144,8 +145,8 @@ class FixedCrawlEnv(QuadrupedMPCEnv):
                 speed = state[0, 19:22].norm().item()
                 spin = state[0, 22:25].norm().item()
                 joint_speed = state[0, 25:].abs().max().item()
-                ok = (loaded.all().item() and abs(offset[0].item()-self.goal) <= .004
-                      and abs(offset[1].item()) <= .010 and speed <= .010
+                in_target = abs(offset[0].item()-self.goal) <= .004 and abs(offset[1].item()) <= .010
+                ok = (loaded.all().item() and (in_target or not self.require_goal_for_stop) and speed <= .010
                       and spin <= .04 and joint_speed <= .10)
                 self.stop_window = self.stop_window + [(offset[0].item(), speed, spin, joint_speed)] if ok else []
                 self.stop_window = self.stop_window[-50:]
