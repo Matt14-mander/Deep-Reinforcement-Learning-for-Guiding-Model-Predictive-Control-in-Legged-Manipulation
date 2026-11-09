@@ -15,14 +15,15 @@ class CrawlFailure(RuntimeError):
 
 class FixedCrawlEnv(QuadrupedMPCEnv):
 
-    def begin_crawl(self, shift_fraction, *, endpoint=False, shape=False, record_probe=False):
+    def begin_crawl(self, shift_fraction, *, endpoint=False, shape=False, record_probe=False,
+                    cycles=2, step_length=.02):
         if self.num_envs != 1 or self._foot_body_indices is None:
             raise ValueError("Fixed crawl requires a single Go2 with mapped feet")
         self.shift_fraction = shift_fraction
         self.check_endpoint = endpoint
         self.shape_enabled = shape
         self.record_probe = record_probe
-        self.plan = go2_slow_walk_plan(cycles=2, step_length=.02, swing_height=.02,
+        self.plan = go2_slow_walk_plan(cycles=cycles, step_length=step_length, swing_height=.02,
                                       support_shift_fraction=shift_fraction,
                                       dt=self.cfg.mpc_dt, device=self.device)
         self.anchors = self.plan.anchors[:1].clone()
