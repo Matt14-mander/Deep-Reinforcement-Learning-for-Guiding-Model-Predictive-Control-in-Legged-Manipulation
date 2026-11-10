@@ -14,6 +14,25 @@ from check_go2_slow_trot import SETTLE, HOLD, evaluate_mixed, make_plan
 from train_stage2_cycle_ppo import GOALS, make_policy
 
 N = 8
+SPEED_GOAL_MM = 64
+SPEEDS = (3., 6.)
+
+
+def speed_feature(speed):
+    return (speed - SPEEDS[1]) / (SPEEDS[1] - SPEEDS[0])
+
+
+def terminal_reward(m):
+    reward = (2. if m["success"] else -2.) - abs(m["final_x_error_mm"]) / 4
+    if "desired_mm_s" in m:
+        reward -= 3 * abs(m["walking_mm_s"] / m["desired_mm_s"] - 1)
+    return reward
+
+
+def cycle_return(m, tick, dt):
+    if "desired_mm_s" in m:
+        return m["terminal_reward"]
+    return m["terminal_reward"] - .1 * (m["end_tick"] - tick) * dt
 
 
 def audit_batch(samples,reports):
@@ -30,9 +49,11 @@ def audit_batch(samples,reports):
             or abs(p["obs"][1]-float(i>0 and m["decisions"][i-1]["gait"]=="trot"))>1e-6
             or abs(max(10.,min(24.,min(d["remaining_mm"],21.)+3*math.tanh(p["z"])))-d["stride_mm"])>1e-5
             or p["end"]-p["start"]!=round(d["stride_mm"]/m["cycles"][i]["command_mm_s"]/.02)
-            or abs(m["terminal_reward"]-((2. if m["success"] else -2.)-abs(m["final_x_error_mm"])/4))>1e-6
+            or ("desired_mm_s" in m and (p["desired_mm_s"] != m["desired_mm_s"]
+                or abs(p["obs"][2]-speed_feature(m["desired_mm_s"]))>1e-6))
+            or abs(m["terminal_reward"]-terminal_reward(m))>1e-6
             or bool(p["g"])!=(d["gait"]=="trot")
-            or abs(p["return_to_go"]-(m["terminal_reward"]-.1*(m["end_tick"]-d["local_tick"])*.02))>1e-5):
+            or abs(p["return_to_go"]-cycle_return(m,d["local_tick"],.02))>1e-5):
             raise RuntimeError(f"Cycle/reward assigned to incorrect owner: {p['key']}")
 
 
@@ -42,7 +63,7 @@ def run(args):
     from PIL import Image, ImageDraw
     from torch import nn
     torch.manual_seed(args.seed)
-    policy = make_policy()
+    policy = make_policy(speed_task=args.speed_task)
     optimizer = torch.optim.Adam(policy.parameters(),lr=.003)
     if args.checkpoint:
         policy.load_state_dict(torch.load(args.checkpoint,map_location="cpu",weights_only=True)["policy"])
@@ -50,6 +71,8 @@ def run(args):
     goal_rng = [random.Random(args.seed+1019*r) for r in range(N)]
     bags = [[] for _ in range(N)]
     noise = [torch.Generator().manual_seed(args.seed+499*r+1) for r in range(N)]
+    speed_groups = [i % 2 for i in range(N)]
+    random.Random(args.seed).shuffle(speed_groups)
     def sample_goal(r):
         if not bags[r]:
             bags[r] = list(GOALS)
@@ -58,6 +81,8 @@ def run(args):
 
     def choose(c,obs,remaining):
         with torch.no_grad():
+            if args.speed_task:
+                obs = torch.cat((obs,obs.new_tensor([speed_feature(c.desired_mm_s)])))
             gd,zd = policy.distributions(obs)
             if c.mode=="sample":
                 generator = noise[c.row_id]
@@ -69,7 +94,7 @@ def run(args):
             elif c.mode=="policy":
                 g,z = gd.logits>=0,zd.mean
             else:
-                g,z = remaining>=30,torch.tensor(0.)
+                g,z = remaining>=30 and (not args.speed_task or c.desired_mm_s==SPEEDS[1]),torch.tensor(0.)
             return ("trot" if bool(g) else "crawl"),z.item()
 
     Clock,Env = async_types(choose)
@@ -89,9 +114,12 @@ def run(args):
         writer=None
         projected_frames=0
         def clock(r,park=False):
-            goal = sample_goal(r) if mode=="sample" and not park else GOALS[r%3]
+            goal = SPEED_GOAL_MM if args.speed_task else (sample_goal(r) if mode=="sample" and not park else GOALS[r%3])
             c=Clock(env,goal,delay=0)
             c.row_id,c.mode,c.identity,c.pending = r,mode,(update,r,counts[r]),[]
+            if args.speed_task:
+                group = (speed_groups[r]+counts[r]+update-1)%2 if mode=="sample" else r%2
+                c.desired_mm_s = SPEEDS[group]
             c.parked=park
             return c
 
@@ -183,8 +211,9 @@ def run(args):
                     draw.rectangle((0,648,1152,720),fill="#192532")
                     draw.text((12,653),f"Stage 2 PPO    8 Go2    deterministic evaluation    {env.world*dt:.2f} s")
                     for r,c in enumerate(env.clocks):
-                        gait="arrived / reset" if c.parked else c.rows[-1]["gait"]
-                        draw.text((12+(r%4)*285,675+(r//4)*20),f"Go2 {r}   {GOALS[r%3]} mm   {gait}")
+                        gait="episode complete" if c.parked else c.rows[-1]["gait"]
+                        speed_label = f"{c.desired_mm_s:g} mm/s   " if args.speed_task else ""
+                        draw.text((12+(r%4)*285,675+(r//4)*20),f"Go2 {r}   {c.goal} mm   {speed_label}{gait}")
                     writer.stdin.write(frame.tobytes())
                 for r,c in enumerate(env.clocks):
                     if c.parked or not c.finishing:
@@ -194,7 +223,13 @@ def run(args):
                         continue
                     m=evaluate_mixed(c.rows,env.drift[r].tolist(),dt,c.schedule,target_mm=c.goal)
                     arrived=c.stable>=50 and all(m["checks"].values())
-                    terminal=(2. if arrived else -2.)-abs(m["final_x_error_mm"])/4
+                    m["success"] = arrived
+                    if args.speed_task:
+                        walking_s = (c.boundary-SETTLE)*dt
+                        walking_mm_s = 1000*(c.rows[c.boundary]["x"]-c.rows[SETTLE]["x"])/walking_s
+                        m.update(desired_mm_s=c.desired_mm_s,walking_s=walking_s,walking_mm_s=walking_mm_s,
+                                 speed_ok=abs(walking_mm_s/c.desired_mm_s-1)<=.20)
+                    terminal=terminal_reward(m)
                     m.update(identity=c.identity,mode=mode,success=arrived,terminal_reward=terminal,
                              decisions=c.decisions,arrival_s=(c.tick-SETTLE)*dt if arrived else None,
                              end_tick=c.tick,reset_world_tick=env.world)
@@ -207,7 +242,9 @@ def run(args):
                             end=c.decisions[i+1]["local_tick"] if i+1<len(c.decisions) else c.boundary
                             if p.get("end")!=end or end<=p["start"] or p["key"]!=(*c.identity,i) or p["start"]!=c.decisions[i]["local_tick"]:
                                 raise RuntimeError("Sample identity or cycle boundary mismatch")
-                            p.update(goal=c.goal,return_to_go=terminal-.1*(c.tick-p["start"])*dt)
+                            if args.speed_task:
+                                p["desired_mm_s"]=c.desired_mm_s
+                            p.update(goal=c.goal,return_to_go=cycle_return(m,p["start"],dt))
                         if len(c.pending)!=len(c.schedule):
                             raise RuntimeError("Missing completed cycle")
                         batch.extend(c.pending)
@@ -271,19 +308,45 @@ def run(args):
     pairs=[]
     for m in sorted(learned,key=lambda v:v["identity"]):
         b=index[tuple(m["identity"])]
-        if b["target_mm"]!=m["target_mm"]:
+        if b["target_mm"]!=m["target_mm"] or b.get("desired_mm_s")!=m.get("desired_mm_s"):
             raise RuntimeError("Mismatched evaluation goals")
         pairs.append(dict(row=m["identity"][1],target_mm=m["target_mm"],policy=m,rule=b))
     passed=all(m[k]["success"] for m in pairs for k in ("rule","policy"))
-    (args.output/"comparison.json").write_text(json.dumps(dict(updates=updates,pairs=pairs,passed=passed),indent=2,allow_nan=False))
+    groups=[]
+    if args.speed_task:
+        from statistics import mean
+        for mode in ("policy","rule"):
+            for speed in SPEEDS:
+                group=[pair[mode] for pair in pairs if pair[mode]["desired_mm_s"]==speed]
+                walking=mean(m["walking_mm_s"] for m in group)
+                switches=[s for m in group for s in m["switches"]]
+                valid=(len(group)==4 and all(m["speed_ok"] for m in group)
+                       and (speed!=SPEEDS[1] or all(m["switches"] for m in group)))
+                passed=passed and valid
+                summary=dict(mode=mode,desired_mm_s=speed,measured_mm_s=walking,
+                    gaits=[[c["gait"] for c in m["cycles"]] for m in group],
+                    arrival_s=[m["arrival_s"] for m in group],
+                    endpoint_errors_mm=[m["final_x_error_mm"] for m in group],
+                    switch_count=len(switches),speed_and_switch_ok=valid)
+                groups.append(summary)
+                print(json.dumps(summary),flush=True)
+            slow, fast = groups[-2:]
+            slow_times, fast_times = slow["arrival_s"], fast["arrival_s"]
+            faster_arrival = (None not in slow_times + fast_times
+                              and max(fast_times) < min(slow_times))
+            fast["faster_arrival_than_slow"] = faster_arrival
+            passed = passed and faster_arrival
+    (args.output/"comparison.json").write_text(json.dumps(dict(updates=updates,pairs=pairs,groups=groups,passed=passed),indent=2,allow_nan=False))
     if not passed:
         raise RuntimeError("Physical evaluation failed; see comparison.json")
-    print("PASS: eight Go2 asynchronous PPO evaluation",flush=True)
+    print("PASS: eight Go2 paired speed evaluation" if args.speed_task else
+          "PASS: eight Go2 asynchronous PPO evaluation",flush=True)
 
 
 if __name__=="__main__":
     parser=argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--output",type=Path,required=True)
+    parser.add_argument("--speed-task", action="store_true", help="64 mm paired goal at 3 and 6 mm/s walking speed")
     parser.add_argument("--seed",type=int,default=37)
     parser.add_argument("--updates",type=int,default=1)
     parser.add_argument("--episodes-per-env",type=int,default=2)

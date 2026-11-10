@@ -11,7 +11,7 @@ from check_go2_slow_trot import (SETTLE, HOLD, evaluate_mixed, gait_env_type, ma
 GOALS = (20, 42, 64)
 
 
-def make_policy():
+def make_policy(speed_task=False):
     import torch
     from torch import nn
     from torch.distributions import Bernoulli, Normal
@@ -19,12 +19,14 @@ def make_policy():
     class Policy(nn.Module):
         def __init__(self):
             super().__init__()
-            self.actor = nn.Linear(2, 2)
-            self.value = nn.Sequential(nn.Linear(2,16), nn.Tanh(), nn.Linear(16,1))
+            inputs = 3 if speed_task else 2
+            self.actor = nn.Linear(inputs, 2)
+            self.value = nn.Sequential(nn.Linear(inputs,16), nn.Tanh(), nn.Linear(16,1))
             self.log_std = nn.Parameter(torch.tensor(-.65))
             # Distance-based initialization. PPO updates both outputs.
             with torch.no_grad():
-                self.actor.weight.copy_(torch.tensor([[2.,0.],[.15,0.]]))
+                weights = [[2.,0.,7.5],[.15,0.,0.]] if speed_task else [[2.,0.],[.15,0.]]
+                self.actor.weight.copy_(torch.tensor(weights))
                 self.actor.bias.copy_(torch.tensor([0.,0.]))
 
         def distributions(self, obs):
