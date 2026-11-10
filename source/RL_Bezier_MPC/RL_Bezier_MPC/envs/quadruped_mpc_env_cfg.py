@@ -178,6 +178,8 @@ class QuadrupedMPCEnvCfg(DirectRLEnvCfg):
     # ==========================================================================
 
     mpc_backend: str = "crocoddyl"  # or torch_tracking for fixed Go2 stance
+    # Flat-ground height of the stance foot-link origin above the ground (m).
+    torch_foot_plane_height: float = 0.0
     use_mpc_cluster: bool = False
 
     # Worker process count. Rule of thumb: physical cores - 2.
