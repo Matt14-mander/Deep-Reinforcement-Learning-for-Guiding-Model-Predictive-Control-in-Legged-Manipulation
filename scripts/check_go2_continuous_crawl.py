@@ -52,16 +52,43 @@ def run(args):
             if writer:
                 from PIL import Image, ImageDraw
                 rgb = self.render()
-                # The annotator may need extra renders for its first frame. Wait
-                # for RGB without advancing physics.
-                for _ in range(8):
-                    if rgb.size and rgb.any():
-                        break
-                    self.sim.render()
-                    rgb = self.render()
-                if not rgb.size or not rgb.any():
-                    raise RuntimeError("Camera returned no image")
-                frame = Image.fromarray(rgb).convert("RGB")
+                # RTX can return a uniform gray sky on a headless GPU. Retry at
+                # the same physics state. If unavailable, project measured links.
+                def visible(image):
+                    return image.size and image[40:430:8, ::8, 0].std() > 8
+
+                if not visible(rgb):
+                    self.sim.set_camera_view(cfg.viewer.eye, cfg.viewer.lookat)
+                    for _ in range(4):
+                        self.sim.render()
+                        rgb = self.render()
+                        if visible(rgb):
+                            break
+                if visible(rgb):
+                    frame = Image.fromarray(rgb).convert("RGB")
+                else:
+                    frame = Image.new("RGB", (800, 480), "#edf1f4")
+                    canvas = ImageDraw.Draw(frame)
+                    def project(xyz):
+                        x, y, z = xyz
+                        return (round(340+750*x-250*y), round(370-750*z-180*y))
+                    for i in range(-5, 7):
+                        x = i / 10
+                        canvas.line([project((x,-.4,0)), project((x,.4,0))], fill="#c7d0d7")
+                    for i in range(-4,5):
+                        y = i / 10
+                        canvas.line([project((-.5,y,0)), project((.6,y,0))], fill="#c7d0d7")
+                    pose = self.robot.data.body_link_pos_w[0] - self.tracking_origins[0]
+                    links = dict(zip(self.robot.body_names, map(project, pose.tolist())))
+                    for leg in ("FL","RL","FR","RR"):
+                        points = [links[f"{leg}_{part}"] for part in ("hip","thigh","calf","foot")]
+                        canvas.line(points, width=7, fill="#205575" if leg.endswith("R") else "#7296aa")
+                        u,v = points[-1]
+                        canvas.ellipse((u-5,v-5,u+5,v+5), fill="#182d37")
+                    canvas.polygon([links[f"{leg}_hip"] for leg in ("FL","FR","RR","RL")],
+                                   fill="#394d60")
+                    canvas.text((12,12), "PhysX measured link positions", fill="#202a34")
+                    self.projected_frames += 1
                 draw = ImageDraw.Draw(frame)
                 dx = (self.robot.data.root_link_pos_w[0, 0] - self.tracking_origins[0, 0]
                       - self.base_start[0]).item() if self.segment is not None else 0.
@@ -87,6 +114,7 @@ def run(args):
     args.output.mkdir(parents=True, exist_ok=False)
     writer = None
     env = StraightCrawl(cfg=cfg, render_mode="rgb_array" if args.video else None)
+    env.projected_frames = 0
     env.start_yaw = None
     env.peak_lateral = env.peak_yaw = 0.
     try:
@@ -99,7 +127,7 @@ def run(args):
             m = env.run_crawl(200, cfg.seed, stride, initial_goal=goal, initial_cycles=2, initial_stride=cruise)
         cycles = len(m["cycle_dx_mm"])
         m.update(cycles=cycles, final_yaw_deg=env.yaw_deg, peak_abs_yaw_deg=env.peak_yaw,
-                 peak_abs_lateral_mm=env.peak_lateral)
+                 peak_abs_lateral_mm=env.peak_lateral, projected_frames=env.projected_frames)
         print(json.dumps(m, allow_nan=False), flush=True)
         (args.output/"measurements.json").write_text(json.dumps(m, indent=2, allow_nan=False))
         if not (cycles > 3 and cycles == len(env.replans) and m["landings"] == 4*cycles
