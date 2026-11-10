@@ -11,32 +11,19 @@ from isaaclab.app import AppLauncher
 from check_go2_slow_trot import SETTLE, HOLD, evaluate_mixed, make_plan, swing_groups
 
 
-def run(args):
+def async_types(choose, verbose=False):
     import torch
-    from PIL import Image, ImageDraw
     sys.path.insert(0, str(Path(__file__).resolve().parents[1]/"source/RL_Bezier_MPC"))
-    from RL_Bezier_MPC.envs import QuadrupedMPCEnv, QuadrupedMPCEnvCfg
-
-    # Frozen deterministic actor from stage2_0002.pt, so the regression also runs
-    # on a fresh checkout. Use --checkpoint to test another trained actor.
-    actor = torch.nn.Linear(2, 2)
-    if args.checkpoint:
-        state = torch.load(args.checkpoint,map_location="cpu",weights_only=True)["policy"]
-        actor.load_state_dict({k[6:]:v for k,v in state.items() if k.startswith("actor.")})
-    else:
-        actor.load_state_dict(dict(
-            weight=torch.tensor([[2.023329734802246,-.018651263788342476],
-                                 [.1350843757390976,.020735003054142]],dtype=torch.float32),
-            bias=torch.tensor([-.023278076201677322,.02399066649377346])))
-    actor.eval()
+    from RL_Bezier_MPC.envs import QuadrupedMPCEnv
 
     class Clock:
-        def __init__(self,goal,delay=0):
+        def __init__(self,env,goal,delay=0):
+            self.env = env
             self.goal = goal
             self.tick = -delay
             self.boundary = SETTLE
             self.schedule, self.decisions, self.rows = [], [], []
-            self.plan = nominal
+            self.plan = env.nominal
             self.start_x = None
             self.finishing = self.parked = False
             self.stable = 0
@@ -55,26 +42,27 @@ def run(args):
             if len(self.schedule)>=7:
                 raise RuntimeError("Cycle budget exceeded")
             obs = torch.tensor([(remaining-30)/15,float(bool(self.schedule and self.schedule[-1][0]=="trot"))])
-            logit,z = actor(obs).tolist()
-            gait = "trot" if logit>=0 else "crawl"
+            gait,z = choose(self,obs,remaining)
             stride = max(10.,min(24.,min(remaining,21.)+3*math.tanh(z)))
             self.schedule.append((gait,stride/1000))
-            self.plan = make_plan(mpc.model,dt,self.schedule,cycle_decisions=True)
+            self.plan = make_plan(self.env.tracking.controller.mpc.model,self.env.cfg.mpc_dt,self.schedule,cycle_decisions=True)
             self.boundary = len(self.plan[0])-HOLD
-            event = dict(world_tick=env.world,local_tick=self.tick,remaining_mm=remaining,gait=gait,stride_mm=stride)
+            event = dict(world_tick=self.env.world,local_tick=self.tick,remaining_mm=remaining,gait=gait,stride_mm=stride)
             self.decisions.append(event)
-            print(json.dumps(dict(stage="decision",goal_mm=self.goal,**event)),flush=True)
+            if verbose:
+                print(json.dumps(dict(stage="decision",goal_mm=self.goal,**event)),flush=True)
 
     class AsyncEnv(QuadrupedMPCEnv):
         live = False
 
         def _reset_idx(self,ids):
-            if self.live and (not self.allow_near_reset or ids.tolist()!=[0]):
+            if self.live and (ids.tolist()!=self.allowed_reset_ids):
                 raise RuntimeError(f"Unexpected reset {ids.tolist()} at world tick {self.world}")
             super()._reset_idx(ids)
 
         def _solve_mpc_control_step(self):
             d,a = self.robot.data,self.tracking
+            mpc = a.controller.mpc
             state = a.pack_state(d.root_link_pose_w.double(),d.root_link_vel_w.double(),
                                  d.joint_pos.double(),d.joint_vel.double(),self.tracking_origins)
             feet = d.body_link_pos_w[:,self._foot_body_indices.tolist()].double()-self.tracking_origins[:,None]
@@ -134,6 +122,7 @@ def run(args):
             self._advance_reference_clocks()
 
         def peer_snapshot(self):
+            mpc = self.tracking.controller.mpc
             c = self.clocks[1]
             return dict(local_tick=c.tick,count=len(c.schedule),boundary=c.boundary,
                         phase=c.plan[2][c.tick],target=c.goal,
@@ -141,6 +130,33 @@ def run(args):
                             self._pending_joint_efforts,self.robot.data.applied_torque,self.robot.data.root_link_pose_w,
                             self.robot.data.root_link_vel_w,self.robot.data.joint_pos,self.robot.data.joint_vel,
                             mpc._warm,mpc._dual,mpc._valid,self.episode_length_buf)])
+
+    return Clock, AsyncEnv
+
+
+def run(args):
+    import torch
+    from PIL import Image, ImageDraw
+    sys.path.insert(0, str(Path(__file__).resolve().parents[1]/"source/RL_Bezier_MPC"))
+    from RL_Bezier_MPC.envs import QuadrupedMPCEnv, QuadrupedMPCEnvCfg
+
+    # Frozen deterministic actor from stage2_0002.pt, so the regression also runs
+    # on a fresh checkout. Use --checkpoint to test another trained actor.
+    actor = torch.nn.Linear(2, 2)
+    if args.checkpoint:
+        state = torch.load(args.checkpoint,map_location="cpu",weights_only=True)["policy"]
+        actor.load_state_dict({k[6:]:v for k,v in state.items() if k.startswith("actor.")})
+    else:
+        actor.load_state_dict(dict(
+            weight=torch.tensor([[2.023329734802246,-.018651263788342476],
+                                 [.1350843757390976,.020735003054142]],dtype=torch.float32),
+            bias=torch.tensor([-.023278076201677322,.02399066649377346])))
+    actor.eval()
+
+    def choose(clock,obs,remaining):
+        logit,z = actor(obs).tolist()
+        return ("trot" if logit>=0 else "crawl"),z
+    Clock, AsyncEnv = async_types(choose, verbose=True)
 
     cfg = QuadrupedMPCEnvCfg()
     cfg.scene.num_envs,cfg.scene.env_spacing,cfg.seed,cfg.sim.device = 2,1.3,37,args.device
@@ -155,14 +171,14 @@ def run(args):
     try:
         env.reset(seed=cfg.seed)
         dt,mpc = cfg.mpc_dt,env.tracking.controller.mpc
-        nominal = make_plan(mpc.model,dt,[("crawl",.020)],cycle_decisions=True)
-        near,far = Clock(20),Clock(64,delay=270)
+        env.nominal = make_plan(mpc.model,dt,[("crawl",.020)],cycle_decisions=True)
+        near,far = Clock(env,20),Clock(env,64,delay=270)
         env.clocks = [near,far]
         env.mask = torch.ones((2,4),device=env.device,dtype=torch.bool)
         env.anchors = mpc.model.contact_positions.expand(2,-1,-1).clone()
         env.origins,env.drift = env.anchors.clone(),env.anchors.new_zeros(2,4)
         env.nodes = torch.arange(mpc.horizon+1,device=env.device)
-        env.world,env.live,env.allow_near_reset = 0,True,False
+        env.world,env.live,env.allowed_reset_ids = 0,True,[]
         action = torch.zeros((2,cfg.action_space),device=env.device)
         reset = None
         if args.video:
@@ -181,14 +197,14 @@ def run(args):
                     raise RuntimeError("Reset must test an active far trot swing")
                 ids = torch.tensor([0],device=env.device)
                 near_report = evaluate_mixed(near.rows,env.drift[0].tolist(),dt,near.schedule,target_mm=20)
-                env.allow_near_reset = True
+                env.allowed_reset_ids = [0]
                 env._reset_idx(ids)
-                env.allow_near_reset = False
+                env.allowed_reset_ids = []
                 env.anchors[0] = mpc.model.contact_positions
                 env.origins[0] = env.anchors[0]
                 env.mask[0] = True
                 env.drift[0].zero_()
-                idle = Clock(20)
+                idle = Clock(env,20)
                 idle.parked = True
                 env.clocks[0] = idle
                 after = env.peer_snapshot()

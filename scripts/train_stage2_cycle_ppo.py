@@ -11,6 +11,29 @@ from check_go2_slow_trot import (SETTLE, HOLD, evaluate_mixed, gait_env_type, ma
 GOALS = (20, 42, 64)
 
 
+def make_policy():
+    import torch
+    from torch import nn
+    from torch.distributions import Bernoulli, Normal
+
+    class Policy(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.actor = nn.Linear(2, 2)
+            self.value = nn.Sequential(nn.Linear(2,16), nn.Tanh(), nn.Linear(16,1))
+            self.log_std = nn.Parameter(torch.tensor(-.65))
+            # Distance-based initialization. PPO updates both outputs.
+            with torch.no_grad():
+                self.actor.weight.copy_(torch.tensor([[2.,0.],[.15,0.]]))
+                self.actor.bias.copy_(torch.tensor([0.,0.]))
+
+        def distributions(self, obs):
+            logits, mean = self.actor(obs).unbind(-1)
+            return Bernoulli(logits=logits), Normal(mean,self.log_std.clamp(-3,0).exp())
+
+    return Policy()
+
+
 def run(args):
     import torch
     from torch import nn
@@ -29,25 +52,10 @@ def run(args):
     # Render explicitly only while recording the final deterministic rollout.
     cfg.sim.render_interval = 1000000
 
-    class Policy(nn.Module):
-        def __init__(self):
-            super().__init__()
-            self.actor = nn.Linear(2, 2)
-            self.value = nn.Sequential(nn.Linear(2,16), nn.Tanh(), nn.Linear(16,1))
-            self.log_std = nn.Parameter(torch.tensor(-.65))
-            # Distance-based initialization. PPO updates both outputs.
-            with torch.no_grad():
-                self.actor.weight.copy_(torch.tensor([[2.,0.],[.15,0.]]))
-                self.actor.bias.copy_(torch.tensor([0.,0.]))
-
-        def distributions(self, obs):
-            logits, mean = self.actor(obs).unbind(-1)
-            return Bernoulli(logits=logits), Normal(mean,self.log_std.clamp(-3,0).exp())
-
     args.output.mkdir(parents=True, exist_ok=False)
     torch.manual_seed(args.seed)
     exploration = torch.Generator().manual_seed(args.seed+1)
-    policy = Policy()
+    policy = make_policy()
     opt = torch.optim.Adam(policy.parameters(), lr=.003)
     first_update = 1
     if args.checkpoint or args.resume:
