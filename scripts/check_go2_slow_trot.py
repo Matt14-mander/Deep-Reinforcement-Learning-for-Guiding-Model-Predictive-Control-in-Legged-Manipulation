@@ -26,7 +26,7 @@ def swing_groups(gait):
     return CRAWL if gait == "crawl" else PAIRS
 
 
-def make_plan(model, dt, schedule):
+def make_plan(model, dt, schedule, *, cycle_decisions=False):
     import torch
     from crocoddyl_batched_mpc.models.go2_walk import go2_leg_ik, go2_center_of_mass, smoothstep
     q0 = model.reference_configuration
@@ -69,7 +69,7 @@ def make_plan(model, dt, schedule):
                 for _ in range(14):
                     append(body, anchors, (cycle, -1, False))
         changing = cycle+1 < len(schedule) and schedule[cycle+1][0] != gait
-        if gait == "crawl" or changing:
+        if gait == "crawl" or changing or cycle_decisions:
             # Compare progress at a centered four-foot stance, after unloading
             # the lateral/fore-aft displacement used to balance the last swing.
             center = q0[:3].clone()
@@ -77,7 +77,7 @@ def make_plan(model, dt, schedule):
             for j in range(1, 36):
                 append(torch.lerp(body,center,smoothstep(j/35)), anchors, (cycle,-1,False))
             body = center
-        if changing:
+        if changing or cycle_decisions:
             for _ in range(HANDOFF):
                 append(body, anchors, (cycle, -1, False))
     end = q0[:3].clone()
@@ -96,13 +96,10 @@ def make_plan(model, dt, schedule):
     return torch.cat((q,v),-1), acc, phases
 
 
-def run(args):
+def gait_env_type(schedule, record_handoffs):
     import torch
-    from PIL import Image, ImageDraw
     sys.path.insert(0, str(Path(__file__).resolve().parents[1]/"source/RL_Bezier_MPC"))
-    from RL_Bezier_MPC.envs import QuadrupedMPCEnv, QuadrupedMPCEnvCfg
-
-    schedule = MIXED if args.mixed_gaits else tuple(("trot", stride) for stride in STRIDES)
+    from RL_Bezier_MPC.envs import QuadrupedMPCEnv
 
     class Trot(QuadrupedMPCEnv):
         active = False
@@ -153,7 +150,7 @@ def run(args):
                 raise RuntimeError(f"MPC rejected {i=} {cycle=} {pair=} {swing=} {self.rows[-1]}")
             self._pending_joint_efforts.copy_(adapter.scatter_action(effort).clamp(
                 -self.cfg.max_joint_torque,self.cfg.max_joint_torque))
-            if args.mixed_gaits:
+            if record_handoffs:
                 self.rows[-1].update(gait=gait, anchors=self.anchors[0].tolist(),
                     requested=self._pending_joint_efforts[0].tolist(), applied=d.applied_torque[0].tolist(),
                     quat=d.root_link_quat_w[0].tolist())
@@ -161,6 +158,18 @@ def run(args):
             self._advance_reference_clocks()
             self.tick += 1
 
+    return Trot
+
+
+def run(args):
+    import torch
+    from PIL import Image, ImageDraw
+    sys.path.insert(0, str(Path(__file__).resolve().parents[1]/"source/RL_Bezier_MPC"))
+    from RL_Bezier_MPC.envs import QuadrupedMPCEnv, QuadrupedMPCEnvCfg
+
+    schedule = MIXED if args.mixed_gaits else tuple(("trot", stride) for stride in STRIDES)
+
+    Trot = gait_env_type(schedule,args.mixed_gaits)
     cfg = QuadrupedMPCEnvCfg()
     cfg.scene.num_envs, cfg.seed, cfg.sim.device = 1,37,args.device
     cfg.mpc_backend, cfg.use_mpc_cluster, cfg.torch_foot_plane_height = "torch_tracking",False,.022
@@ -261,12 +270,12 @@ def evaluate(rows, drift, dt):
                                       r["spin"]<.04 and r["joint"]<.10 for r in stop)))
 
 
-def evaluate_mixed(rows, drift, dt):
+def evaluate_mixed(rows, drift, dt, schedule=MIXED, target_mm=None):
     from itertools import groupby
     from math import dist
 
     cycles, switches, contacts = [], [], []
-    for i, (gait, stride) in enumerate(MIXED):
+    for i, (gait, stride) in enumerate(schedule):
         samples = [r for r in rows if r["cycle"] == i]
         first, end = samples[0]["tick"], samples[-1]["tick"]+1
         duration = (end-first)*dt
@@ -284,7 +293,7 @@ def evaluate_mixed(rows, drift, dt):
             recovered = any(all(min(r["loads"])>5 for r in recovery[k:k+3]) for k in range(len(recovery)-2))
             contacts.append(dict(cycle=i+1, swing=leg_ids, support_fraction=sum(correct)/len(correct),
                                  recovered=recovered))
-        if i and MIXED[i-1][0] != gait:
+        if i and schedule[i-1][0] != gait:
             # Include the first five commands in the new transfer and their measured response.
             window = rows[first-5:first+7]
             def max_joint_step(key):
@@ -294,7 +303,7 @@ def evaluate_mixed(rows, drift, dt):
                 dot = abs(sum(x*y for x,y in zip(a,b)))
                 norms = math.sqrt(sum(x*x for x in a)*sum(y*y for y in b))
                 return math.degrees(2*math.acos(min(1.,dot/norms)))
-            switches.append(dict(change=MIXED[i-1][0]+" -> "+gait,tick=first,
+            switches.append(dict(change=schedule[i-1][0]+" -> "+gait,tick=first,
                 all_loaded=all(min(r["loads"])>5 for r in window),
                 anchor_jump_mm=1000*max(dist(a,b) for r in window for a,b in zip(window[0]["anchors"],r["anchors"])),
                 requested_step_Nm=max_joint_step("requested"), applied_step_Nm=max_joint_step("applied"),
@@ -302,21 +311,25 @@ def evaluate_mixed(rows, drift, dt):
     stop = rows[-50:]
     dx = 1000*(stop[-1]["x"]-rows[SETTLE]["x"])
     dy = 1000*(stop[-1]["y"]-rows[SETTLE]["y"])
-    goal = 1000*sum(stride for _,stride in MIXED)
+    goal = 1000*sum(stride for _,stride in schedule) if target_mm is None else target_mm
     span = 1000*(max(r["x"] for r in stop)-min(r["x"] for r in stop))
     peaks = [max(abs(r[k]) for r in rows) for k in ("roll","pitch","yaw")]
-    return dict(cycles=cycles, switches=switches, contacts=contacts, max_stance_mm=[1000*x for x in drift],
+    result = dict(cycles=cycles, switches=switches, contacts=contacts, max_stance_mm=[1000*x for x in drift],
         target_mm=goal, dx_mm=dx, dy_mm=dy, final_x_error_mm=dx-goal,
         max_roll_pitch_yaw_deg=peaks, stop_span_mm=span, stop_ticks=len(stop),
-        checks=dict(handoffs=len(switches)==2 and all(s["all_loaded"] and s["anchor_jump_mm"]<.001
+        checks=dict(handoffs=len(switches)==sum(a[0]!=b[0] for a,b in zip(schedule,schedule[1:])) and all(s["all_loaded"] and s["anchor_jump_mm"]<.001
             and max(s["requested_step_Nm"],s["applied_step_Nm"])<3 and s["rotation_step_deg"]<1 for s in switches),
-            contacts=len(contacts)==16 and all(c["support_fraction"]>=.75 and c["recovered"] for c in contacts),
-            cruise=all(abs(c["measured_mm_s"]/c["command_mm_s"]-1)<.25 for c in cycles[2:4]),
-            pacing=0<cycles[0]["measured_mm_s"]<min(c["measured_mm_s"] for c in cycles[2:4])
-                and 0<cycles[-1]["measured_mm_s"]<cycles[-2]["measured_mm_s"],
+            contacts=len(contacts)==sum(len(swing_groups(g)) for g,_ in schedule) and all(c["support_fraction"]>=.75 and c["recovered"] for c in contacts),
             drift=max(drift)<=.010, attitude=max(peaks)<5, arrived=abs(dx-goal)<=4 and abs(dy)<=10,
             stopped=span<1 and all(min(r["loads"])>5 and r["speed"]<.01 and
                                   r["spin"]<.04 and r["joint"]<.10 for r in stop)))
+    if target_mm is None:
+        result["checks"].update(
+            cruise=all(abs(c["measured_mm_s"]/c["command_mm_s"]-1)<.25 for c in cycles[2:4]),
+            pacing=0<cycles[0]["measured_mm_s"]<min(c["measured_mm_s"] for c in cycles[2:4])
+                and 0<cycles[-1]["measured_mm_s"]<cycles[-2]["measured_mm_s"],
+        )
+    return result
 
 
 if __name__ == "__main__":
