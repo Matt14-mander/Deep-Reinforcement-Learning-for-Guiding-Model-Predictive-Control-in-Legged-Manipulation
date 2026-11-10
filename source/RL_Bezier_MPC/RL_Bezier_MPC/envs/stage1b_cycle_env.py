@@ -11,7 +11,7 @@ class Stage1BCycleEnv(ReplanningCrawlEnv):
     def _solve_mpc_control_step(self):
         phase = self.plan.phase_names[self.index]
         boundary = self.previous == "center" and phase == "shift_RL"
-        if self.target_mm != 60 and self.request_tick is None and phase == "swing_FL":
+        if abs(self.target_mm / 1000 - self.goal) > 1e-9 and self.request_tick is None and phase == "swing_FL":
             self.request_tick = self.tick
             self.request_endpoint(self.target_mm / 1000)
             print(json.dumps(dict(stage="request", tick=self.tick, phase=phase,
@@ -52,10 +52,20 @@ class Stage1BCycleEnv(ReplanningCrawlEnv):
         super().check_progress(state)
 
     def run_episode(self, target_mm, seed, policy, *, require_goal_for_stop=True):
+        summary = self.run_crawl(target_mm, seed, policy, initial_goal=.060, initial_cycles=3,
+                                 require_goal_for_stop=require_goal_for_stop)
+        if (self.landings != 12 or summary["stable_ticks"] != 50 or max(summary["cumulative_stance_mm"]) > 40
+                or len(self.distances) != 3):
+            raise RuntimeError(f"Physical crawl gate failed: {summary}")
+        return summary
+
+    def run_crawl(self, target_mm, seed, policy, *, initial_goal, initial_cycles,
+                  require_goal_for_stop=True, initial_stride=None):
         self.walking = False
         self.reset(seed=seed)
         self.target_mm = target_mm
-        self.begin_forward_crawl(.060, 3, stride_policy=policy, require_goal_for_stop=require_goal_for_stop)
+        self.begin_forward_crawl(initial_goal, initial_cycles, stride_policy=policy,
+                                 require_goal_for_stop=require_goal_for_stop, initial_stride=initial_stride)
         self.request_tick = None
         self.distances = []
         self.splice_jump_mm = 0.
@@ -80,7 +90,4 @@ class Stage1BCycleEnv(ReplanningCrawlEnv):
                        max_speed_mps=max(speeds), max_spin_rad_s=max(spins), max_joint_rad_s=max(joints))
         summary.update(stopped=self.stopped, arrived=abs(dx-target_mm) <= 4 and abs(delta[1].item()) <= .010,
                        recovery_ticks_per_landing=20, cycle_decisions=list(self.replans))
-        if (self.landings != 12 or len(xs) != 50 or cumulative.max() > 40
-                or len(self.distances) != 3):
-            raise RuntimeError(f"Physical crawl gate failed: {summary}")
         return summary
