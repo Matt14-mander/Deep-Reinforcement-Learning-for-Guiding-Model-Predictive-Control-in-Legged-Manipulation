@@ -74,3 +74,58 @@ frequency and bootstrap assertions passed. Reported maximum stance drift was
 5.2115 mm (diagnostic). Three feedback helper tests and five existing Stage 2
 training-state tests passed. Extracted planner outputs matched the previous
 planner for crawl/trot across all three period scales.
+
+## Eight-environment PPO smoke acceptance
+
+```bash
+conda activate limx
+(
+  set -e
+  cd ~/workspace/Deep-Reinforcement-Learning-for-Guiding-Model-Predictive-Control-in-Legged-Manipulation
+  git switch go2-torch-integration
+  git pull --ff-only origin go2-torch-integration
+  export PYTHONPATH="$HOME/workspace/Crocoddyl-batched-mpc/src${PYTHONPATH:+:$PYTHONPATH}"
+  RUN="logs/go2_augmpc/ppo_$(date +%Y%m%d_%H%M%S)"
+  python -u scripts/check_go2_feedback_ppo.py --headless --device cuda:0 --steps 96 --output "$RUN"
+  python -m json.tool "$RUN/acceptance.json"
+)
+```
+
+This collects 96 steps per environment (768 transitions, 24 simulated seconds),
+then performs ONE PPO update with four full-batch optimization epochs. The actor
+uses categorical gait/period choices and tanh-transformed Gaussian stride/CoM
+residuals. Likelihood includes the tanh Jacobian; latent samples are retained
+rather than reconstructing them from clipped actions. The sampled categorical
+choices map exactly to the environment's gait threshold and period slots.
+
+The first three action components are pending requests, consumed only at safe
+cycle boundaries, while the fourth affects ongoing control. PPO records requests
+at their submission time; it does not claim all components execute immediately.
+
+The acceptance checks rollout identities, executed actions, finite signals, and
+termination masks. GAE uses pre-reset final observations for time-limit bootstrap
+and cuts recursion for all episode boundaries. It is independently checked per
+row. Environment 0 starts at an already-reached goal and environment 6 at a far
+goal to guarantee coverage of natural termination and timeout; these are test
+fixtures, not a training target distribution.
+
+Outputs are `rollout.pt`, `feedback_0001.pt`, and `acceptance.json`. The checkpoint
+stores model, Adam state, CPU/CUDA RNG state, iteration and interface dimensions.
+Exact deterministic outputs after reload, an identical next Adam update, and
+identical stochastic samples after RNG restoration are checked. Four real PhysX
+steps then exercise the reloaded mean policy. The optimizer comparison is a
+throwaway probe; the saved checkpoint remains iteration 1. This checkpoint does
+not serialize PhysX state or in-flight episodes, so restarting collection must
+reset the environment and begin a fresh rollout.
+
+This acceptance is not a full-episode policy-vs-rule evaluation or evidence of
+learned arrival behavior. Next, add matched-seed complete-episode evaluations
+before starting longer training. Unit tests: `python scripts/test_go2_feedback_ppo.py`.
+
+Local PPO acceptance (2026-11-11): 768 transitions / 24 s, 3 natural
+terminations, 6 time truncations, zero failures. One update (4 epochs) changed
+actor parameters by L2 0.048533 and deterministic actions by maximum 0.029177.
+Loss was finite (2.030428). Model/optimizer/RNG reload checks and four post-reload
+PhysX steps passed. Two probability/optimizer tests and three feedback helper
+tests passed. These changes establish a working training pipeline, not measured
+improvement in goal-reaching performance.

@@ -284,7 +284,8 @@ class QuadrupedMPCEnv(DirectRLEnv):
             self.action_high = torch.tensor(
                 bezier_high, device=self.device, dtype=torch.float32
             )
-            print(f"[ActionSpace] Stage 1: fixed gait, Bezier only ({len(bezier_low)}D)")
+            if cfg.action_space == len(bezier_low):
+                print(f"[ActionSpace] Stage 1: fixed gait, Bezier only ({len(bezier_low)}D)")
         else:
             # Stage 2: Bezier + gait modulation (15D)
             gait_mod_low = np.array([
@@ -305,7 +306,8 @@ class QuadrupedMPCEnv(DirectRLEnv):
                 np.concatenate([bezier_high, gait_mod_high]),
                 device=self.device, dtype=torch.float32
             )
-            print(f"[ActionSpace] Stage 2: Bezier + gait modulation ({len(bezier_low) + 3}D)")
+            if cfg.action_space == len(bezier_low) + 3:
+                print(f"[ActionSpace] Stage 2: Bezier + gait modulation ({len(bezier_low) + 3}D)")
 
         # Foot contact tracking
         self.foot_contacts = torch.zeros(
