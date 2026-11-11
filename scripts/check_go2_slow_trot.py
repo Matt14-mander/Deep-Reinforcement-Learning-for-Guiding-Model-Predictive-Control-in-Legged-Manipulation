@@ -26,9 +26,18 @@ def swing_groups(gait):
     return CRAWL if gait == "crawl" else PAIRS
 
 
-def make_plan(model, dt, schedule, *, cycle_decisions=False):
+def cycle_timing(scale=1.0):
+    if not math.isfinite(scale) or not .5 <= scale <= 2.:
+        raise ValueError("Cycle time scale must be finite and between 0.5 and 2")
+    return dict(swing=round(SWING*scale), transfer=round(TRANSFER*scale),
+                crawl_transfer=round(45*scale), center=round(35*scale),
+                recovery=max(14,round(14*scale)), handoff=max(HANDOFF,round(HANDOFF*scale)))
+
+
+def make_plan(model, dt, schedule, *, cycle_decisions=False, time_scale=1.0):
     import torch
     from crocoddyl_batched_mpc.models.go2_walk import go2_leg_ik, go2_center_of_mass, smoothstep
+    timing = cycle_timing(time_scale)
     q0 = model.reference_configuration
     anchors = model.contact_positions.clone()
     body = q0[:3].clone()
@@ -54,19 +63,19 @@ def make_plan(model, dt, schedule, *, cycle_decisions=False):
             for _ in range(4):
                 pose = go2_leg_ik(model, base[None], anchors[None])
                 base[:2] += desired - go2_center_of_mass(model, pose)[0, :2]
-            transfer_ticks = 45 if gait == "crawl" else TRANSFER
+            transfer_ticks = timing["crawl_transfer"] if gait == "crawl" else timing["transfer"]
             for j in range(1, transfer_ticks+1):
                 append(torch.lerp(body, base[:3], smoothstep(j/transfer_ticks)), anchors, (cycle, pair, False))
             body = base[:3].clone()
-            for j in range(1, SWING+1):
-                u = j / SWING
+            for j in range(1, timing["swing"]+1):
+                u = j / timing["swing"]
                 feet = anchors.clone()
                 feet[list(swing), 0] += stride * smoothstep(u)
                 feet[list(swing), 2] += .020 * 64 * (u*(1-u))**3
                 append(body, feet, (cycle, pair, True))
             anchors[list(swing), 0] += stride
             if gait == "crawl":
-                for _ in range(14):
+                for _ in range(timing["recovery"]):
                     append(body, anchors, (cycle, -1, False))
         changing = cycle+1 < len(schedule) and schedule[cycle+1][0] != gait
         if gait == "crawl" or changing or cycle_decisions:
@@ -74,11 +83,11 @@ def make_plan(model, dt, schedule, *, cycle_decisions=False):
             # the lateral/fore-aft displacement used to balance the last swing.
             center = q0[:3].clone()
             center[0] += sum(length for _, length in schedule[:cycle+1])
-            for j in range(1, 36):
-                append(torch.lerp(body,center,smoothstep(j/35)), anchors, (cycle,-1,False))
+            for j in range(1, timing["center"]+1):
+                append(torch.lerp(body,center,smoothstep(j/timing["center"])), anchors, (cycle,-1,False))
             body = center
         if changing or cycle_decisions:
-            for _ in range(HANDOFF):
+            for _ in range(timing["handoff"]):
                 append(body, anchors, (cycle, -1, False))
     end = q0[:3].clone()
     end[0] += sum(stride for _,stride in schedule)
@@ -154,6 +163,9 @@ def gait_env_type(schedule, record_handoffs):
                 self.rows[-1].update(gait=gait, anchors=self.anchors[0].tolist(),
                     requested=self._pending_joint_efforts[0].tolist(), applied=d.applied_torque[0].tolist(),
                     quat=d.root_link_quat_w[0].tolist())
+            if getattr(self,"period_diagnostics",False):
+                self.rows[-1].update(feet=feet.tolist(),
+                    raw_requested=adapter.scatter_action(effort)[0].tolist())
             self._last_mpc_costs, self._last_mpc_converged = res.cost,res.success
             self._advance_reference_clocks()
             self.tick += 1
@@ -270,10 +282,11 @@ def evaluate(rows, drift, dt):
                                       r["spin"]<.04 and r["joint"]<.10 for r in stop)))
 
 
-def evaluate_mixed(rows, drift, dt, schedule=MIXED, target_mm=None):
+def evaluate_mixed(rows, drift, dt, schedule=MIXED, target_mm=None, *, time_scale=1.0):
     from itertools import groupby
     from math import dist
 
+    timing = cycle_timing(time_scale)
     cycles, switches, contacts = [], [], []
     for i, (gait, stride) in enumerate(schedule):
         samples = [r for r in rows if r["cycle"] == i]
@@ -287,9 +300,9 @@ def evaluate_mixed(rows, drift, dt, schedule=MIXED, target_mm=None):
             leg_ids = swing_groups(gait)[pair]
             ticks = list(group)
             start = ticks[0]["tick"]
-            middle = rows[start+SWING//4+1:start+3*SWING//4+1]
+            middle = rows[start+len(ticks)//4+1:start+3*len(ticks)//4+1]
             correct = [all(f<2 if j in leg_ids else f>10 for j,f in enumerate(r["loads"])) for r in middle]
-            recovery = rows[start+SWING+1:start+SWING+TRANSFER+1]
+            recovery = rows[start+len(ticks)+1:start+len(ticks)+timing["transfer"]+1]
             recovered = any(all(min(r["loads"])>5 for r in recovery[k:k+3]) for k in range(len(recovery)-2))
             contacts.append(dict(cycle=i+1, swing=leg_ids, support_fraction=sum(correct)/len(correct),
                                  recovered=recovered))
