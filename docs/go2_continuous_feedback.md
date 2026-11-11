@@ -190,3 +190,100 @@ the rule used trot for the first cycle and crawl thereafter. Error changes were
 complete-episode acceptance pass, but one PPO update has not demonstrated
 performance improvement. This closes the feedback-environment/training-pipeline
 milestone, not the learned-controller-performance milestone.
+
+## Resume continuous PPO through iteration 12
+
+`train_go2_feedback_ppo.py` accepts an ABSOLUTE `--total-iterations`. Starting
+from iteration 1 performs 11 new updates. Each update defaults to 96 policy steps
+in eight environments (768 transitions, four optimization epochs). It evaluates
+1/4/8/12 with the unchanged 32/40/48 mm complete-episode evaluator. The initial
+checkpoint is evaluated before any further training. The original untrained
+policy remains the `pre` baseline throughout; `post` is the current milestone.
+
+Training uses independent reset-time uniform sampling of 32/40/48 mm goals,
+6 mm/s speed, and 60 s episode timeout. It deliberately replaces the smoke test's
+zero/far termination fixtures and the old 64-100 mm defaults. This curriculum is
+stored in checkpoints and checked on subsequent resumes. No claim is made that
+12 updates suffice for learning or that a higher arrival rate is guaranteed.
+
+Within a training segment, physical episodes persist across update boundaries.
+Evaluation runs in a separate process after the worker exits and cannot change
+its policy/optimizer/RNG. A new segment starts fresh physical episodes because
+PhysX state is not checkpointed. Rollout-end values bootstrap normally and no
+GAE recursion crosses into the fresh rollout. CPU/CUDA action RNG, Adam moments,
+and the independent goal sampler RNG are restored. Individual in-segment resets
+remain asynchronous. Evaluation never supplies samples to PPO.
+
+Launch on the server (the output directory must not already exist):
+
+```bash
+conda activate limx
+(
+  set -e
+  cd ~/workspace/Deep-Reinforcement-Learning-for-Guiding-Model-Predictive-Control-in-Legged-Manipulation
+  git switch go2-torch-integration
+  git pull --ff-only origin go2-torch-integration
+  export PYTHONPATH="$HOME/workspace/Crocoddyl-batched-mpc/src${PYTHONPATH:+:$PYTHONPATH}"
+  START=$(python -c 'from pathlib import Path; p=list(Path("logs/go2_augmpc").rglob("feedback_0001.pt")); assert p, "Missing iteration-1 checkpoint"; print(max(p,key=lambda x:x.stat().st_mtime).resolve())')
+  RUN="$PWD/logs/go2_augmpc/pilot12_$(date +%Y%m%d_%H%M%S)"
+  nohup bash -c '
+    python -u scripts/train_go2_feedback_ppo.py --checkpoint "$1" --output "$2" \
+      --total-iterations 12 --eval-iterations 1 4 8 12 --rollout-steps 96 --device cuda:0
+    rc=$?
+    echo "TRAIN_EXIT_CODE=$rc"
+    exit "$rc"
+  ' _ "$START" "$RUN" > "$RUN.log" 2>&1 < /dev/null &
+  echo "PID=$!"
+  echo "RUN=$RUN"
+  echo "LOG=$RUN.log"
+)
+```
+
+Inspect the newest run without a placeholder path:
+
+```bash
+cd ~/workspace/Deep-Reinforcement-Learning-for-Guiding-Model-Predictive-Control-in-Legged-Manipulation
+RUN=$(python -c 'from pathlib import Path; p=list(Path("logs/go2_augmpc").glob("pilot12_*/run.json")); assert p; print(max(p,key=lambda x:x.stat().st_mtime).parent.resolve())')
+grep -E '"stage": "(ppo_update|milestone|complete)"|TRAIN_EXIT_CODE=|Traceback|RuntimeError:' "$RUN.log" | tail -15
+python scripts/report_go2_feedback_training.py "$RUN" --require-complete
+```
+
+The final report checks all planned milestone reports exist, then lists gait
+sequences, endpoint errors, mean speeds, arrival times, stopping and drift for
+all controllers and goals. Completion is separate from performance success.
+Check `run.json`, `milestones.json`, `eval_0001/comparison.json`, etc. Training
+emits effective transitions/s and counts of successful/failed/timed-out episodes.
+Every completed update is atomically saved as `feedback_NNNN.pt`, not just the
+milestones. An interrupted update can be restarted from the last complete file.
+
+For an interrupted run, choose its last checkpoint and a NEW output directory;
+keep the same rollout length. Resume evaluates the starting checkpoint and the
+remaining scheduled milestones; older reports remain in the previous directory.
+For example, with `RUN` still pointing to the interrupted run:
+
+```bash
+export PYTHONPATH="$HOME/workspace/Crocoddyl-batched-mpc/src${PYTHONPATH:+:$PYTHONPATH}"
+START=$(python -c 'from pathlib import Path; import sys; p=list(Path(sys.argv[1]).glob("feedback_*.pt")); assert p; print(max(p,key=lambda x:int(x.stem.split("_")[-1])).resolve())' "$RUN")
+NEW="${RUN}_resume_$(date +%Y%m%d_%H%M%S)"
+nohup bash -c '
+  python -u scripts/train_go2_feedback_ppo.py --checkpoint "$1" --output "$2" \
+    --total-iterations 12 --eval-iterations 1 4 8 12 --rollout-steps 96 --device cuda:0
+  rc=$?; echo "TRAIN_EXIT_CODE=$rc"; exit "$rc"
+' _ "$START" "$NEW" > "$NEW.log" 2>&1 < /dev/null &
+echo "RUN=$NEW"
+```
+
+Regression tests: `python scripts/test_go2_feedback_training.py` and
+`python scripts/test_go2_feedback_ppo.py`. A changed curriculum or rollout length
+is rejected on resume rather than silently changing the experiment.
+
+Local continuation validation (2026-11-11): real PhysX resumed the original
+iteration-1 checkpoint, performed updates 2 and 3, evaluated complete episodes
+at 3, restarted the worker from 3, updated to 4, and evaluated complete episodes
+again. The reduced test rollout length was 8 steps per update, not the production
+96-step setting. All nine episodes at each evaluation arrived and stopped with
+zero failures. Real Adam step counters were 4/8/12/16 at iterations 1/2/3/4, and
+goal RNG reload matched exactly. The completion report command passed. Three
+schedule/configuration regression tests and two PPO probability/optimizer tests
+passed. Full 12-round training is to be run on the server; this local smoke run
+is not evidence of learning improvement or a completed 12-round experiment.
