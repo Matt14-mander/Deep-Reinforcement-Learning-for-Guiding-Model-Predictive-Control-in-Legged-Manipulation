@@ -287,3 +287,103 @@ goal RNG reload matched exactly. The completion report command passed. Three
 schedule/configuration regression tests and two PPO probability/optimizer tests
 passed. Full 12-round training is to be run on the server; this local smoke run
 is not evidence of learning improvement or a completed 12-round experiment.
+
+## Learning-signal diagnostics (no training or reward changes)
+
+Old iteration 2-12 checkpoints did not retain per-transition rollouts. Historical
+exploration counts/advantages cannot be recovered from weights. This tool runs a
+NEW frozen-policy rollout, labels its data as non-historical, and compares saved
+policies on identical observation probes. It must not be presented as a replay
+of the original training run.
+
+```bash
+conda activate limx
+(
+  set -e
+  cd ~/workspace/Deep-Reinforcement-Learning-for-Guiding-Model-Predictive-Control-in-Legged-Manipulation
+  git switch go2-torch-integration
+  git pull --ff-only origin go2-torch-integration
+  export PYTHONPATH="$HOME/workspace/Crocoddyl-batched-mpc/src${PYTHONPATH:+:$PYTHONPATH}"
+  RUN="$PWD/logs/go2_augmpc/pilot12_20261111_183306"
+  OUT="$PWD/logs/go2_augmpc/signal_$(date +%Y%m%d_%H%M%S)"
+  for i in 0001 0004 0008 0012; do test -f "$RUN/feedback_$i.pt"; done
+  nohup bash -c '
+    python -u scripts/diagnose_go2_feedback_ppo.py --mode sample --steps 192 \
+      --checkpoints "$1/feedback_0001.pt" "$1/feedback_0004.pt" "$1/feedback_0008.pt" "$1/feedback_0012.pt" \
+      --headless --device cuda:0 --output "$2/sample" &&
+    python -u scripts/diagnose_go2_feedback_ppo.py --mode paired \
+      --headless --device cuda:0 --output "$2/paired"
+    rc=$?
+    echo "DIAG_EXIT_CODE=$rc"
+    exit "$rc"
+  ' _ "$RUN" "$OUT" > "$OUT.log" 2>&1 < /dev/null &
+  echo "PID=$!"
+  echo "OUT=$OUT"
+  echo "LOG=$OUT.log"
+)
+```
+
+Sampling freezes the highest numbered checkpoint, uses eight environments with
+fixed reset goals assigned by env_id modulo 3 (32/40/48 mm), and collects 192
+steps / 48 s. Actual `_choose_cycle` calls identify the submitted action that
+was consumed, with environment/episode/decision identity checks. Each event
+contains gait and period probabilities at request submission, executed choices,
+and raw plus PPO-normalized GAE advantages. GAE and normalization use the saved
+training rollout length (normally 96), independently per block; the frozen policy
+is not updated between diagnostic blocks. All 1/4/8/12 policies are probed on
+these SAME observations; differing state distributions cannot explain their
+probability differences. These are latest-policy states, not each historical
+policy's original occupancy distribution.
+
+`sample/summary.json` reports applied vs submitted decisions, gait/period counts,
+advantages, common-observation probability changes and reward components by
+actual MPC mode. Mixed-mode transitions are counted separately and excluded from
+single-mode reward averages. Unapplied categorical requests still incur their
+share of the action-change penalty; its total is reported separately. The sum of
+six reward components is checked against the actual environment reward at every
+step. `sample/events.json` and `sample/transitions.pt` retain the evidence.
+Advantage group averages are observational and confounded by state and critic
+errors; they do not establish a causal preference by themselves.
+
+The paired experiment runs six complete episodes: each goal with crawl-only,
+and with trot above 30 mm remaining then crawl. Initial local states match;
+period slot, stride input and CoM residual are fixed at 1/0/0. It records both
+undiscounted reward sums and gamma=0.99 discounted returns, component sums,
+arrival, elapsed time and drift. Gait switching has its normal action-change
+cost. A positive `crawl_minus_trot_discounted_return` means the slower crawl
+gets a higher discounted return under the current reward in this matched test.
+This is a controlled rule comparison, not a historical PPO advantage estimate.
+
+Read the reports after `DIAG_EXIT_CODE=0`:
+
+```bash
+cd ~/workspace/Deep-Reinforcement-Learning-for-Guiding-Model-Predictive-Control-in-Legged-Manipulation
+OUT=$(python -c 'from pathlib import Path; p=list(Path("logs/go2_augmpc").glob("signal_*/sample/summary.json")); assert p; print(max(p,key=lambda x:x.stat().st_mtime).parent.parent.resolve())')
+python -m json.tool "$OUT/sample/summary.json"
+python -m json.tool "$OUT/paired/summary.json"
+```
+
+Code-level concerns being tested: most 4 Hz categorical requests never reach a
+cycle boundary; all still receive joint PPO likelihood updates and action-change
+penalties. The speed reward remains positive at rest (about 0.698 per second at
+a 6 mm/s command), so a longer successful episode may collect more reward. The
+GAE trace coefficient over a 6.9 s crawl cycle is about 0.184. These mechanisms
+motivate diagnostics, not a claim that all caused the observed training outcome.
+
+Local matched experiment (2026-11-11): all six episodes arrived without failures.
+For 32/40/48 mm, crawl-minus-trot undiscounted rewards were +1.4675/+1.7218/+1.2331;
+gamma=0.99 discounted return differences were +0.2113/+0.3289/-0.2309. Crawl took
+5/5/4.75 s longer. Thus the current objective actually prefers slower crawl in
+two of these matched tasks even after discounting; it does not uniformly reward
+faster arrival. This establishes a concrete objective mismatch, not a unique
+causal explanation for every historical PPO update.
+
+Local frozen-policy smoke test used the available short-test iteration-4 model,
+32 steps and its stored 8-step advantage blocks, NOT the server's trained
+iteration-12 model. Of 256 transitions, 15 contained effective cycle decisions
+(13 crawl, 2 trot); 28 submitted trot requests produced only two effective trot
+choices. Unapplied categorical-change penalties summed to -1.44, versus -0.095
+on effective requests. Common-state trot probability was 0.17965 at checkpoint 1
+and 0.17404 at this local checkpoint 4. This verifies instrumentation and the
+sparse-request mechanism; server diagnostics are required for the actual 12-round
+run. Both diagnostic unit tests passed.
