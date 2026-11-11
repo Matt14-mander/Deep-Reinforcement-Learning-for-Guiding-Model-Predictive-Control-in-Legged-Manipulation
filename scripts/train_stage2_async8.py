@@ -4,6 +4,7 @@ import json
 import math
 from pathlib import Path
 import random
+import shutil
 import subprocess
 import time
 import traceback
@@ -12,6 +13,10 @@ from isaaclab.app import AppLauncher
 from check_stage2_async_reset import async_types
 from check_go2_slow_trot import SETTLE, HOLD, evaluate_mixed, make_plan, PERIOD_SCALES
 from train_stage2_cycle_ppo import GOALS, make_policy
+from stage2_training_state import (
+    save_json, save_checkpoint, restore_checkpoint, sampling_state, restore_sampling,
+    period_probes, compare_evaluation, learning_summary,
+)
 
 N = 8
 SPEED_GOAL_MM = 64
@@ -73,14 +78,29 @@ def run(args):
     torch.manual_seed(args.seed)
     policy = make_policy(speed_task=args.speed_task, period_actions=args.period_actions)
     optimizer = torch.optim.Adam(policy.parameters(),lr=.003)
+    start_iteration = 0
     if args.checkpoint:
-        policy.load_compatible_state(torch.load(args.checkpoint,map_location="cpu",weights_only=True)["policy"])
+        loaded = torch.load(args.checkpoint,map_location="cpu",weights_only=True)
+        policy.load_compatible_state(loaded["policy"])
+        if args.eval_only:
+            start_iteration = loaded.get("iteration",0)
     args.output.mkdir(parents=True,exist_ok=False)
     goal_rng = [random.Random(args.seed+1019*r) for r in range(N)]
     bags = [[] for _ in range(N)]
     noise = [torch.Generator().manual_seed(args.seed+499*r+1) for r in range(N)]
     speed_groups = [i % 2 for i in range(N)]
     random.Random(args.seed).shuffle(speed_groups)
+    task = dict(seed=args.seed, speed_task=args.speed_task, period_actions=args.period_actions,
+                num_envs=N, speed_goal_mm=SPEED_GOAL_MM, speeds=SPEEDS, period_scales=PERIOD_SCALES)
+    resume_mode = None
+    if args.resume:
+        start_iteration,resume_mode = restore_checkpoint(
+            args.resume,policy,optimizer,task,noise,goal_rng,bags)
+        print(json.dumps(dict(stage="resume",iteration=start_iteration,
+                              sampling_state=resume_mode,optimizer_restored=True)),flush=True)
+    final_iteration = args.until if args.until is not None else start_iteration+(args.updates or 1)
+    if not args.eval_only and not args.evaluate_run and final_iteration<start_iteration:
+        raise ValueError("--until precedes the restored iteration")
     def sample_goal(r):
         if not bags[r]:
             bags[r] = list(GOALS)
@@ -125,7 +145,8 @@ def run(args):
 
     Clock,Env = async_types(choose, period_actions=args.period_actions)
     from RL_Bezier_MPC.envs import QuadrupedMPCEnvCfg
-    def rollout(mode,update):
+    def rollout(mode,update,output=None):
+        output = args.output if output is None else output
         quota = args.episodes_per_env if mode=="sample" else 1
         cfg = QuadrupedMPCEnvCfg()
         cfg.scene.num_envs,cfg.scene.env_spacing,cfg.seed,cfg.sim.device = N,1.15,args.seed,args.device
@@ -188,7 +209,7 @@ def run(args):
             if record:
                 writer=subprocess.Popen(["ffmpeg","-loglevel","error","-f","rawvideo","-pix_fmt","rgb24",
                     "-s","1152x720","-r",str(1/dt),"-i","pipe:0","-c:v","libx264","-pix_fmt","yuv420p",
-                    "-movflags","+faststart",str(args.output/"policy_8go2.mp4")],stdin=subprocess.PIPE)
+                    "-movflags","+faststart",str(output/"policy_8go2.mp4")],stdin=subprocess.PIPE)
             if str(env.device).startswith("cuda"):
                 torch.cuda.synchronize(env.device)
             start=time.perf_counter()
@@ -333,60 +354,85 @@ def run(args):
         print("PASS: eight asynchronous period action probes",flush=True)
         return
 
-    updates=[]
-    if not args.eval_only:
-        for i in range(1,args.updates+1):
-            reports,samples,elapsed=rollout("sample",i)
+    updates,evaluations = [],[]
+    baseline = None
+    milestones = {start_iteration} if args.eval_only else set(args.eval_iterations)
+
+    def evaluate(iteration, checkpoint):
+        nonlocal baseline
+        saved_sampling = sampling_state(noise,goal_rng,bags)
+        directory = args.output/f"eval_{iteration:04d}"
+        directory.mkdir(exist_ok=False)
+        try:
+            # Evaluate exactly the file that a future process will reload.
+            policy.load_compatible_state(torch.load(checkpoint,map_location="cpu",weights_only=True)["policy"])
+            policy.eval()
+            if baseline is None:
+                baseline = rollout("rule",0)[0]
+                save_json(args.output/"baseline.json",baseline)
+            learned = rollout("policy",iteration,directory)[0]
+            probes = period_probes(policy) if args.period_actions else []
+            report = compare_evaluation(learned,baseline,iteration,args.speed_task,probes)
+            save_json(directory/"comparison.json",report)
+            evaluations.append(report)
+            save_json(args.output/"comparison.json",report)
+            summary = learning_summary(evaluations,milestones)
+            summary.update(start_iteration=start_iteration, last_evaluated_iteration=iteration,
+                           resume_sampling_state=resume_mode, updates=updates, completed=False)
+            save_json(args.output/"summary.json",summary)
+            print(json.dumps(dict(stage="milestone",iteration=iteration,passed=report["passed"],
+                period_adaptation_observed=report["period_adaptation_observed"],
+                groups=report["groups"])),flush=True)
+            return report
+        finally:
+            restore_sampling(saved_sampling,noise,goal_rng,bags)
+            policy.train()
+
+    if args.evaluate_run:
+        for iteration in sorted(milestones):
+            checkpoint=args.evaluate_run/f"async8_{iteration:04d}.pt"
+            restore_checkpoint(checkpoint,policy,optimizer,task,noise,goal_rng,bags)
+            evaluate(iteration,checkpoint)
+    elif args.eval_only:
+        evaluate(start_iteration,args.resume or args.checkpoint)
+    else:
+        if args.resume:
+            initial=args.output/f"async8_{start_iteration:04d}.pt"
+            save_checkpoint(initial,policy,optimizer,start_iteration,task,noise,goal_rng,bags)
+            for earlier in sorted(i for i in milestones if i<start_iteration):
+                source=args.resume.parent/f"async8_{earlier:04d}.pt"
+                if source.is_file():
+                    copied=args.output/source.name
+                    shutil.copyfile(source,copied)
+                    evaluate(earlier,copied)
+            if start_iteration in milestones or start_iteration==final_iteration:
+                evaluate(start_iteration,initial)
+            # Earlier milestone evaluation may have loaded an older policy.
+            policy.load_state_dict(torch.load(initial,map_location="cpu",weights_only=True)["policy"])
+        for iteration in range(start_iteration+1,final_iteration+1):
+            reports,samples,elapsed=rollout("sample",iteration)
             change,period_change=update_policy(samples,reports)
-            metric=dict(update=i,completed_decisions=len(samples),collection_wall_s=elapsed,
-                        decisions_per_wall_s=len(samples)/elapsed,actor_change=change,period_actor_change=period_change)
-            print(json.dumps(dict(stage="ppo_update",**metric)),flush=True)
+            metric=dict(update=iteration,completed_decisions=len(samples),collection_wall_s=elapsed,
+                decisions_per_wall_s=len(samples)/elapsed,actor_change=change,period_actor_change=period_change)
             updates.append(metric)
-            (args.output/f"batch_{i:04d}.json").write_text(json.dumps(dict(metric=metric,episodes=reports,samples=samples),allow_nan=False))
-            last=args.output/f"async8_{i:04d}.pt"
-            torch.save(dict(policy=policy.state_dict(),optimizer=optimizer.state_dict(),iteration=i,period_actions=args.period_actions,speed_task=args.speed_task),last)
-        policy.load_state_dict(torch.load(last,map_location="cpu",weights_only=True)["policy"])
-    policy.eval()
-    learned=rollout("policy",0)[0]
-    baseline=rollout("rule",0)[0]
-    index={tuple(m["identity"]):m for m in baseline}
-    pairs=[]
-    for m in sorted(learned,key=lambda v:v["identity"]):
-        b=index[tuple(m["identity"])]
-        if b["target_mm"]!=m["target_mm"] or b.get("desired_mm_s")!=m.get("desired_mm_s"):
-            raise RuntimeError("Mismatched evaluation goals")
-        pairs.append(dict(row=m["identity"][1],target_mm=m["target_mm"],policy=m,rule=b))
-    passed=all(m[k]["success"] for m in pairs for k in ("rule","policy"))
-    groups=[]
-    if args.speed_task:
-        from statistics import mean
-        for mode in ("policy","rule"):
-            for speed in SPEEDS:
-                group=[pair[mode] for pair in pairs if pair[mode]["desired_mm_s"]==speed]
-                walking=mean(m["walking_mm_s"] for m in group)
-                switches=[s for m in group for s in m["switches"]]
-                valid=(len(group)==4 and all(m["speed_ok"] for m in group)
-                       and (speed!=SPEEDS[1] or all(m["switches"] for m in group)))
-                passed=passed and valid
-                summary=dict(mode=mode,desired_mm_s=speed,measured_mm_s=walking,
-                    gaits=[[c["gait"] for c in m["cycles"]] for m in group],
-                    time_scales=[[c["time_scale"] for c in m["cycles"]] for m in group],
-                    arrival_s=[m["arrival_s"] for m in group],
-                    endpoint_errors_mm=[m["final_x_error_mm"] for m in group],
-                    switch_count=len(switches),speed_and_switch_ok=valid)
-                groups.append(summary)
-                print(json.dumps(summary),flush=True)
-            slow, fast = groups[-2:]
-            slow_times, fast_times = slow["arrival_s"], fast["arrival_s"]
-            faster_arrival = (None not in slow_times + fast_times
-                              and max(fast_times) < min(slow_times))
-            fast["faster_arrival_than_slow"] = faster_arrival
-            passed = passed and faster_arrival
-    (args.output/"comparison.json").write_text(json.dumps(dict(updates=updates,pairs=pairs,groups=groups,passed=passed),indent=2,allow_nan=False))
-    if not passed:
-        raise RuntimeError("Physical evaluation failed; see comparison.json")
-    print("PASS: eight Go2 paired speed evaluation" if args.speed_task else
-          "PASS: eight Go2 asynchronous PPO evaluation",flush=True)
+            save_json(args.output/f"batch_{iteration:04d}.json",
+                      dict(metric=metric,episodes=reports,samples=samples))
+            checkpoint=args.output/f"async8_{iteration:04d}.pt"
+            save_checkpoint(checkpoint,policy,optimizer,iteration,task,noise,goal_rng,bags)
+            print(json.dumps(dict(stage="ppo_update",**metric)),flush=True)
+            if iteration in milestones or iteration==final_iteration:
+                evaluate(iteration,checkpoint)
+    summary = learning_summary(evaluations,milestones)
+    summary.update(start_iteration=start_iteration,
+                   last_evaluated_iteration=evaluations[-1]["iteration"],
+                   resume_sampling_state=resume_mode, updates=updates, completed=True)
+    save_json(args.output/"summary.json",summary)
+    print(json.dumps(dict(stage="complete",last_iteration=evaluations[-1]["iteration"],
+        all_evaluations_passed=summary["all_evaluations_passed"],
+        missing_milestones=summary["missing_milestones"],
+        final_period_adaptation_observed=summary["final_period_adaptation_observed"])),flush=True)
+    if not evaluations[-1]["passed"]:
+        raise RuntimeError("Final evaluation failed; training and reports are saved in the output directory")
 
 
 if __name__=="__main__":
@@ -396,15 +442,30 @@ if __name__=="__main__":
     parser.add_argument("--period-probe-only", action="store_true", help="Execute slow/fast/current period actions and verify boundaries")
     parser.add_argument("--speed-task", action="store_true", help="64 mm paired goal at 3 and 6 mm/s walking speed")
     parser.add_argument("--seed",type=int,default=37)
-    parser.add_argument("--updates",type=int,default=1)
+    duration = parser.add_mutually_exclusive_group()
+    duration.add_argument("--updates",type=int,help="Number of additional PPO updates (default 1)")
+    duration.add_argument("--until",type=int,help="Cumulative completed iteration, inclusive")
+    parser.add_argument("--eval-iterations",nargs="+",type=int,default=[1,4,8,12])
     parser.add_argument("--episodes-per-env",type=int,default=2)
-    parser.add_argument("--checkpoint",type=Path)
+    source = parser.add_mutually_exclusive_group()
+    source.add_argument("--checkpoint",type=Path,help="Policy-only warm start; resets optimizer and iteration")
+    source.add_argument("--resume",type=Path,help="Restore completed iteration, Adam and sampling state")
+    source.add_argument("--evaluate-run",type=Path,help="Evaluate saved milestone checkpoints without training")
     parser.add_argument("--eval-only",action="store_true")
     parser.add_argument("--video",action="store_true")
     AppLauncher.add_app_launcher_args(parser)
     args=parser.parse_args()
-    if args.updates<1 or args.episodes_per_env<1 or (args.eval_only and not args.checkpoint):
-        parser.error("Positive rollout sizes required; --eval-only requires --checkpoint")
+    if ((args.updates is not None and args.updates<1) or (args.until is not None and args.until<1)
+        or args.episodes_per_env<1 or any(i<1 for i in args.eval_iterations)):
+        parser.error("Rollout sizes and iteration numbers must be positive")
+    if args.eval_only and not (args.checkpoint or args.resume):
+        parser.error("--eval-only requires --checkpoint or --resume")
+    if args.period_probe_only and (args.eval_only or args.evaluate_run or args.resume):
+        parser.error("Period probe cannot be combined with resume or evaluation modes")
+    if args.evaluate_run:
+        missing=[i for i in args.eval_iterations if not (args.evaluate_run/f"async8_{i:04d}.pt").is_file()]
+        if missing:
+            parser.error(f"Missing milestone checkpoints: {missing}")
     if args.period_actions and not args.speed_task:
         parser.error("--period-actions requires --speed-task")
     if args.period_probe_only and not args.period_actions:
