@@ -28,6 +28,7 @@ def run(args):
         obs=env._get_observations()["policy"]
         torch.manual_seed(37)
         policy=FeedbackPolicy().to(env.device)
+        initial_policy={k:v.detach().cpu().clone() for k,v in policy.state_dict().items()}
         optimizer=torch.optim.Adam(policy.parameters(),lr=3e-4)
         rows=[]
         natural=truncations=failures=0
@@ -72,7 +73,7 @@ def run(args):
         assert all(torch.isfinite(p).all() for p in policy.parameters())
         checkpoint=args.output/"feedback_0001.pt"
         state=dict(format_version=1,iteration=1,observation_size=57,action_size=4,
-                   policy=policy.state_dict(),optimizer=optimizer.state_dict(),
+                   policy=policy.state_dict(),initial_policy=initial_policy,seed=37,optimizer=optimizer.state_dict(),
                    rng_cpu=torch.get_rng_state(),rng_cuda=torch.cuda.get_rng_state_all() if torch.cuda.is_available() else [],
                    policy_hz=4.,mpc_hz=50.)
         torch.save(state,checkpoint)

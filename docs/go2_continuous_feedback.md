@@ -129,3 +129,64 @@ Loss was finite (2.030428). Model/optimizer/RNG reload checks and four post-relo
 PhysX steps passed. Two probability/optimizer tests and three feedback helper
 tests passed. These changes establish a working training pipeline, not measured
 improvement in goal-reaching performance.
+
+## Deterministic full-episode comparison
+
+Run the evaluator on the actual iteration-1 checkpoint from the smoke test:
+
+```bash
+conda activate limx
+(
+  set -e
+  cd ~/workspace/Deep-Reinforcement-Learning-for-Guiding-Model-Predictive-Control-in-Legged-Manipulation
+  git switch go2-torch-integration
+  git pull --ff-only origin go2-torch-integration
+  export PYTHONPATH="$HOME/workspace/Crocoddyl-batched-mpc/src${PYTHONPATH:+:$PYTHONPATH}"
+  CHECKPOINT=$(python -c 'from pathlib import Path; p=list(Path("logs/go2_augmpc").rglob("feedback_0001.pt")); assert p, "No feedback_0001.pt found; run the PPO smoke acceptance first"; print(max(p,key=lambda x:x.stat().st_mtime).resolve())')
+  RUN="logs/go2_augmpc/evaluation_$(date +%Y%m%d_%H%M%S)"
+  echo "Checkpoint: $CHECKPOINT"
+  python -u scripts/evaluate_go2_feedback_ppo.py --headless --device cuda:0 \
+    --checkpoint "$CHECKPOINT" --output "$RUN"
+  python -m json.tool "$RUN/comparison.json"
+)
+```
+
+Defaults: 32/40/48 mm targets, desired speed 0.006 m/s, 60 s timeout. Nine
+independent robots run three goals for each of pre-update, post-update, and rule
+controllers in the same simulation. Their local initial states are checked equal.
+No action sampling occurs: categories use argmax and continuous actions use tanh
+of Gaussian means. The rule uses trot when desired speed exceeds 0.0045 m/s and
+remaining distance exceeds 30 mm, otherwise crawl; stride/period/residual inputs
+are zero. It is a fixed reference controller, not a separately optimized baseline.
+
+New smoke checkpoints include initial weights. Legacy iteration-1 checkpoints
+reconstruct the seed-37 model and MUST match both log probabilities and critic
+values in the sibling `rollout.pt`; missing/mismatching evidence aborts evaluation.
+Keep the original checkpoint and rollout together when transferring them.
+
+Each arm records exactly the first complete episode, using a physical snapshot
+before automatic reset. Later auto-reset episodes of completed rows are excluded.
+Stopping is independent of arrival: over the last 1 s, position span must be below
+1 mm, body speed below 0.01 m/s, angular speed below 0.04 rad/s, joint speeds below
+0.1 rad/s, and every foot load above 5 N. Arrival additionally requires endpoint
+error at most 4 mm and no failure. Signed error, time to arrival, total-episode
+mean forward speed, sampled body velocity, final speed, and maximum stance drift
+are reported. Drift is the per-stance-anchor maximum retained at MPC frequency;
+it is not a cumulative path-length measurement. The fixed target set gives a
+small acceptance-set arrival rate, not a statistical generalization estimate.
+
+`comparison.json` distinguishes evaluation completion, policy_all_arrived, and
+improvement_demonstrated (every goal improves endpoint error by more than 0.1 mm).
+A completed evaluation is not a performance PASS. `traces.json` stores sampled
+physical signals. The script never changes the input checkpoint or trains a model.
+
+Local full-episode result (2026-11-11, iteration 1): all nine episodes arrived
+within 4 mm and stopped, with zero failures. Mean absolute endpoint errors were
+1.3002 mm (pre), 1.3022 mm (post), and 1.1833 mm (rule). Maximum stance drift was
+5.2726 / 5.2781 / 5.2696 mm respectively. Mean whole-episode forward speeds were
+0.002239 / 0.002236 / 0.003139 m/s. Pre/post mean policies both selected crawl;
+the rule used trot for the first cycle and crawl thereafter. Error changes were
+-0.0414, -0.0336, +0.0689 mm improvements at 32, 40, 48 mm. Thus the pipeline and
+complete-episode acceptance pass, but one PPO update has not demonstrated
+performance improvement. This closes the feedback-environment/training-pipeline
+milestone, not the learned-controller-performance milestone.
