@@ -114,6 +114,8 @@ class TrainingStateTests(unittest.TestCase):
             "def rollout(mode,update,output=None):\n"
             "    return fake_rollout(mode,update)\n"
             "def update_policy(samples,reports):\n"
+            "    with torch.no_grad():\n"
+            "        policy.actor.weight.add_(.01)\n"
             "    return 0.01,0.02\n")
         replacements={n.name:n for n in replacement.body}
         run.body=[replacements.get(n.name,n) if isinstance(n,ast.FunctionDef) else n for n in run.body]
@@ -181,6 +183,10 @@ class TrainingStateTests(unittest.TestCase):
             self.assertEqual([i for mode,i in calls if mode=="policy"],[1,4,8,12])
             self.assertTrue((args.output/"async8_0001.pt").is_file())
             self.assertTrue((args.output/"async8_0004.pt").is_file())
+            original=torch.load(root/"training"/"async8_0012.pt",weights_only=True)["policy"]
+            resumed=torch.load(args.output/"async8_0012.pt",weights_only=True)["policy"]
+            for key in original:
+                self.assertTrue(torch.equal(original[key],resumed[key]))
 
     def test_period_probes_change_only_requested_speed(self):
         class Policy:
