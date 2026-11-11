@@ -16,3 +16,16 @@ __all__ = [
     "QuadrupedMPCEnv",
     "QuadrupedMPCEnvCfg",
 ]
+
+
+from .go2_augmpc_env import Go2AugMPCEnv
+from .go2_augmpc_env_cfg import Go2AugMPCEnvCfg
+__all__ += ["Go2AugMPCEnv", "Go2AugMPCEnvCfg"]
+
+import gymnasium as gym
+gym.register(
+    id="Isaac-Go2-AugMPC-Direct-v0",
+    entry_point="RL_Bezier_MPC.envs:Go2AugMPCEnv",
+    disable_env_checker=True,
+    kwargs={"env_cfg_entry_point": "RL_Bezier_MPC.envs:Go2AugMPCEnvCfg"},
+)

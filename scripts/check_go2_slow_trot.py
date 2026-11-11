@@ -24,90 +24,18 @@ PERIOD_SCALES = {"crawl": (1.2, 1., .8), "trot": (1.2, 1., .9)}
 
 
 def swing_groups(gait):
-    return CRAWL if gait == "crawl" else PAIRS
+    from RL_Bezier_MPC.envs.go2_cycle import swing_groups as implementation
+    return implementation(gait)
 
 
 def cycle_timing(scale=1.0):
-    if not math.isfinite(scale) or not .5 <= scale <= 2.:
-        raise ValueError("Cycle time scale must be finite and between 0.5 and 2")
-    return dict(swing=round(SWING*scale), transfer=round(TRANSFER*scale),
-                crawl_transfer=round(45*scale), center=round(35*scale),
-                recovery=max(14,round(14*scale)), handoff=max(HANDOFF,round(HANDOFF*scale)))
+    from RL_Bezier_MPC.envs.go2_cycle import cycle_timing as implementation
+    return implementation(scale)
 
 
-def make_plan(model, dt, schedule, *, cycle_decisions=False, time_scale=1.0, time_scales=None):
-    import torch
-    from crocoddyl_batched_mpc.models.go2_walk import go2_leg_ik, go2_center_of_mass, smoothstep
-    scales = [time_scale]*len(schedule) if time_scales is None else list(time_scales)
-    if len(scales) != len(schedule):
-        raise ValueError("One time scale is required per cycle")
-    timings = [cycle_timing(scale) for scale in scales]
-    q0 = model.reference_configuration
-    anchors = model.contact_positions.clone()
-    body = q0[:3].clone()
-    bodies, targets, phases = [], [], []
-
-    def append(base, feet, phase):
-        bodies.append(base.clone())
-        targets.append(feet.clone())
-        phases.append(phase)
-
-    for _ in range(SETTLE):
-        append(body, anchors, (-1, -1, False))
-    for cycle, (gait, stride) in enumerate(schedule):
-        timing = timings[cycle]
-        for pair, swing in enumerate(swing_groups(gait)):
-            support = [j for j in range(4) if j not in swing]
-            desired = anchors[support, :2].mean(0)
-            if gait == "crawl":
-                leg = swing[0]
-                midpoint = (anchors[leg ^ 1,:2] + anchors[leg ^ 2,:2])/2
-                desired = torch.lerp(midpoint, desired, .35)
-            base = q0.clone()
-            base[:3] = body
-            for _ in range(4):
-                pose = go2_leg_ik(model, base[None], anchors[None])
-                base[:2] += desired - go2_center_of_mass(model, pose)[0, :2]
-            transfer_ticks = timing["crawl_transfer"] if gait == "crawl" else timing["transfer"]
-            for j in range(1, transfer_ticks+1):
-                append(torch.lerp(body, base[:3], smoothstep(j/transfer_ticks)), anchors, (cycle, pair, False))
-            body = base[:3].clone()
-            for j in range(1, timing["swing"]+1):
-                u = j / timing["swing"]
-                feet = anchors.clone()
-                feet[list(swing), 0] += stride * smoothstep(u)
-                feet[list(swing), 2] += .020 * 64 * (u*(1-u))**3
-                append(body, feet, (cycle, pair, True))
-            anchors[list(swing), 0] += stride
-            if gait == "crawl":
-                for _ in range(timing["recovery"]):
-                    append(body, anchors, (cycle, -1, False))
-        changing = cycle+1 < len(schedule) and schedule[cycle+1][0] != gait
-        if gait == "crawl" or changing or cycle_decisions:
-            # Compare progress at a centered four-foot stance, after unloading
-            # the lateral/fore-aft displacement used to balance the last swing.
-            center = q0[:3].clone()
-            center[0] += sum(length for _, length in schedule[:cycle+1])
-            for j in range(1, timing["center"]+1):
-                append(torch.lerp(body,center,smoothstep(j/timing["center"])), anchors, (cycle,-1,False))
-            body = center
-        if changing or cycle_decisions:
-            for _ in range(timing["handoff"]):
-                append(body, anchors, (cycle, -1, False))
-    end = q0[:3].clone()
-    end[0] += sum(stride for _,stride in schedule)
-    for j in range(1, HOLD+1):
-        append(torch.lerp(body, end, smoothstep(min(1., j/TRANSFER))), anchors, (len(schedule), -1, False))
-    feet = torch.stack(targets)
-    bases = q0.expand(len(feet), -1).clone()
-    bases[:, :3] = torch.stack(bodies)
-    q = go2_leg_ik(model, bases, feet)
-    v = q.new_zeros(len(q),18)
-    v[1:-1,:3] = (q[2:,:3]-q[:-2,:3])/(2*dt)
-    v[1:-1,6:] = (q[2:,7:]-q[:-2,7:])/(2*dt)
-    acc = torch.zeros_like(v)
-    acc[1:-1] = (v[2:]-v[:-2])/(2*dt)
-    return torch.cat((q,v),-1), acc, phases
+def make_plan(model,dt,schedule,*,cycle_decisions=False,time_scale=1.,time_scales=None):
+    from RL_Bezier_MPC.envs.go2_cycle import make_plan as implementation
+    return implementation(model,dt,schedule,cycle_decisions=cycle_decisions,time_scale=time_scale,time_scales=time_scales)
 
 
 def gait_env_type(schedule, record_handoffs):
