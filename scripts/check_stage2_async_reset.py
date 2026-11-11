@@ -8,10 +8,10 @@ import sys
 import traceback
 
 from isaaclab.app import AppLauncher
-from check_go2_slow_trot import SETTLE, HOLD, evaluate_mixed, make_plan, swing_groups
+from check_go2_slow_trot import SETTLE, HOLD, evaluate_mixed, make_plan, swing_groups, PERIOD_SCALES
 
 
-def async_types(choose, verbose=False):
+def async_types(choose, verbose=False, period_actions=False):
     import torch
     sys.path.insert(0, str(Path(__file__).resolve().parents[1]/"source/RL_Bezier_MPC"))
     from RL_Bezier_MPC.envs import QuadrupedMPCEnv
@@ -23,6 +23,8 @@ def async_types(choose, verbose=False):
             self.tick = -delay
             self.boundary = SETTLE
             self.schedule, self.decisions, self.rows = [], [], []
+            self.time_scales = []
+            self.period_slot = 1
             self.plan = env.nominal
             self.start_x = None
             self.finishing = self.parked = False
@@ -42,12 +44,30 @@ def async_types(choose, verbose=False):
             if len(self.schedule)>=7:
                 raise RuntimeError("Cycle budget exceeded")
             obs = torch.tensor([(remaining-30)/15,float(bool(self.schedule and self.schedule[-1][0]=="trot"))])
-            gait,z = choose(self,obs,remaining)
+            action = choose(self,obs,remaining)
+            gait,z = action[:2]
+            if period_actions:
+                slot = action[2]
+                if isinstance(slot, bool) or not isinstance(slot, int) or slot not in range(3):
+                    raise ValueError("Period slot must be 0, 1 or 2")
+                self.period_slot = slot
+                self.time_scales.append(PERIOD_SCALES[gait][slot])
+            else:
+                self.time_scales.append(1.)
             stride = max(10.,min(24.,min(remaining,21.)+3*math.tanh(z)))
             self.schedule.append((gait,stride/1000))
-            self.plan = make_plan(self.env.tracking.controller.mpc.model,self.env.cfg.mpc_dt,self.schedule,cycle_decisions=True)
+            reference,acceleration,phases = make_plan(
+                self.env.tracking.controller.mpc.model,self.env.cfg.mpc_dt,self.schedule,
+                cycle_decisions=True,time_scales=self.time_scales)
+            # Keep all previously executed samples, including boundary derivatives.
+            self.plan = (torch.cat((self.plan[0][:self.tick],reference[self.tick:])),
+                         torch.cat((self.plan[1][:self.tick],acceleration[self.tick:])),
+                         self.plan[2][:self.tick]+phases[self.tick:])
             self.boundary = len(self.plan[0])-HOLD
             event = dict(world_tick=self.env.world,local_tick=self.tick,remaining_mm=remaining,gait=gait,stride_mm=stride)
+            if period_actions:
+                event.update(period_slot=self.period_slot,time_scale=self.time_scales[-1],
+                             duration_s=(self.boundary-self.tick)*self.env.cfg.mpc_dt)
             self.decisions.append(event)
             if verbose:
                 print(json.dumps(dict(stage="decision",goal_mm=self.goal,**event)),flush=True)

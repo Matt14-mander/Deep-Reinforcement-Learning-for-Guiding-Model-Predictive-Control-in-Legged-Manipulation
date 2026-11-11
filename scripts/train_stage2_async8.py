@@ -10,7 +10,7 @@ import traceback
 
 from isaaclab.app import AppLauncher
 from check_stage2_async_reset import async_types
-from check_go2_slow_trot import SETTLE, HOLD, evaluate_mixed, make_plan
+from check_go2_slow_trot import SETTLE, HOLD, evaluate_mixed, make_plan, PERIOD_SCALES
 from train_stage2_cycle_ppo import GOALS, make_policy
 
 N = 8
@@ -45,6 +45,14 @@ def audit_batch(samples,reports):
         m=owners[tuple(p["key"][:3])]
         i=p["key"][3]
         d=m["decisions"][i]
+        if "period_slot" in d or "period_slot" in p:
+            previous = m["decisions"][i-1]["period_slot"] if i else 1
+            slot=p.get("period_slot")
+            if (slot not in (0,1,2) or slot!=d["period_slot"] or abs(p["obs"][3]-(previous-1))>1e-6
+                or d["time_scale"]!=PERIOD_SCALES[d["gait"]][slot]
+                or m["cycles"][i]["time_scale"]!=d["time_scale"]
+                or abs(d["duration_s"]-(p["end"]-p["start"])*.02)>1e-9):
+                raise RuntimeError(f"Incorrect period action ownership: {p['key']}")
         if (p["goal"]!=m["target_mm"] or abs(p["obs"][0]-(d["remaining_mm"]-30)/15)>1e-5
             or abs(p["obs"][1]-float(i>0 and m["decisions"][i-1]["gait"]=="trot"))>1e-6
             or abs(max(10.,min(24.,min(d["remaining_mm"],21.)+3*math.tanh(p["z"])))-d["stride_mm"])>1e-5
@@ -63,10 +71,10 @@ def run(args):
     from PIL import Image, ImageDraw
     from torch import nn
     torch.manual_seed(args.seed)
-    policy = make_policy(speed_task=args.speed_task)
+    policy = make_policy(speed_task=args.speed_task, period_actions=args.period_actions)
     optimizer = torch.optim.Adam(policy.parameters(),lr=.003)
     if args.checkpoint:
-        policy.load_state_dict(torch.load(args.checkpoint,map_location="cpu",weights_only=True)["policy"])
+        policy.load_compatible_state(torch.load(args.checkpoint,map_location="cpu",weights_only=True)["policy"])
     args.output.mkdir(parents=True,exist_ok=False)
     goal_rng = [random.Random(args.seed+1019*r) for r in range(N)]
     bags = [[] for _ in range(N)]
@@ -83,6 +91,8 @@ def run(args):
         with torch.no_grad():
             if args.speed_task:
                 obs = torch.cat((obs,obs.new_tensor([speed_feature(c.desired_mm_s)])))
+            if args.period_actions:
+                obs = torch.cat((obs,obs.new_tensor([c.period_slot-1.])))
             gd,zd = policy.distributions(obs)
             if c.mode=="sample":
                 generator = noise[c.row_id]
@@ -95,9 +105,25 @@ def run(args):
                 g,z = gd.logits>=0,zd.mean
             else:
                 g,z = remaining>=30 and (not args.speed_task or c.desired_mm_s==SPEEDS[1]),torch.tensor(0.)
-            return ("trot" if bool(g) else "crawl"),z.item()
+            gait = "trot" if bool(g) else "crawl"
+            if not args.period_actions:
+                return gait,z.item()
+            pd = policy.period_distribution(obs)
+            if c.mode == "sample":
+                slot = int(torch.multinomial(pd.probs,1,generator=noise[c.row_id]).item())
+                c.pending[-1].update(period_slot=slot,
+                    logp=c.pending[-1]["logp"]+pd.log_prob(torch.tensor(slot)).item())
+            elif c.mode == "policy":
+                slot = int(pd.logits.argmax().item())
+            elif c.mode == "period_probe":
+                gait = "crawl" if c.row_id%2==0 else "trot"
+                slot = (0,2,1)[len(c.schedule)%3]
+                z = torch.tensor(math.atanh((20.-min(remaining,21.))/3.))
+            else:
+                slot = 1
+            return gait,z.item(),slot
 
-    Clock,Env = async_types(choose)
+    Clock,Env = async_types(choose, period_actions=args.period_actions)
     from RL_Bezier_MPC.envs import QuadrupedMPCEnvCfg
     def rollout(mode,update):
         quota = args.episodes_per_env if mode=="sample" else 1
@@ -115,6 +141,8 @@ def run(args):
         projected_frames=0
         def clock(r,park=False):
             goal = SPEED_GOAL_MM if args.speed_task else (sample_goal(r) if mode=="sample" and not park else GOALS[r%3])
+            if mode=="period_probe":
+                goal = 60
             c=Clock(env,goal,delay=0)
             c.row_id,c.mode,c.identity,c.pending = r,mode,(update,r,counts[r]),[]
             if args.speed_task:
@@ -221,7 +249,7 @@ def run(args):
                     timeout=c.tick-c.boundary>=HOLD
                     if c.stable<50 and not timeout:
                         continue
-                    m=evaluate_mixed(c.rows,env.drift[r].tolist(),dt,c.schedule,target_mm=c.goal)
+                    m=evaluate_mixed(c.rows,env.drift[r].tolist(),dt,c.schedule,target_mm=c.goal,time_scales=c.time_scales)
                     arrived=c.stable>=50 and all(m["checks"].values())
                     m["success"] = arrived
                     if args.speed_task:
@@ -268,16 +296,17 @@ def run(args):
     def update_policy(samples,reports):
         audit_batch(samples,reports)
         obs,g,z,old,ret=[torch.tensor([p[k] for p in samples]) for k in ("obs","g","z","logp","return_to_go")]
+        period = torch.tensor([p["period_slot"] for p in samples]) if args.period_actions else None
         with torch.no_grad():
-            gd,zd=policy.distributions(obs)
-            if not torch.allclose(gd.log_prob(g)+zd.log_prob(z),old,atol=1e-5,rtol=0):
+            if not torch.allclose(policy.action_log_prob(obs,g,z,period),old,atol=1e-5,rtol=0):
                 raise RuntimeError("Stored action probability does not match the rollout policy")
         adv=(ret-policy.value(obs).squeeze(-1)).detach()
         adv=(adv-adv.mean())/adv.std(unbiased=False).clamp_min(1e-6)
         before=nn.utils.parameters_to_vector(policy.actor.parameters()).detach().clone()
+        period_before = (nn.utils.parameters_to_vector(policy.period_actor.parameters()).detach().clone()
+                         if args.period_actions else None)
         for _ in range(4):
-            gd,zd=policy.distributions(obs)
-            ratio=(gd.log_prob(g)+zd.log_prob(z)-old).exp()
+            ratio=(policy.action_log_prob(obs,g,z,period)-old).exp()
             loss=-torch.minimum(ratio*adv,ratio.clamp(.8,1.2)*adv).mean()+.5*(policy.value(obs).squeeze(-1)-ret).square().mean()
             optimizer.zero_grad()
             loss.backward()
@@ -286,20 +315,36 @@ def run(args):
         change=(nn.utils.parameters_to_vector(policy.actor.parameters())-before).norm().item()
         if not math.isfinite(change) or change<=0:
             raise RuntimeError("No finite PPO actor update")
-        return change
+        if args.period_actions:
+            period_change=(nn.utils.parameters_to_vector(policy.period_actor.parameters())-period_before).norm().item()
+            if not math.isfinite(period_change) or period_change<=0:
+                raise RuntimeError("Period head did not update")
+        else:
+            period_change=0.
+        return change,period_change
+
+    if args.period_probe_only:
+        reports,_,_=rollout("period_probe",0)
+        passed=all(m["success"] and [d["period_slot"] for d in m["decisions"]]==[0,2,1]
+                   and len(m["switches"])==2 for m in reports)
+        (args.output/"comparison.json").write_text(json.dumps(dict(passed=passed,episodes=reports),indent=2))
+        if not passed:
+            raise RuntimeError("Cycle period switching probe failed")
+        print("PASS: eight asynchronous period action probes",flush=True)
+        return
 
     updates=[]
     if not args.eval_only:
         for i in range(1,args.updates+1):
             reports,samples,elapsed=rollout("sample",i)
-            change=update_policy(samples,reports)
+            change,period_change=update_policy(samples,reports)
             metric=dict(update=i,completed_decisions=len(samples),collection_wall_s=elapsed,
-                        decisions_per_wall_s=len(samples)/elapsed,actor_change=change)
+                        decisions_per_wall_s=len(samples)/elapsed,actor_change=change,period_actor_change=period_change)
             print(json.dumps(dict(stage="ppo_update",**metric)),flush=True)
             updates.append(metric)
             (args.output/f"batch_{i:04d}.json").write_text(json.dumps(dict(metric=metric,episodes=reports,samples=samples),allow_nan=False))
             last=args.output/f"async8_{i:04d}.pt"
-            torch.save(dict(policy=policy.state_dict(),optimizer=optimizer.state_dict(),iteration=i),last)
+            torch.save(dict(policy=policy.state_dict(),optimizer=optimizer.state_dict(),iteration=i,period_actions=args.period_actions,speed_task=args.speed_task),last)
         policy.load_state_dict(torch.load(last,map_location="cpu",weights_only=True)["policy"])
     policy.eval()
     learned=rollout("policy",0)[0]
@@ -325,6 +370,7 @@ def run(args):
                 passed=passed and valid
                 summary=dict(mode=mode,desired_mm_s=speed,measured_mm_s=walking,
                     gaits=[[c["gait"] for c in m["cycles"]] for m in group],
+                    time_scales=[[c["time_scale"] for c in m["cycles"]] for m in group],
                     arrival_s=[m["arrival_s"] for m in group],
                     endpoint_errors_mm=[m["final_x_error_mm"] for m in group],
                     switch_count=len(switches),speed_and_switch_ok=valid)
@@ -346,6 +392,8 @@ def run(args):
 if __name__=="__main__":
     parser=argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--output",type=Path,required=True)
+    parser.add_argument("--period-actions", action="store_true", help="Choose a validated slow/current/fast period each cycle")
+    parser.add_argument("--period-probe-only", action="store_true", help="Execute slow/fast/current period actions and verify boundaries")
     parser.add_argument("--speed-task", action="store_true", help="64 mm paired goal at 3 and 6 mm/s walking speed")
     parser.add_argument("--seed",type=int,default=37)
     parser.add_argument("--updates",type=int,default=1)
@@ -357,6 +405,10 @@ if __name__=="__main__":
     args=parser.parse_args()
     if args.updates<1 or args.episodes_per_env<1 or (args.eval_only and not args.checkpoint):
         parser.error("Positive rollout sizes required; --eval-only requires --checkpoint")
+    if args.period_actions and not args.speed_task:
+        parser.error("--period-actions requires --speed-task")
+    if args.period_probe_only and not args.period_actions:
+        parser.error("--period-probe-only requires --period-actions")
     if args.video:
         args.enable_cameras=True
     launcher=AppLauncher(args)

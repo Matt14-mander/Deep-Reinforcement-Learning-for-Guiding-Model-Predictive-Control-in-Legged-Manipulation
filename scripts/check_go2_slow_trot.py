@@ -20,6 +20,7 @@ CRAWL = ((2,), (0,), (3,), (1,))
 MIXED = (("crawl", .020), ("trot", .018), ("trot", .024), ("trot", .024),
          ("trot", .018), ("crawl", .016))
 HANDOFF = 10
+PERIOD_SCALES = {"crawl": (1.2, 1., .8), "trot": (1.2, 1., .9)}
 
 
 def swing_groups(gait):
@@ -34,10 +35,13 @@ def cycle_timing(scale=1.0):
                 recovery=max(14,round(14*scale)), handoff=max(HANDOFF,round(HANDOFF*scale)))
 
 
-def make_plan(model, dt, schedule, *, cycle_decisions=False, time_scale=1.0):
+def make_plan(model, dt, schedule, *, cycle_decisions=False, time_scale=1.0, time_scales=None):
     import torch
     from crocoddyl_batched_mpc.models.go2_walk import go2_leg_ik, go2_center_of_mass, smoothstep
-    timing = cycle_timing(time_scale)
+    scales = [time_scale]*len(schedule) if time_scales is None else list(time_scales)
+    if len(scales) != len(schedule):
+        raise ValueError("One time scale is required per cycle")
+    timings = [cycle_timing(scale) for scale in scales]
     q0 = model.reference_configuration
     anchors = model.contact_positions.clone()
     body = q0[:3].clone()
@@ -51,6 +55,7 @@ def make_plan(model, dt, schedule, *, cycle_decisions=False, time_scale=1.0):
     for _ in range(SETTLE):
         append(body, anchors, (-1, -1, False))
     for cycle, (gait, stride) in enumerate(schedule):
+        timing = timings[cycle]
         for pair, swing in enumerate(swing_groups(gait)):
             support = [j for j in range(4) if j not in swing]
             desired = anchors[support, :2].mean(0)
@@ -282,17 +287,20 @@ def evaluate(rows, drift, dt):
                                       r["spin"]<.04 and r["joint"]<.10 for r in stop)))
 
 
-def evaluate_mixed(rows, drift, dt, schedule=MIXED, target_mm=None, *, time_scale=1.0):
+def evaluate_mixed(rows, drift, dt, schedule=MIXED, target_mm=None, *, time_scale=1.0, time_scales=None):
     from itertools import groupby
     from math import dist
 
-    timing = cycle_timing(time_scale)
+    scales = [time_scale]*len(schedule) if time_scales is None else list(time_scales)
+    if len(scales) != len(schedule):
+        raise ValueError("One time scale is required per cycle")
     cycles, switches, contacts = [], [], []
     for i, (gait, stride) in enumerate(schedule):
+        timing = cycle_timing(scales[i])
         samples = [r for r in rows if r["cycle"] == i]
         first, end = samples[0]["tick"], samples[-1]["tick"]+1
         duration = (end-first)*dt
-        cycles.append(dict(gait=gait, command_mm_s=1000*stride/duration,
+        cycles.append(dict(gait=gait, time_scale=scales[i], duration_s=duration, command_mm_s=1000*stride/duration,
                            measured_mm_s=1000*(rows[end]["x"]-rows[first]["x"])/duration))
         for (pair, swing), group in groupby(samples, key=lambda r: (r["pair"], r["swing"])):
             if not swing:
@@ -306,7 +314,7 @@ def evaluate_mixed(rows, drift, dt, schedule=MIXED, target_mm=None, *, time_scal
             recovered = any(all(min(r["loads"])>5 for r in recovery[k:k+3]) for k in range(len(recovery)-2))
             contacts.append(dict(cycle=i+1, swing=leg_ids, support_fraction=sum(correct)/len(correct),
                                  recovered=recovered))
-        if i and schedule[i-1][0] != gait:
+        if i and (schedule[i-1][0] != gait or scales[i-1] != scales[i]):
             # Include the first five commands in the new transfer and their measured response.
             window = rows[first-5:first+7]
             def max_joint_step(key):
@@ -316,7 +324,7 @@ def evaluate_mixed(rows, drift, dt, schedule=MIXED, target_mm=None, *, time_scal
                 dot = abs(sum(x*y for x,y in zip(a,b)))
                 norms = math.sqrt(sum(x*x for x in a)*sum(y*y for y in b))
                 return math.degrees(2*math.acos(min(1.,dot/norms)))
-            switches.append(dict(change=schedule[i-1][0]+" -> "+gait,tick=first,
+            switches.append(dict(change=schedule[i-1][0]+" -> "+gait, old_scale=scales[i-1], new_scale=scales[i], tick=first,
                 all_loaded=all(min(r["loads"])>5 for r in window),
                 anchor_jump_mm=1000*max(dist(a,b) for r in window for a,b in zip(window[0]["anchors"],r["anchors"])),
                 requested_step_Nm=max_joint_step("requested"), applied_step_Nm=max_joint_step("applied"),
@@ -330,7 +338,7 @@ def evaluate_mixed(rows, drift, dt, schedule=MIXED, target_mm=None, *, time_scal
     result = dict(cycles=cycles, switches=switches, contacts=contacts, max_stance_mm=[1000*x for x in drift],
         target_mm=goal, dx_mm=dx, dy_mm=dy, final_x_error_mm=dx-goal,
         max_roll_pitch_yaw_deg=peaks, stop_span_mm=span, stop_ticks=len(stop),
-        checks=dict(handoffs=len(switches)==sum(a[0]!=b[0] for a,b in zip(schedule,schedule[1:])) and all(s["all_loaded"] and s["anchor_jump_mm"]<.001
+        checks=dict(handoffs=len(switches)==sum(schedule[i-1][0]!=schedule[i][0] or scales[i-1]!=scales[i] for i in range(1,len(schedule))) and all(s["all_loaded"] and s["anchor_jump_mm"]<.001
             and max(s["requested_step_Nm"],s["applied_step_Nm"])<3 and s["rotation_step_deg"]<1 for s in switches),
             contacts=len(contacts)==sum(len(swing_groups(g)) for g,_ in schedule) and all(c["support_fraction"]>=.75 and c["recovered"] for c in contacts),
             drift=max(drift)<=.010, attitude=max(peaks)<5, arrived=abs(dx-goal)<=4 and abs(dy)<=10,

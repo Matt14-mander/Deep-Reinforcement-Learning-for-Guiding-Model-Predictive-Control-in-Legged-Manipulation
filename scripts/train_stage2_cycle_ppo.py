@@ -11,23 +11,55 @@ from check_go2_slow_trot import (SETTLE, HOLD, evaluate_mixed, gait_env_type, ma
 GOALS = (20, 42, 64)
 
 
-def make_policy(speed_task=False):
+def make_policy(speed_task=False, period_actions=False):
     import torch
     from torch import nn
     from torch.distributions import Bernoulli, Normal
 
+    inputs_for_legacy = 3 if speed_task else 2
+
     class Policy(nn.Module):
         def __init__(self):
             super().__init__()
-            inputs = 3 if speed_task else 2
+            inputs = (3 if speed_task else 2) + int(period_actions)
             self.actor = nn.Linear(inputs, 2)
             self.value = nn.Sequential(nn.Linear(inputs,16), nn.Tanh(), nn.Linear(16,1))
+            if period_actions:
+                self.period_actor = nn.Linear(inputs, 3)
+                nn.init.zeros_(self.period_actor.weight)
+                with torch.no_grad():
+                    self.period_actor.bias.copy_(torch.tensor([0.,1.,0.]))
             self.log_std = nn.Parameter(torch.tensor(-.65))
             # Distance-based initialization. PPO updates both outputs.
             with torch.no_grad():
                 weights = [[2.,0.,7.5],[.15,0.,0.]] if speed_task else [[2.,0.],[.15,0.]]
+                if period_actions:
+                    weights = [row+[0.] for row in weights]
                 self.actor.weight.copy_(torch.tensor(weights))
                 self.actor.bias.copy_(torch.tensor([0.,0.]))
+
+        def load_compatible_state(self, state):
+            state = dict(state)
+            if period_actions and "period_actor.weight" not in state:
+                # Extend a legacy policy with a neutral previous-period feature.
+                for key in ("actor.weight", "value.0.weight"):
+                    weight = state[key]
+                    if weight.shape[1] != inputs_for_legacy:
+                        raise ValueError("Checkpoint observation layout does not match this task")
+                    state[key] = torch.cat((weight,weight.new_zeros(weight.shape[0],1)),dim=1)
+                state["period_actor.weight"] = self.period_actor.weight.detach().clone()
+                state["period_actor.bias"] = self.period_actor.bias.detach().clone()
+            self.load_state_dict(state)
+
+        def period_distribution(self, obs):
+            return torch.distributions.Categorical(logits=self.period_actor(obs))
+
+        def action_log_prob(self, obs, gait, stride, period=None):
+            gd, zd = self.distributions(obs)
+            value = gd.log_prob(gait) + zd.log_prob(stride)
+            if period is not None:
+                value = value + self.period_distribution(obs).log_prob(period)
+            return value
 
         def distributions(self, obs):
             logits, mean = self.actor(obs).unbind(-1)
